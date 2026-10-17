@@ -85,17 +85,20 @@ func TestTenants(t *testing.T) {
 
 	u, err := d.UpdateTenant(ctx, "tenant-a", func(t *Tenant) error {
 		t.ClientCAPEM = "ca"
-		t.Enabled = false
+		t.Enabled = false // UpdateTenant では変わらない
 		return nil
 	})
-	if err != nil || u.DesiredVersion != 2 || u.ClientCAPEM != "ca" || u.Enabled {
+	if err != nil || u.DesiredVersion != 2 || u.ClientCAPEM != "ca" || !u.Enabled {
 		t.Errorf("UpdateTenant = %+v, %v", u, err)
 	}
-	if err := d.MarkApplied(ctx, "tenant-a", 2, "h"); err != nil {
+	if err := d.SetEnabled(ctx, "tenant-a", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.MarkApplied(ctx, "tenant-a", 2, "h", 20830); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.Tenant(ctx, "tenant-a")
-	if err != nil || got.Pending() || got.AppliedHash != "h" {
+	if err != nil || got.Pending() || got.AppliedHash != "h" || got.AppliedPort != 20830 || got.Enabled || got.DesiredVersion != 2 {
 		t.Errorf("after MarkApplied: %+v, %v", got, err)
 	}
 	if _, err := d.Tenant(ctx, "none"); !errors.Is(err, ErrNotFound) {

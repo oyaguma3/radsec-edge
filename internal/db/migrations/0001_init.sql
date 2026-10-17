@@ -2,7 +2,9 @@
 -- 鍵（テナントのサーバー証明書とヘルスチェック用の証明書の秘密鍵）は DB に入れず、ファイルに置く。
 
 -- テナント（AP のグループ）。単独モードでは id は slug と同じ（§21.2 の 4）。
--- desired_version は望む状態の版（変更のたびに 1 増やす）、applied_version と applied_hash は反映済みの版と設定のハッシュ。
+-- desired_version は望む状態の版（変更のたびに 1 増やす）、applied_version・applied_hash・applied_port は反映済みの版と
+-- 設定のハッシュとポート（整合ループは、未反映の変更を反映せず、反映済みのポートでコンテナを保つ）。
+-- enabled は運用の状態（停止・起動）で、望む状態の版には入れない。
 CREATE TABLE tenants (
     id              TEXT    PRIMARY KEY,
     slug            TEXT    NOT NULL UNIQUE,
@@ -17,6 +19,7 @@ CREATE TABLE tenants (
     desired_version INTEGER NOT NULL DEFAULT 1,
     applied_version INTEGER NOT NULL DEFAULT 0,
     applied_hash    TEXT    NOT NULL DEFAULT '',
+    applied_port    INTEGER NOT NULL DEFAULT 0,
     applied_at      INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL

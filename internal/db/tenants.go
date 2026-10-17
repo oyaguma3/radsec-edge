@@ -24,10 +24,12 @@ type Tenant struct {
 	// ClientCAPEM はテナントのクライアントCA の証明書、ServerCertPEM はテナントのサーバー証明書、
 	// ProbeCertPEM はヘルスチェック用の証明書（どれも PEM。まだなければ空）。
 	ClientCAPEM, ServerCertPEM, ProbeCertPEM string
-	Enabled                                  bool
-	// DesiredVersion は望む状態の版、AppliedVersion と AppliedHash は反映済みの版と設定のハッシュ。
+	// Enabled は運用の状態（停止・起動）。望む状態の版には入れない（SetEnabled）。
+	Enabled bool
+	// DesiredVersion は望む状態の版、AppliedVersion・AppliedHash・AppliedPort は反映済みの版と設定のハッシュとポート。
 	DesiredVersion, AppliedVersion  int64
 	AppliedHash                     string
+	AppliedPort                     int
 	AppliedAt, CreatedAt, UpdatedAt time.Time
 }
 
@@ -35,7 +37,7 @@ type Tenant struct {
 func (t Tenant) Pending() bool { return t.AppliedVersion < t.DesiredVersion }
 
 const tenantColumns = `id, slug, port, auth_upstream, acct_upstream, crl_url, client_ca_pem, server_cert_pem, probe_cert_pem,
-	enabled, desired_version, applied_version, applied_hash, applied_at, created_at, updated_at`
+	enabled, desired_version, applied_version, applied_hash, applied_port, applied_at, created_at, updated_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -44,7 +46,7 @@ func scanTenant(s scanner) (Tenant, error) {
 	var auth, acct string
 	var applied, created, updated int64
 	err := s.Scan(&t.ID, &t.Slug, &t.Port, &auth, &acct, &t.CRLURL, &t.ClientCAPEM, &t.ServerCertPEM, &t.ProbeCertPEM,
-		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &applied, &created, &updated)
+		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &t.AppliedPort, &applied, &created, &updated)
 	if err != nil {
 		return Tenant{}, err
 	}
@@ -150,7 +152,7 @@ func (d *DB) CreateTenant(ctx context.Context, s TenantSpec) (Tenant, error) {
 }
 
 // UpdateTenant は、テナントを読んで fn で変え、望む状態の版を 1 増やして書き戻す。fn が変えてよいのは
-// ポート、上流、CRL の取得先、証明書、有効・無効だけ（ID と slug は変えない）。fn がエラーを返したら何もしない。
+// ポート、上流、CRL の取得先、証明書だけ（ID・slug・有効・無効は変えない）。fn がエラーを返したら何もしない。
 func (d *DB) UpdateTenant(ctx context.Context, id string, fn func(*Tenant) error) (Tenant, error) {
 	var out Tenant
 	err := d.tx(ctx, func(tx *sql.Tx) error {
@@ -166,10 +168,10 @@ func (d *DB) UpdateTenant(ctx context.Context, id string, fn func(*Tenant) error
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE tenants SET port = ?, auth_upstream = ?, acct_upstream = ?, crl_url = ?,
-			client_ca_pem = ?, server_cert_pem = ?, probe_cert_pem = ?, enabled = ?,
+			client_ca_pem = ?, server_cert_pem = ?, probe_cert_pem = ?,
 			desired_version = desired_version + 1, updated_at = ? WHERE id = ?`,
 			t.Port, t.AuthUpstream.String(), t.AcctUpstream.String(), t.CRLURL, t.ClientCAPEM, t.ServerCertPEM, t.ProbeCertPEM,
-			t.Enabled, millis(d.now()), id)
+			millis(d.now()), id)
 		if isUnique(err) {
 			return fmt.Errorf("%w: the port is already used", ErrConflict)
 		}
@@ -197,11 +199,23 @@ func touchTenant(ctx context.Context, tx *sql.Tx, id string, now int64) error {
 	return nil
 }
 
-// MarkApplied は版 version を反映済みにする（ハッシュと時刻も残す）。反映の間に望む状態が進んでいても、
-// 反映した版の番号を残すので、次の反映でその先を反映する。
-func (d *DB) MarkApplied(ctx context.Context, id string, version int64, hash string) error {
-	_, err := d.sql.ExecContext(ctx, "UPDATE tenants SET applied_version = ?, applied_hash = ?, applied_at = ? WHERE id = ?",
-		version, hash, millis(d.now()), id)
+// SetEnabled はテナントを有効（起動）・無効（停止）にする。望む状態の版は変えない。
+func (d *DB) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	res, err := d.sql.ExecContext(ctx, "UPDATE tenants SET enabled = ?, updated_at = ? WHERE id = ?", enabled, millis(d.now()), id)
+	if err != nil {
+		return fmt.Errorf("set enabled %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkApplied は版 version を、ハッシュ hash とポート port で反映済みにする（時刻も残す）。反映の間に望む状態が
+// 進んでいても、反映した版の番号を残すので、次の反映でその先を反映する。
+func (d *DB) MarkApplied(ctx context.Context, id string, version int64, hash string, port int) error {
+	_, err := d.sql.ExecContext(ctx, "UPDATE tenants SET applied_version = ?, applied_hash = ?, applied_port = ?, applied_at = ? WHERE id = ?",
+		version, hash, port, millis(d.now()), id)
 	if err != nil {
 		return fmt.Errorf("mark applied %s: %w", id, err)
 	}

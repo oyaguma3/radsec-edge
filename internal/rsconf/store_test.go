@@ -81,6 +81,15 @@ func TestStore(t *testing.T) {
 		}
 	}
 
+	if err := s.Deactivate("tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if gen, _, _ := s.Current("tenant-a"); gen != "" {
+		t.Errorf("Current after Deactivate = %q", gen)
+	}
+	if err := s.Deactivate("tenant-a"); err != nil {
+		t.Errorf("second Deactivate = %v", err)
+	}
 	if slugs, _ := s.Slugs(); len(slugs) != 1 || slugs[0] != "tenant-a" {
 		t.Errorf("Slugs = %v", slugs)
 	}

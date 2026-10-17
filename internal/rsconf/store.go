@@ -44,6 +44,22 @@ func GenName(b Bundle) string { return b.Hash()[:16] }
 // 動いているコンテナには見えないので、リンクを付け替える（§21.2 の 1）。
 type Store struct {
 	Root string
+	// DirMode と FileMode は権限（ゼロ値なら 0750 と 0640）。試験で、ほかの利用者のコンテナに読ませるときだけ変える。
+	DirMode, FileMode fs.FileMode
+}
+
+func (s Store) dirMode() fs.FileMode {
+	if s.DirMode != 0 {
+		return s.DirMode
+	}
+	return dirMode
+}
+
+func (s Store) fileMode() fs.FileMode {
+	if s.FileMode != 0 {
+		return s.FileMode
+	}
+	return fileMode
 }
 
 func (s Store) dir(slug string) (string, error) {
@@ -120,7 +136,7 @@ func (s Store) Stage(slug string, b Bundle) (string, error) {
 	}
 	gen := GenName(b)
 	genRoot := filepath.Join(d, GenDir)
-	if err := mkdirs(s.Root, d, genRoot); err != nil {
+	if err := mkdirs(s.dirMode(), d, genRoot); err != nil {
 		return "", err
 	}
 	final := filepath.Join(genRoot, gen)
@@ -134,10 +150,10 @@ func (s Store) Stage(slug string, b Bundle) (string, error) {
 	var rnd [6]byte
 	rand.Read(rnd[:])
 	tmp := filepath.Join(genRoot, ".tmp-"+gen+"-"+hex.EncodeToString(rnd[:]))
-	if err := os.Mkdir(tmp, dirMode); err != nil {
+	if err := mkdirs(s.dirMode(), tmp); err != nil {
 		return "", fmt.Errorf("stage %s: %w", slug, err)
 	}
-	if err := writeFiles(tmp, b); err != nil {
+	if err := writeFiles(tmp, b, s.fileMode()); err != nil {
 		os.RemoveAll(tmp)
 		return "", fmt.Errorf("stage %s: %w", slug, err)
 	}
@@ -148,19 +164,24 @@ func (s Store) Stage(slug string, b Bundle) (string, error) {
 	return gen, syncDir(genRoot)
 }
 
-func mkdirs(dirs ...string) error {
+// mkdirs はディレクトリを作る（Root はあるものとする。ホストのディレクトリで、導入のときに作る）。
+func mkdirs(mode fs.FileMode, dirs ...string) error {
 	for _, d := range dirs {
-		if err := os.Mkdir(d, dirMode); err != nil && !errors.Is(err, fs.ErrExist) {
+		if err := os.Mkdir(d, mode); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		// umask で権限が狭まっても、グループが入れるようにする。
+		if err := os.Chmod(d, mode); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeFiles(dir string, b Bundle) error {
+func writeFiles(dir string, b Bundle, mode fs.FileMode) error {
 	for _, f := range Files {
 		p := filepath.Join(dir, f)
-		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileMode)
+		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 		if err != nil {
 			return err
 		}
@@ -175,7 +196,7 @@ func writeFiles(dir string, b Bundle) error {
 			return err
 		}
 		// umask で権限が狭まっても、グループが読めるようにする。
-		if err := os.Chmod(p, fileMode); err != nil {
+		if err := os.Chmod(p, mode); err != nil {
 			return err
 		}
 	}
@@ -211,6 +232,18 @@ func (s Store) Activate(slug, gen string) error {
 		return fmt.Errorf("activate %s: %w", slug, err)
 	}
 	return syncDir(d)
+}
+
+// Deactivate は current を外す（最初の反映に失敗したとき。壊れた版で起動しないように）。
+func (s Store) Deactivate(slug string) error {
+	d, err := s.dir(slug)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(d, CurrentLink)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Prune は、今の版と、使った時刻の新しい版を合わせて keep 個を残し、ほかの版のディレクトリを消す（§10.2）。

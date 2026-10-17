@@ -17,8 +17,12 @@ import (
 	// distroless のイメージにはタイムゾーンのデータがないので、埋め込んで環境変数 TZ を効かせる。
 	_ "time/tzdata"
 
+	"github.com/oyaguma3/radsec-edge/internal/agent"
 	"github.com/oyaguma3/radsec-edge/internal/config"
 	"github.com/oyaguma3/radsec-edge/internal/db"
+	"github.com/oyaguma3/radsec-edge/internal/edge"
+	"github.com/oyaguma3/radsec-edge/internal/keystore"
+	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 	"github.com/oyaguma3/radsec-edge/internal/server"
 )
 
@@ -96,6 +100,17 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	defer d.Close()
+	svc := edge.New(edge.Options{
+		Log: log, DB: d, Agent: agent.NewClient(cfg.AgentSocket),
+		Store: rsconf.Store{Root: cfg.TenantsDir}, Keys: keystore.Store{Dir: filepath.Join(cfg.DataDir, "keys")},
+		URNPrefix: cfg.URNPrefix, DNSDomain: cfg.DNSDomain, Secret: cfg.Upstream.Secret, CRLBaseURL: cfg.CRLBaseURL,
+		ProbeTimeout: cfg.ProbeTimeout,
+	})
+	log.Info("edge", "tenants_dir", cfg.TenantsDir, "agent_socket", cfg.AgentSocket, "urn_prefix", cfg.URNPrefix,
+		"dns_domain", cfg.DNSDomain, "crl_base_url", cfg.CRLBaseURL, "reconcile_interval", cfg.ReconcileInterval.String(),
+		"crl_interval", cfg.CRLInterval.String())
+	go svc.Run(ctx, cfg.ReconcileInterval, cfg.CRLInterval)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := d.Ping(r.Context()); err != nil {

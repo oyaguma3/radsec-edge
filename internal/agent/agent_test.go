@@ -237,11 +237,11 @@ func TestDockerLifecycle(t *testing.T) {
 		t.Fatalf("Ensure after Stop = %q, %v", a, err)
 	}
 	// ポートが変われば作り直す。
-	if a, err := c.Ensure(ctx, slug, slug, port-1); err != nil || a != EnsureRecreated {
+	if a, err := c.Ensure(ctx, slug, slug, port+1); err != nil || a != EnsureRecreated {
 		t.Fatalf("Ensure with another port = %q, %v", a, err)
 	}
 	waitRunning(t, c, slug)
-	if ct := container(t, c, slug); ct.Port != port-1 {
+	if ct := container(t, c, slug); ct.Port != port+1 {
 		t.Errorf("port after recreate = %d", ct.Port)
 	}
 	if err := c.Remove(ctx, slug); err != nil {
