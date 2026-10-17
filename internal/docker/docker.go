@@ -51,7 +51,9 @@ type apiError struct {
 
 func (e *apiError) Error() string { return fmt.Sprintf("docker: %d %s", e.Status, e.Message) }
 
-func (e *apiError) Is(target error) bool { return target == ErrNotFound && e.Status == http.StatusNotFound }
+func (e *apiError) Is(target error) bool {
+	return target == ErrNotFound && e.Status == http.StatusNotFound
+}
 
 // do は要求を送り、2xx と 304 以外はエラーにする。out が nil でなければ応答の JSON を読む。
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, in, out any) error {
