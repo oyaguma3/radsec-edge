@@ -1,0 +1,47 @@
+# radsec-edge が生成した radsecproxy の設定（テナント {{.Slug}}）。手で書き換えない。
+# 設計概要 §10.3。値は §8.1 の規則で検証済み。
+ListenTLS *:2083
+# LogLevel 2: 接続の確立・切断と証明書の拒否を出す（3 は認証ごとの行が加わる。§18.1 の V4）。
+LogLevel 2
+
+tls tenant {
+    CACertificateFile  {{.Dir}}/ca-bundle.pem
+    CertificateFile    {{.Dir}}/server.pem
+    CertificateKeyFile {{.Dir}}/server.key
+    CRLCheck on
+    TlsVersion TLS1_2:TLS1_3
+}
+{{range .Clients}}
+rewrite nasid-{{.NASID}} {
+    removeAttribute 32
+    addAttribute 32:'{{.NASID}}
+    supplementAttribute 1:'{{.NASID}}
+}
+client {{.NASID}} {
+    type tls
+    host 0.0.0.0/0
+    tls tenant
+    certificateNameCheck off
+    matchCertificateAttribute SubjectAltName:URI:/^{{.URI}}$/
+    rewriteIn nasid-{{.NASID}}
+}
+{{end}}
+server upstream-auth {
+    type udp
+    host {{.AuthHost}}
+    port {{.AuthPort}}
+    secret {{.Secret}}
+    statusServer on
+}
+server upstream-acct {
+    type udp
+    host {{.AcctHost}}
+    port {{.AcctPort}}
+    secret {{.Secret}}
+    statusServer on
+}
+
+realm * {
+    server upstream-auth
+    accountingServer upstream-acct
+}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/names"
+	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 )
 
 // モード（設計概要 §6）。
@@ -158,10 +159,6 @@ func Load() (Config, error) {
 	return c, errors.Join(errs...)
 }
 
-// secretPattern は共有シークレットに使える文字。設定ファイルに書くので、空白・引用符・# と、
-// radsecproxy が値の中で特別に扱いうる % などの記号は使わせない（base64 と 16 進の値は使える）。
-var secretPattern = regexp.MustCompile(`^[A-Za-z0-9._~+/=@-]{8,128}$`)
-
 func (c *Config) loadUpstream() []error {
 	var errs []error
 	for _, u := range []struct {
@@ -180,7 +177,7 @@ func (c *Config) loadUpstream() []error {
 		*u.dst = ap
 	}
 	c.Upstream.Secret = os.Getenv("EDGE_UPSTREAM_SECRET")
-	if !secretPattern.MatchString(c.Upstream.Secret) {
+	if !rsconf.ValidSecret(c.Upstream.Secret) {
 		errs = append(errs, errors.New("EDGE_UPSTREAM_SECRET: must be 8 to 128 characters of letters, digits and ._~+/=@-"))
 	}
 	return errs

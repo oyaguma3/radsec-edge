@@ -35,3 +35,27 @@ jobs:
         run: go vet ./...
       - name: テスト
         run: go test -race -count=1 ./...
+
+  docker:
+    name: 結合の試験（Docker）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: radsecproxy のイメージのビルド
+        run: docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy
+      - name: 結合の試験
+        env:
+          EDGE_TEST_DOCKER: "1"
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./... | tee docker.log
+          # Docker の試験は EDGE_TEST_DOCKER がないとスキップされ、テスト自体は成功してしまうので、別に確かめる。
+          if grep -q -- '--- SKIP' docker.log; then
+            echo "スキップされた試験があります"
+            grep -- '--- SKIP' docker.log
+            exit 1
+          fi
