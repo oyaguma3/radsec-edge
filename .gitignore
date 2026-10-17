@@ -1,0 +1,8 @@
+# 検証用の環境の情報などを含むので公開しない（引き継ぎのメモ）
+CLAUDE.md
+
+# ローカルのパスを含むので共有しない
+.claude/settings.json
+
+# 段階 0 の検証の道具のビルドの結果（verify/v0/README.md の手順で作る）
+/verify/v0/bin/

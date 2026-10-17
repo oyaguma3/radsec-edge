@@ -1,0 +1,70 @@
+# 段階 0 の実機の検証（設計概要 §18）。ホストにポートを公開せず、外に出ない内部のネットワークだけを使う。
+name: radsec-v0
+
+x-rsp: &rsp
+  image: radsec-v0:latest
+  # 設計概要 §10.2 のひな形（V9: nonroot・読み取り専用のルートのファイルシステム）
+  user: "100:101"
+  # radsecproxy は PID 1 のままだと SIGTERM で止まらない（V6）。init（tini）を PID 1 にする
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  command: ["radsecproxy", "-f", "-c", "/conf/radsecproxy.conf"]
+  restart: "no"
+
+services:
+  upstream:
+    image: radsec-v0:latest
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    volumes: ["./bin/fakeradius:/usr/local/bin/fakeradius:ro"]
+    command: ["fakeradius", "-secret", "upsecret"]
+    networks: [rsv0]
+
+  edge-a1:
+    <<: *rsp
+    depends_on: [upstream]
+    volumes: ["./conf/edge-a1:/conf:ro"]
+    networks: {rsv0: {aliases: [primary.tenant-a.radsec.test]}}
+  edge-a2:
+    <<: *rsp
+    depends_on: [upstream]
+    volumes: ["./conf/edge-a2:/conf:ro"]
+    networks: {rsv0: {aliases: [secondary.tenant-a.radsec.test]}}
+  edge-b1:
+    <<: *rsp
+    depends_on: [upstream]
+    volumes: ["./conf/edge-b1:/conf:ro"]
+    networks: {rsv0: {aliases: [primary.tenant-b.radsec.test]}}
+  edge-c1:
+    <<: *rsp
+    depends_on: [upstream]
+    volumes: ["./conf/edge-c1:/conf:ro"]
+    networks: {rsv0: {aliases: [primary.tenant-c.radsec.test]}}
+
+  ap-a:
+    <<: *rsp
+    depends_on: [edge-a1, edge-a2]
+    volumes: ["./conf/ap-a:/conf:ro"]
+    networks: [rsv0]
+  ap-r:
+    <<: *rsp
+    depends_on: [edge-a1, edge-a2]
+    volumes: ["./conf/ap-r:/conf:ro"]
+    networks: [rsv0]
+  ap-b:
+    <<: *rsp
+    depends_on: [edge-b1]
+    volumes: ["./conf/ap-b:/conf:ro"]
+    networks: [rsv0]
+  ap-x:
+    <<: *rsp
+    depends_on: [edge-b1]
+    volumes: ["./conf/ap-x:/conf:ro"]
+    networks: [rsv0]
+
+networks:
+  rsv0:
+    internal: true
