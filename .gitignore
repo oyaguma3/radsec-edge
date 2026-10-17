@@ -19,3 +19,8 @@ coverage.*
 # エディター
 *.swp
 *~
+
+# 生成した CSS（Docker のビルドの段で作る）と、その生成に使うファイル（scripts/build-css.sh が取得する）
+/internal/web/static/app.css
+/internal/web/css/daisyui.mjs
+/.cache/

@@ -17,13 +17,16 @@ import (
 	// distroless のイメージにはタイムゾーンのデータがないので、埋め込んで環境変数 TZ を効かせる。
 	_ "time/tzdata"
 
+	"github.com/oyaguma3/radsec-edge/internal/access"
 	"github.com/oyaguma3/radsec-edge/internal/agent"
+	"github.com/oyaguma3/radsec-edge/internal/auth"
 	"github.com/oyaguma3/radsec-edge/internal/config"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge"
 	"github.com/oyaguma3/radsec-edge/internal/keystore"
 	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 	"github.com/oyaguma3/radsec-edge/internal/server"
+	"github.com/oyaguma3/radsec-edge/internal/web"
 )
 
 // version はビルド時に -ldflags "-X main.version=..." で埋め込む。
@@ -111,15 +114,39 @@ func serve(ctx context.Context) error {
 		"crl_interval", cfg.CRLInterval.String())
 	go svc.Run(ctx, cfg.ReconcileInterval, cfg.CRLInterval)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := d.Ping(r.Context()); err != nil {
-			http.Error(w, "db is not available", http.StatusServiceUnavailable)
-			return
-		}
-		fmt.Fprintln(w, "ok")
-	})
-	return server.Run(ctx, server.Options{Addr: cfg.GUIAddr, Handler: mux, Log: log})
+	ident, err := newIdentifier(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
+	h, err := web.New(web.Options{Log: log, Version: version, Mode: cfg.Mode, DB: d, Edge: svc, Identifier: ident,
+		AuthUpstream: cfg.Upstream.Auth, AcctUpstream: cfg.Upstream.Acct, CRLWarn: cfg.CRLWarn, ApplyTimeout: cfg.ApplyTimeout})
+	if err != nil {
+		return err
+	}
+	// 画面から待つ反映は、構文検査とヘルスチェックを含めて時間がかかるので、上限を長くする。
+	return server.Run(ctx, server.Options{Addr: cfg.GUIAddr, Handler: h.Routes(), Log: log,
+		WriteTimeout: max(3*time.Minute, cfg.ApplyTimeout+time.Minute)})
+}
+
+// newIdentifier は、要求から利用者を決める方法を作る（Cloudflare Access の JWT、または開発用の設定）。
+func newIdentifier(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.Identifier, error) {
+	if cfg.DevMode() {
+		log.Warn("development mode: requests are not authenticated; every request acts as the development user "+
+			"(EDGE_DEV_USER_EMAIL). Do not use this setting in production", "email", cfg.DevUserEmail, "addr", cfg.GUIAddr)
+		return auth.Dev(cfg.DevUserEmail), nil
+	}
+	v, err := access.New(access.Options{TeamDomain: cfg.AccessTeamDomain, AUDs: cfg.AccessAUDs,
+		HTTPClient: &http.Client{Timeout: 10 * time.Second}})
+	if err != nil {
+		return nil, err
+	}
+	// 公開鍵を先に取得しておく。取得できなくても起動は続ける（最初の要求のときにもう一度試みる）。
+	if n, err := v.Refresh(ctx); err != nil {
+		log.Warn("cannot fetch Cloudflare Access public keys; will retry on the first request", "url", v.CertsURL(), "error", err)
+	} else {
+		log.Info("cloudflare access", "team_domain", cfg.AccessTeamDomain, "auds", len(cfg.AccessAUDs), "keys", n)
+	}
+	return auth.Access(v), nil
 }
 
 func migrate(ctx context.Context) error {

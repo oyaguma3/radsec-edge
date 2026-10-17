@@ -1,0 +1,70 @@
+{{define "content" -}}
+{{with .Data -}}
+<h1 class="text-2xl font-bold mb-4">ダッシュボード</h1>
+<div class="grid gap-4 md:grid-cols-3 mb-6">
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">agent と Docker</h2>
+      {{- if .AgentError}}
+      <p><span class="badge badge-error">agent に届きません</span></p>
+      <p class="text-sm break-all">{{.AgentError}}</p>
+      {{- else if not .Agent.DockerOK}}
+      <p><span class="badge badge-error">Docker に届きません</span></p>
+      <p class="text-sm break-all">{{.Agent.DockerError}}</p>
+      {{- else}}
+      <p><span class="badge badge-success">正常</span> <span class="text-sm">agent {{.Agent.Version}}</span></p>
+      <p class="text-sm">イメージ <code>{{.Agent.Image}}</code>: {{if .Agent.ImagePresent}}あり{{else}}<span class="text-error">ありません（images/radsecproxy から作ってください）</span>{{end}}</p>
+      <p class="text-sm">ネットワーク <code>{{.Agent.Network}}</code>: {{if .Agent.NetworkPresent}}あり{{else}}<span class="text-error">ありません</span>{{end}}</p>
+      {{- end}}
+    </div>
+  </div>
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">整合ループ</h2>
+      <p class="text-sm">最後に回った時刻: {{datetime .Reconcile.At}}</p>
+      {{- if .Reconcile.Error}}<p class="text-sm text-error break-all">{{.Reconcile.Error}}</p>{{else if not .Reconcile.At.IsZero}}<p><span class="badge badge-success">正常</span></p>{{end}}
+    </div>
+  </div>
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">容量</h2>
+      <p class="text-3xl font-bold">{{.Tenants}} <span class="text-base font-normal">/ {{.Capacity}} テナント</span></p>
+      <p class="text-sm text-base-content/60">テナントにはポート（20830〜20999）を 1 つずつ割り当てます。</p>
+    </div>
+  </div>
+</div>
+
+<div class="card bg-base-100 shadow mb-6">
+  <div class="card-body">
+    <h2 class="card-title">CRL の期限と取得</h2>
+    {{- if .CRLProblems}}
+    <p class="text-sm">nextUpdate を過ぎると新しい接続が拒否されます。残りが {{.CRLWarn}} を切ったテナントと、取得に失敗しているテナントです。</p>
+    <ul class="list-disc ml-6">
+      {{- range .CRLProblems}}
+      <li><a class="link" href="/tenants/{{.ID}}">{{.Slug}}</a> {{template "crl-badge" .CRL}}{{with .CRL.LastError}} <span class="text-sm text-base-content/60">{{.}}</span>{{end}}</li>
+      {{- end}}
+    </ul>
+    {{- else}}<p><span class="badge badge-success">警告なし</span></p>{{end}}
+  </div>
+</div>
+
+<div class="grid gap-4 md:grid-cols-2">
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">未反映の変更のあるテナント</h2>
+      {{- if .Pending}}
+      <ul class="list-disc ml-6">{{range .Pending}}<li><a class="link" href="/tenants/{{.ID}}">{{.Slug}}</a>（版 {{.AppliedVersion}} → {{.DesiredVersion}}）</li>{{end}}</ul>
+      {{- else}}<p class="text-base-content/60">ありません。</p>{{end}}
+    </div>
+  </div>
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">コンテナが動いていないテナント</h2>
+      {{- if .Down}}
+      <ul class="list-disc ml-6">{{range .Down}}<li><a class="link" href="/tenants/{{.ID}}">{{.Slug}}</a> {{template "container-badge" .Container}}</li>{{end}}</ul>
+      {{- else}}<p class="text-base-content/60">ありません。</p>{{end}}
+    </div>
+  </div>
+</div>
+{{- end}}
+{{- end}}

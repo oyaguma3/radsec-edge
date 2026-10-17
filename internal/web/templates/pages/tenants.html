@@ -1,0 +1,66 @@
+{{define "content" -}}
+<h1 class="text-2xl font-bold mb-4">テナント</h1>
+{{template "tenants-section" .Data}}
+{{- end}}
+
+{{/* 作成で誤りがあったとき、htmx でこの部分を差し替える。 */}}
+{{define "tenants-section" -}}
+<div id="tenants">
+  {{template "alerts" (dict "Error" .Error)}}
+  {{- with .AgentError}}<div role="alert" class="alert alert-warning mb-4"><span>agent に届かないため、コンテナの状態を出せません: {{.}}</span></div>{{end}}
+  <div class="overflow-x-auto bg-base-100 rounded-box shadow mb-6">
+    <table class="table table-sm">
+      <thead><tr><th>テナント</th><th>ポート</th><th>AP</th><th>コンテナ</th><th>反映</th><th>CRL</th></tr></thead>
+      <tbody>
+        {{- range .Rows}}
+        <tr>
+          <td><a class="link" href="/tenants/{{.ID}}">{{.Slug}}</a>{{if not .Enabled}} <span class="badge badge-ghost badge-sm">停止中</span>{{end}}</td>
+          <td>{{.Port}}{{if and .AppliedPort (ne .AppliedPort .Port)}} <span class="text-sm text-base-content/60">（反映済み {{.AppliedPort}}）</span>{{end}}</td>
+          <td>{{.APs}}</td>
+          <td>{{template "container-badge" .Container}}</td>
+          <td>{{if .Pending}}<span class="badge badge-warning badge-sm">未反映あり</span>{{else}}版 {{.AppliedVersion}}{{end}}</td>
+          <td>{{template "crl-badge" .CRL}}</td>
+        </tr>
+        {{- else}}
+        <tr><td colspan="6" class="text-base-content/60">テナントはありません。</td></tr>
+        {{- end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card bg-base-100 shadow">
+    <div class="card-body">
+      <h2 class="card-title">作成</h2>
+      <p class="text-sm text-base-content/60">テナントの名前は SAN・NAS-Identifier・DNS の名前に入るので、作った後は変えられません。ポートの空き: {{.Free}} / {{.Capacity}}。</p>
+      <form hx-post="/tenants" hx-target="#tenants" hx-swap="outerHTML" autocomplete="off" class="grid gap-2 md:grid-cols-2">
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">テナントの名前（slug）</legend>
+          <input name="slug" value="{{.Form.Slug}}" required maxlength="32" class="input w-full">
+          <p class="label">英小文字・数字・- の 1〜32 文字（例 tenant-a）</p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">ポート</legend>
+          <input name="port" value="{{.Form.Port}}" inputmode="numeric" class="input w-full">
+          <p class="label">20830〜20999。空なら空いているものを割り当てます</p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">上流（認証）</legend>
+          <input name="auth" value="{{.Form.Auth}}" required class="input w-full">
+          <p class="label">IP アドレス:ポート（例 10.0.0.10:1812。ホスト名は使えません）</p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">上流（課金）</legend>
+          <input name="acct" value="{{.Form.Acct}}" required class="input w-full">
+          <p class="label">IP アドレス:ポート（例 10.0.0.10:1813）</p>
+        </fieldset>
+        <fieldset class="fieldset md:col-span-2">
+          <legend class="fieldset-legend">CRL の取得先（任意）</legend>
+          <input name="crl_url" value="{{.Form.CRLURL}}" class="input w-full">
+          <p class="label">空なら EDGE_CRL_BASE_URL の /crl/tenant.&lt;テナント&gt;.pem から取ります</p>
+        </fieldset>
+        <div><button type="submit" class="btn btn-primary">作成する</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{{- end}}

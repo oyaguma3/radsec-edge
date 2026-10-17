@@ -1,0 +1,40 @@
+{{/* 複数の画面で使う部品。すべてのページから使える。 */}}
+
+{{/* alerts は画面の上部の成功とエラーの文。引数は dict で Message、Error。 */}}
+{{define "alerts" -}}
+{{- with .Message}}<div role="status" class="alert alert-success mb-4"><span>{{.}}</span></div>{{end}}
+{{- with .Error}}<div role="alert" class="alert alert-error mb-4"><span class="whitespace-pre-wrap">{{.}}</span></div>{{end}}
+{{- end}}
+
+{{/* confirm は確認ダイアログ。開くボタンは command="show-modal" commandfor="ID" を持つ。
+     引数は dict で ID、Title、Message、Form（確認のボタンで送るフォームの id）、Label（確認のボタンの文字）、Class（ボタンの色）。 */}}
+{{define "confirm" -}}
+<dialog id="{{.ID}}" class="modal">
+  <div class="modal-box">
+    <h3 class="text-lg font-bold">{{.Title}}</h3>
+    <p class="py-4">{{.Message}}</p>
+    <div class="modal-action">
+      <form method="dialog"><button class="btn">やめる</button></form>
+      <button type="submit" form="{{.Form}}" class="btn {{.Class}}">{{.Label}}</button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>閉じる</button></form>
+</dialog>
+{{- end}}
+
+{{/* container-badge はコンテナの状態（引数は *agent.Container。nil ならなし）。 */}}
+{{define "container-badge" -}}
+{{- if not .}}<span class="badge badge-ghost">なし</span>
+{{- else if .Running}}<span class="badge badge-success">{{stateLabel .State}}</span>
+{{- else if .Restarting}}<span class="badge badge-warning">{{stateLabel .State}}</span>
+{{- else}}<span class="badge badge-error">{{stateLabel .State}}</span>{{end -}}
+{{- end}}
+
+{{/* crl-badge は CRL の状態（引数は crlState）。 */}}
+{{define "crl-badge" -}}
+{{- if .Missing}}<span class="badge badge-warning">なし</span>
+{{- else if .Expired}}<span class="badge badge-error">期限切れ</span>
+{{- else if .Warn}}<span class="badge badge-warning">残り {{.RemainingText}}</span>
+{{- else}}<span class="badge badge-success badge-outline">残り {{.RemainingText}}</span>{{end -}}
+{{- if .LastError}} <span class="badge badge-error badge-outline" title="{{.LastError}}">取得に失敗</span>{{end -}}
+{{- end}}

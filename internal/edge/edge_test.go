@@ -39,7 +39,7 @@ func TestApplyNeedsEverything(t *testing.T) {
 	if err == nil || !IsInput(err) || rec.Result != db.ResultFailed || !strings.Contains(err.Error(), "そろっていません") {
 		t.Fatalf("Apply = %+v, %v", rec, err)
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("agent was called: %v", calls)
 	}
 	p, _ := e.svc.Plan(ctx, "tenant-a")
@@ -62,8 +62,8 @@ func TestApplyFlow(t *testing.T) {
 	if err != nil || rec.Result != db.ResultOK || rec.Action != agent.EnsureCreated {
 		t.Fatalf("Apply = %+v, %v", rec, err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"validate tenant-a", "ensure tenant-a"})
-	if got := e.probe.addrs[len(e.probe.addrs)-1]; got != "radsecproxy-tenant-a:2083" {
+	eq(t, "calls", e.agent.TakeCalls(), []string{"validate tenant-a", "ensure tenant-a"})
+	if got := e.probe.Addrs[len(e.probe.Addrs)-1]; got != "radsecproxy-tenant-a:2083" {
 		t.Errorf("probe addr = %s", got)
 	}
 	tn, _ = e.db.Tenant(ctx, "tenant-a")
@@ -77,7 +77,7 @@ func TestApplyFlow(t *testing.T) {
 	if rec, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil || rec.Action != "none" {
 		t.Errorf("Apply(same) = %+v, %v", rec, err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"ensure tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"ensure tenant-a"})
 
 	// AP を足すと、client ブロックが変わるので再起動する。
 	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil); err != nil {
@@ -90,13 +90,13 @@ func TestApplyFlow(t *testing.T) {
 	if rec, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil || rec.Action != "restart" || rec.Version != 5 {
 		t.Fatalf("Apply(ap) = %+v, %v", rec, err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"validate tenant-a", "ensure tenant-a", "restart tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"validate tenant-a", "ensure tenant-a", "restart tenant-a"})
 
 	// CRL の更新は、望む状態の版を上げずに、反映済みの版に入れて SIGHUP する。
 	if err := e.svc.InstallCRL(ctx, e.user, "tenant-a", e.ca.CRL(t, pkitest.CRL{Number: 2, Revoked: []*big.Int{big.NewInt(9)}})); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"sighup tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"sighup tenant-a"})
 	after, _ := e.db.Tenant(ctx, "tenant-a")
 	if after.Pending() || after.DesiredVersion != 5 || after.AppliedHash == tn.AppliedHash {
 		t.Errorf("tenant after crl: pending=%v desired=%d hash changed=%v", after.Pending(), after.DesiredVersion, after.AppliedHash != tn.AppliedHash)
@@ -117,7 +117,7 @@ func TestApplyFlow(t *testing.T) {
 	if err := e.svc.InstallCRL(ctx, e.user, "tenant-a", e.ca.CRL(t, pkitest.CRL{Number: 3, ThisUpdate: now.Add(-2 * time.Hour), NextUpdate: now.Add(-time.Hour)})); err == nil {
 		t.Error("expired CRL accepted")
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("calls after rejected CRLs = %v", calls)
 	}
 	// 版のディレクトリは 3 つまで。
@@ -147,34 +147,34 @@ func TestApplyRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	goodGen, _, _ := e.svc.Store.Current("tenant-a")
-	e.agent.takeCalls()
+	e.agent.TakeCalls()
 
 	// 構文検査で断られたら、何も変えない。
 	e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil)
-	e.agent.validateOK = false
+	e.agent.ValidateOK = false
 	rec, err := e.svc.Apply(ctx, e.user, "tenant-a")
 	if err == nil || rec.Result != db.ResultFailed || !strings.Contains(err.Error(), "syntax error") {
 		t.Fatalf("Apply(invalid) = %+v, %v", rec, err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"validate tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"validate tenant-a"})
 	if gen, _, _ := e.svc.Store.Current("tenant-a"); gen != goodGen {
 		t.Error("current changed after a validation failure")
 	}
-	e.agent.validateOK = true
+	e.agent.ValidateOK = true
 
 	// ヘルスチェックが通らなければ、前の版に戻して再起動する。
-	e.probe.setFail(true)
+	e.probe.SetFail(true)
 	go func() {
 		// 前の版のヘルスチェックは通す（戻した後）。
 		time.Sleep(1500 * time.Millisecond)
-		e.probe.setFail(false)
+		e.probe.SetFail(false)
 	}()
 	e.svc.ProbeTimeout = time.Second
 	rec, err = e.svc.Apply(ctx, e.user, "tenant-a")
 	if err == nil || rec.Result != db.ResultRolledBack {
 		t.Fatalf("Apply(probe fails) = %+v, %v", rec, err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"validate tenant-a", "ensure tenant-a", "restart tenant-a", "ensure tenant-a", "restart tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"validate tenant-a", "ensure tenant-a", "restart tenant-a", "ensure tenant-a", "restart tenant-a"})
 	if gen, _, _ := e.svc.Store.Current("tenant-a"); gen != goodGen {
 		t.Error("not rolled back to the previous generation")
 	}
@@ -188,21 +188,21 @@ func TestFirstApplyFailure(t *testing.T) {
 	e := newEnv(t)
 	ctx := t.Context()
 	e.readyTenant(t, "tenant-a")
-	e.probe.setFail(true)
+	e.probe.SetFail(true)
 	e.svc.ProbeTimeout = 500 * time.Millisecond
 	rec, err := e.svc.Apply(ctx, e.user, "tenant-a")
 	if err == nil || rec.Result != db.ResultRolledBack {
 		t.Fatalf("Apply = %+v, %v", rec, err)
 	}
 	// 前の版がないので、止めて current を外す（整合ループが壊れた版で起動しない）。
-	eq(t, "calls", e.agent.takeCalls(), []string{"validate tenant-a", "ensure tenant-a", "stop tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"validate tenant-a", "ensure tenant-a", "stop tenant-a"})
 	if gen, _, _ := e.svc.Store.Current("tenant-a"); gen != "" {
 		t.Errorf("current = %q", gen)
 	}
 	if err := e.svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("reconcile started a broken generation: %v", calls)
 	}
 }
@@ -217,53 +217,53 @@ func TestReconcile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.agent.takeCalls()
+	e.agent.TakeCalls()
 	// 何も変わっていなければ何もしない。
 	if err := e.svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("calls = %v", calls)
 	}
 	// 手で止めたコンテナは起動し、消えたコンテナは作り直す。未反映の変更（ポート）は反映しない。
-	e.agent.containers["tenant-a"].Running = false
-	delete(e.agent.containers, "tenant-b")
+	e.agent.Containers["tenant-a"].Running = false
+	delete(e.agent.Containers, "tenant-b")
 	if _, err := e.svc.UpdateTenant(ctx, e.user, "tenant-b", TenantInput{Port: 20900, Auth: authUp, Acct: acctUp}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"ensure tenant-a", "ensure tenant-b"})
-	if p := e.agent.containers["tenant-b"].Port; p != 20831 {
+	eq(t, "calls", e.agent.TakeCalls(), []string{"ensure tenant-a", "ensure tenant-b"})
+	if p := e.agent.Containers["tenant-b"].Port; p != 20831 {
 		t.Errorf("tenant-b port = %d, want the applied port 20831", p)
 	}
 	// 停止したテナントのコンテナは止める（SetEnabled はすぐに効かせる）。
 	if err := e.svc.SetEnabled(ctx, e.user, "tenant-a", false); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"stop tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"stop tenant-a"})
 	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); !IsInput(err) {
 		t.Errorf("Apply(stopped) = %v", err)
 	}
 	if err := e.svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("calls for a stopped tenant = %v", calls)
 	}
 	if err := e.svc.SetEnabled(ctx, e.user, "tenant-a", true); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"ensure tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"ensure tenant-a"})
 
 	// DB にないテナントのコンテナとディレクトリは片付ける。
-	e.agent.containers["gone"] = &agent.Container{TenantID: "gone", Slug: "gone", Running: true}
+	e.agent.Containers["gone"] = &agent.Container{TenantID: "gone", Slug: "gone", Running: true}
 	os.MkdirAll(filepath.Join(e.svc.Store.Root, "gone", "gen"), 0o750)
 	if err := e.svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"remove gone"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"remove gone"})
 	if _, err := os.Stat(filepath.Join(e.svc.Store.Root, "gone")); !os.IsNotExist(err) {
 		t.Error("the directory of a deleted tenant is left")
 	}
@@ -275,7 +275,7 @@ func TestReconcile(t *testing.T) {
 	if err := e.svc.DeleteTenant(ctx, e.user, "tenant-b"); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"remove tenant-b"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"remove tenant-b"})
 	if _, err := os.Stat(filepath.Join(e.svc.Store.Root, "tenant-b")); !os.IsNotExist(err) {
 		t.Error("tenant dir is left")
 	}
@@ -291,7 +291,7 @@ func TestRefreshCRL(t *testing.T) {
 	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
 		t.Fatal(err)
 	}
-	e.agent.takeCalls()
+	e.agent.TakeCalls()
 
 	var body atomic.Value
 	body.Store(e.ca.CRL(t, pkitest.CRL{Number: 5}))
@@ -318,7 +318,7 @@ func TestRefreshCRL(t *testing.T) {
 	if err := e.svc.RefreshCRL(ctx, System, "tenant-a"); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "calls", e.agent.takeCalls(), []string{"sighup tenant-a"})
+	eq(t, "calls", e.agent.TakeCalls(), []string{"sighup tenant-a"})
 	c, _ := e.db.CRL(ctx, "tenant-a")
 	if c.Number != "5" || c.Source != "fetch" || c.ETag == "" || c.LastError != "" {
 		t.Errorf("crl = %+v", c)
@@ -330,7 +330,7 @@ func TestRefreshCRL(t *testing.T) {
 	if notModified.Load() != 1 {
 		t.Errorf("304 = %d", notModified.Load())
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("calls after 304 = %v", calls)
 	}
 	// 期限の切れた CRL は置かず、取得の誤りとして残す。
@@ -353,7 +353,7 @@ func TestRefreshCRL(t *testing.T) {
 	if err := e.svc.RefreshCRL(ctx, System, "tenant-a"); err == nil {
 		t.Error("unreachable server accepted")
 	}
-	if calls := e.agent.takeCalls(); len(calls) != 0 {
+	if calls := e.agent.TakeCalls(); len(calls) != 0 {
 		t.Errorf("calls after failures = %v", calls)
 	}
 	// テナントごとの取得先。

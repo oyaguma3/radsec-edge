@@ -1,0 +1,15 @@
+{{define "content" -}}
+{{$user := .User -}}
+{{with .Data -}}
+<div class="card bg-base-100 shadow max-w-xl mx-auto">
+  <div class="card-body">
+    <h1 class="card-title">{{.Status}}</h1>
+    <p role="alert">{{.Message}}</p>
+    {{- /* 利用者を確かめられなかった画面（401・503）では、トップへ戻っても同じ画面になるので出さない。 */}}
+    {{- if $user}}
+    <div class="card-actions justify-end"><a href="/" class="btn btn-primary">トップへ</a></div>
+    {{- end}}
+  </div>
+</div>
+{{- end}}
+{{- end}}

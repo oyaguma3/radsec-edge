@@ -1,0 +1,281 @@
+{{define "content" -}}
+<div class="breadcrumbs text-sm mb-2"><ul><li><a href="/tenants">テナント</a></li><li>{{.Data.Tenant.Slug}}</li></ul></div>
+{{template "tenant-detail" .Data}}
+{{- end}}
+
+{{/* 操作のたびに htmx でこの部分を差し替える。 */}}
+{{define "tenant-detail" -}}
+<div id="tenant">
+  <h1 class="text-2xl font-bold mb-4">テナント {{.Tenant.Slug}}{{if not .Tenant.Enabled}} <span class="badge badge-ghost align-middle">停止中</span>{{end}}</h1>
+  {{template "alerts" (dict "Message" .Message "Error" .Error)}}
+
+  {{/* ---- 状態と運用の操作 ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">状態</h2>
+      <table class="table table-sm">
+        <tbody>
+          <tr><th class="w-48">コンテナ</th><td>
+            {{- if .AgentError}}<span class="text-error">agent に届きません: {{.AgentError}}</span>
+            {{- else}}{{template "container-badge" .Container}}{{with .Container}} <code class="text-xs">{{.Name}}</code>
+              {{- if .RestartCount}} <span class="text-sm">再起動 {{.RestartCount}} 回</span>{{end}}
+              {{- if not .StartedAt.IsZero}} <span class="text-sm text-base-content/60">{{datetime .StartedAt}} に起動</span>{{end}}
+              {{- if not .SpecCurrent}} <span class="badge badge-warning badge-sm">ひな形が古い（次の反映で作り直します）</span>{{end}}{{end}}
+            {{- end}}</td></tr>
+          <tr><th>ポート</th><td>{{.Tenant.Port}}{{if and .Tenant.AppliedPort (ne .Tenant.AppliedPort .Tenant.Port)}}（反映済みは {{.Tenant.AppliedPort}}）{{end}}</td></tr>
+          <tr><th>望む状態の版</th><td>{{.Tenant.DesiredVersion}}</td></tr>
+          <tr><th>反映済みの版</th><td>{{if .Tenant.AppliedVersion}}{{.Tenant.AppliedVersion}}（{{datetime .Tenant.AppliedAt}}、設定のハッシュ <code>{{short 16 .Tenant.AppliedHash}}</code>）{{else}}まだ反映していません{{end}}</td></tr>
+        </tbody>
+      </table>
+      <div class="card-actions">
+        <form id="tenant-restart" hx-post="/tenants/{{.Tenant.ID}}/restart" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"></form>
+        <button type="button" class="btn btn-sm" command="show-modal" commandfor="dialog-restart">再起動</button>
+        {{template "confirm" (dict "ID" "dialog-restart" "Title" "再起動" "Form" "tenant-restart" "Label" "再起動する" "Class" "btn-primary"
+          "Message" (printf "テナント %s の radsecproxy を再起動します。このテナントの AP の接続がいったん切れます（予備のエッジにつなぎ替えます）。よろしいですか？" .Tenant.Slug))}}
+        {{- if .Tenant.Enabled}}
+        <form id="tenant-stop" hx-post="/tenants/{{.Tenant.ID}}/stop" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"></form>
+        <button type="button" class="btn btn-sm btn-error btn-outline" command="show-modal" commandfor="dialog-stop">停止</button>
+        {{template "confirm" (dict "ID" "dialog-stop" "Title" "停止" "Form" "tenant-stop" "Label" "停止する" "Class" "btn-error"
+          "Message" (printf "テナント %s の radsecproxy を止めます。起動するまで、このテナントの AP はこのエッジにつながりません（整合ループも起動しません）。よろしいですか？" .Tenant.Slug))}}
+        {{- else}}
+        <form hx-post="/tenants/{{.Tenant.ID}}/start" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><button class="btn btn-sm btn-primary">起動</button></form>
+        {{- end}}
+      </div>
+    </div>
+  </div>
+
+  {{/* ---- 未反映の変更と反映 ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">反映{{if .Tenant.Pending}} <span class="badge badge-warning">未反映の変更あり</span>{{end}}</h2>
+      {{- if .PlanError}}<p class="text-error">変更を求められません: {{.PlanError}}</p>
+      {{- else if .Plan.Missing}}
+      <p>反映に要るものがそろっていません: {{range $i, $m := .Plan.Missing}}{{if $i}}、{{end}}<strong>{{$m}}</strong>{{end}}。</p>
+      <p class="text-sm text-base-content/60">下の「証明書」と「CRL」で取り込んでください。ヘルスチェックを省いた反映はしません。</p>
+      {{- else if .Plan.Error}}<p class="text-error whitespace-pre-wrap">{{.Plan.Error}}</p>
+      {{- else}}
+        {{- if .Plan.Same}}<p>反映済みの版と同じです（反映すると、コンテナの状態を確かめてヘルスチェックだけを行います）。</p>
+        {{- else}}
+        <p>反映すると、radsecproxy に <strong>{{if eq (printf "%s" .Plan.Action) "restart"}}再起動（このテナントの AP の接続がいったん切れます）{{else if eq (printf "%s" .Plan.Action) "sighup"}}SIGHUP（接続は切れません）{{else}}何もしません{{end}}</strong> を行います。</p>
+        {{- with .Plan.Files}}<p>設定のほかに変わるもの: {{range $i, $f := .}}{{if $i}}、{{end}}{{$f}}{{end}}</p>{{end}}
+        {{- if .Plan.Hunks}}
+        <p class="text-sm">radsecproxy.conf の差分:</p>
+        <pre class="bg-base-200 rounded p-2 text-xs overflow-x-auto max-h-96">{{range .Plan.Hunks}}<span class="text-base-content/50">@@ -{{.OldStart}} +{{.NewStart}} @@</span>
+{{range .Lines}}{{if eq (opChar .Op) "+"}}<span class="text-success">+{{.Text}}</span>{{else if eq (opChar .Op) "-"}}<span class="text-error">-{{.Text}}</span>{{else}} {{.Text}}{{end}}
+{{end}}{{end}}</pre>
+        {{- end}}
+        {{- end}}
+      <div class="card-actions">
+        <form id="tenant-apply" hx-post="/tenants/{{.Tenant.ID}}/apply" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"></form>
+        <button type="button" class="btn btn-primary" command="show-modal" commandfor="dialog-apply"{{if not .Tenant.Enabled}} disabled{{end}}>反映する</button>
+        {{template "confirm" (dict "ID" "dialog-apply" "Title" "反映" "Form" "tenant-apply" "Label" "反映する" "Class" "btn-primary"
+          "Message" "設定を生成して構文検査し、radsecproxy に効かせてからヘルスチェックを行います。失敗したら前の版に戻します。よろしいですか？")}}
+        {{- if not .Tenant.Enabled}}<p class="text-sm text-base-content/60">停止しているテナントは反映できません。起動してから反映してください。</p>{{end}}
+      </div>
+      {{- end}}
+    </div>
+  </div>
+
+  {{/* ---- 設定 ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">設定</h2>
+      <form hx-post="/tenants/{{.Tenant.ID}}/update" hx-target="#tenant" hx-swap="outerHTML" autocomplete="off" class="grid gap-2 md:grid-cols-2">
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">ポート</legend>
+          <input name="port" value="{{.Form.Port}}" required inputmode="numeric" class="input w-full">
+          <p class="label">20830〜20999（AP の設定に入るので、ふつうは変えません）</p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">CRL の取得先</legend>
+          <input name="crl_url" value="{{.Form.CRLURL}}" class="input w-full">
+          <p class="label">空なら EDGE_CRL_BASE_URL から決めます</p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">上流（認証）</legend>
+          <input name="auth" value="{{.Form.Auth}}" required class="input w-full">
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">上流（課金）</legend>
+          <input name="acct" value="{{.Form.Acct}}" required class="input w-full">
+        </fieldset>
+        <div><button type="submit" class="btn">変更する</button></div>
+      </form>
+      <div class="mt-2">
+        <p class="font-semibold">DNS に登録する名前</p>
+        <p class="text-sm text-base-content/60">AP には primary を主、secondary（と tertiary）を予備の RadSec サーバーとして、ポート {{.Tenant.Port}} とともに設定します。
+          それぞれ、このテナントを置いたエッジの公開のアドレスに向けます。</p>
+        <ul class="list-disc ml-6 text-sm">{{range .DNSNames}}<li><code>{{.}}</code></li>{{end}}</ul>
+      </div>
+    </div>
+  </div>
+
+  {{/* ---- 証明書 ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">証明書</h2>
+      <p class="text-sm text-base-content/60">鍵はエッジで作り、外に出しません。CSR を CA（radsec-ca）の画面で署名して、できた証明書を取り込みます。</p>
+
+      <h3 class="font-semibold mt-2">クライアントCA（テナントの AP の証明書を発行する CA）</h3>
+      {{template "cert-info" .ClientCA}}
+      <form hx-post="/tenants/{{.Tenant.ID}}/client-ca" hx-target="#tenant" hx-swap="outerHTML" class="flex flex-col gap-2">
+        <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN CERTIFICATE-----" required></textarea>
+        <div><button class="btn btn-sm">取り込む</button></div>
+      </form>
+
+      <h3 class="font-semibold mt-4">サーバー証明書（AP に見せる証明書。SAN は 3 つのスロットの名前）</h3>
+      {{template "cert-info" .ServerCert}}
+      {{- if .ServerPending}}<p class="text-sm"><span class="badge badge-info badge-sm">CSR を出した鍵が証明書を待っています</span></p>{{end}}
+      {{template "csr-and-import" (dict "ID" .Tenant.ID "Kind" "server" "CSR" .CSR "CSRKind" .CSRKind
+        "Help" (printf "CA のプロファイル tenant-server で署名します（テナント %s）。" .Tenant.Slug))}}
+
+      <h3 class="font-semibold mt-4">ヘルスチェック用の証明書（SAN <code>{{.ProbeSAN}}</code>）</h3>
+      {{template "cert-info" .ProbeCert}}
+      {{- if .ProbePending}}<p class="text-sm"><span class="badge badge-info badge-sm">CSR を出した鍵が証明書を待っています</span></p>{{end}}
+      {{template "csr-and-import" (dict "ID" .Tenant.ID "Kind" "probe" "CSR" .CSR "CSRKind" .CSRKind
+        "Help" (printf "CA のプロファイル probe-client で署名します（テナント %s）。" .Tenant.Slug))}}
+    </div>
+  </div>
+
+  {{/* ---- CRL ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">CRL {{template "crl-badge" .CRL}}</h2>
+      <table class="table table-sm">
+        <tbody>
+          <tr><th class="w-48">番号</th><td>{{if .CRL.Missing}}-{{else}}{{.CRL.Number}}{{end}}</td></tr>
+          <tr><th>nextUpdate</th><td>{{datetime .CRL.NextUpdate}}</td></tr>
+          <tr><th>置いた時刻</th><td>{{datetime .CRL.InstalledAt}}{{with .CRL.Source}}（{{if eq . "fetch"}}CA から取得{{else}}画面から取り込み{{end}}）{{end}}</td></tr>
+          <tr><th>取得先</th><td>{{with .CRLURL}}<code class="break-all">{{.}}</code>{{else}}なし（貼り付けで取り込みます）{{end}}</td></tr>
+          <tr><th>最後の取得</th><td>試みた {{datetime .CRL.LastAttemptAt}}、成功 {{datetime .CRL.LastSuccessAt}}{{with .CRL.LastError}}<div class="text-error break-all">{{.}}</div>{{end}}</td></tr>
+        </tbody>
+      </table>
+      <p class="text-sm text-base-content/60">CRL は、クライアントCA の署名で、期限が切れておらず、番号が今の CRL より小さくないものだけを置きます。置くと、反映済みの版に入れて SIGHUP で読み直させます（望む状態の版は上がりません）。</p>
+      <div class="card-actions">
+        {{- if .CRLURL}}<form hx-post="/tenants/{{.Tenant.ID}}/crl/refresh" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><button class="btn btn-sm">今すぐ取りに行く</button></form>{{end}}
+      </div>
+      <form hx-post="/tenants/{{.Tenant.ID}}/crl" hx-target="#tenant" hx-swap="outerHTML" class="flex flex-col gap-2">
+        <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN X509 CRL-----" required></textarea>
+        <div><button class="btn btn-sm">貼り付けた CRL を取り込む</button></div>
+      </form>
+    </div>
+  </div>
+
+  {{/* ---- AP ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">AP（{{len .APs}}）</h2>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead><tr><th>名前</th><th>NAS-Identifier</th><th>SAN（URI）</th><th>証明書</th><th></th></tr></thead>
+          <tbody>
+            {{- $id := .Tenant.ID}}
+            {{- range .APs}}
+            <tr>
+              <td>{{.Name}}</td>
+              <td><code>{{.NASID}}</code></td>
+              <td><code class="text-xs">{{.SAN}}</code></td>
+              <td class="text-sm">{{if .CertSerial}}<code class="text-xs">{{short 16 .CertSerial}}</code> {{datetime .CertNotAfter}} まで
+                {{- if .Expired}} <span class="badge badge-error badge-sm">期限切れ</span>{{else if .Soon}} <span class="badge badge-warning badge-sm">期限が近い</span>{{end}}{{else}}-{{end}}</td>
+              <td>
+                <form id="ap-delete-{{.Name}}" hx-post="/tenants/{{$id}}/aps/{{.Name}}/delete" hx-target="#tenant" hx-swap="outerHTML"></form>
+                <button type="button" class="btn btn-xs btn-error btn-outline" command="show-modal" commandfor="dialog-ap-{{.Name}}">削除</button>
+                {{template "confirm" (dict "ID" (printf "dialog-ap-%s" .Name) "Title" "AP の削除" "Form" (printf "ap-delete-%s" .Name) "Label" "削除する" "Class" "btn-error"
+                  "Message" (printf "AP %s を削除します。次の反映で設定から消えます。すぐにつながらなくするには、CA で証明書を失効させてください。よろしいですか？" .Name))}}
+              </td>
+            </tr>
+            {{- else}}
+            <tr><td colspan="5" class="text-base-content/60">AP はありません。</td></tr>
+            {{- end}}
+          </tbody>
+        </table>
+      </div>
+      <form hx-post="/tenants/{{.Tenant.ID}}/aps" hx-target="#tenant" hx-swap="outerHTML" autocomplete="off" class="grid gap-2 mt-2">
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">AP の名前</legend>
+          <input name="name" value="{{.APName}}" required maxlength="32" class="input">
+          <p class="label">英小文字・数字・- の 1〜32 文字（probe は使えません）。CA で署名するときと同じ名前を入れます。SAN は <code>urn:{{.URNPrefix}}:nas:{{.Tenant.Slug}}:&lt;名前&gt;</code></p>
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">AP の証明書（任意）</legend>
+          <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+          <p class="label">入れると、クライアントCA の発行で SAN が合うことを確かめ、シリアル番号と期限を記録します（照合は SAN で行うので、なくても動きます）</p>
+        </fieldset>
+        <div><button class="btn btn-sm">登録する</button></div>
+      </form>
+    </div>
+  </div>
+
+  {{/* ---- 反映の履歴 ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">反映の履歴（新しい 20 件）</h2>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead><tr><th>日時</th><th>きっかけ</th><th>版</th><th>操作</th><th>結果</th><th>操作者</th></tr></thead>
+          <tbody>
+            {{- range .Applies}}
+            <tr>
+              <td class="whitespace-nowrap">{{datetime .Started}}</td>
+              <td>{{triggerLabel .Trigger}}</td>
+              <td>{{.Version}}</td>
+              <td>{{actionLabel .Action}}</td>
+              <td>{{if eq .Result "ok"}}<span class="badge badge-success badge-sm">{{resultLabel .Result}}</span>{{else}}<span class="badge badge-error badge-sm">{{resultLabel .Result}}</span>{{end}}
+                {{- with .Error}}<details class="text-xs"><summary>理由</summary><pre class="whitespace-pre-wrap">{{.}}</pre></details>{{end}}</td>
+              <td class="text-sm">{{.Operator}}</td>
+            </tr>
+            {{- else}}
+            <tr><td colspan="6" class="text-base-content/60">記録はありません。</td></tr>
+            {{- end}}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {{/* ---- ログ ---- */}}
+  <div class="card bg-base-100 shadow mb-6">
+    <div class="card-body">
+      <h2 class="card-title">ログの末尾</h2>
+      <div id="logs"><button type="button" class="btn btn-sm" hx-get="/tenants/{{.Tenant.ID}}/logs" hx-target="#logs" hx-swap="innerHTML">radsecproxy のログを読む（200 行）</button></div>
+    </div>
+  </div>
+
+  <form id="tenant-delete" hx-post="/tenants/{{.Tenant.ID}}/delete" hx-target="#tenant" hx-swap="outerHTML"></form>
+  <button type="button" class="btn btn-error btn-outline" command="show-modal" commandfor="dialog-delete">このテナントを削除</button>
+  {{template "confirm" (dict "ID" "dialog-delete" "Title" "テナントの削除" "Form" "tenant-delete" "Label" "削除する" "Class" "btn-error"
+    "Message" (printf "テナント %s を削除します。コンテナ・設定・鍵・AP の登録も消えます（反映の履歴と監査ログは残ります）。よろしいですか？" .Tenant.Slug))}}
+</div>
+{{- end}}
+
+{{/* cert-info は証明書の内容（引数は *certInfo。nil なら「まだありません」）。 */}}
+{{define "cert-info" -}}
+{{- with .}}
+<div class="text-sm">
+  <div>Subject: <code>{{.Subject}}</code>{{with .Issuer}}、発行者: <code>{{.}}</code>{{end}}</div>
+  <div>シリアル番号: <code class="text-xs">{{.Serial}}</code>、期限: {{datetime .NotAfter}}
+    {{- if .Expired}} <span class="badge badge-error badge-sm">期限切れ</span>{{else if .Soon}} <span class="badge badge-warning badge-sm">30 日を切りました</span>{{end}}</div>
+  {{- with .DNS}}<div>SAN（DNS）: {{range $i, $d := .}}{{if $i}}、{{end}}<code>{{$d}}</code>{{end}}</div>{{end}}
+  {{- with .URIs}}<div>SAN（URI）: {{range $i, $u := .}}{{if $i}}、{{end}}<code>{{$u}}</code>{{end}}</div>{{end}}
+</div>
+{{- else}}<p class="text-sm text-base-content/60">まだありません。</p>{{end}}
+{{- end}}
+
+{{/* csr-and-import は CSR の作成と証明書の取り込み（引数は dict で ID、Kind（server / probe）、CSR と CSRKind（出した CSR）、Help）。 */}}
+{{define "csr-and-import" -}}
+<p class="text-sm text-base-content/60">{{.Help}}</p>
+<form hx-post="/tenants/{{.ID}}/csr/{{.Kind}}" hx-target="#tenant" hx-swap="outerHTML"><button class="btn btn-sm">鍵を作って CSR を出す</button></form>
+{{- if and .CSR (eq .CSRKind .Kind)}}
+<textarea readonly rows="8" class="textarea w-full font-mono text-xs" aria-label="CSR">{{.CSR}}</textarea>
+{{- end}}
+<form hx-post="/tenants/{{.ID}}/cert/{{.Kind}}" hx-target="#tenant" hx-swap="outerHTML" class="flex flex-col gap-2">
+  <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN CERTIFICATE-----" required></textarea>
+  <div><button class="btn btn-sm">署名済みの証明書を取り込む</button></div>
+</form>
+{{- end}}
+
+{{/* logs はログの末尾（GET /tenants/{id}/logs で差し替える）。 */}}
+{{define "logs" -}}
+{{- if .Error}}<p class="text-error">{{.Error}}</p>
+{{- else}}<pre class="bg-base-200 rounded p-2 text-xs overflow-x-auto max-h-96 whitespace-pre-wrap">{{.Logs}}</pre>{{end}}
+{{- end}}

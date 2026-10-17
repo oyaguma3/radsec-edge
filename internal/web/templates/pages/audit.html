@@ -1,0 +1,29 @@
+{{define "content" -}}
+<h1 class="text-2xl font-bold mb-4">監査ログ</h1>
+<div class="overflow-x-auto bg-base-100 rounded-box shadow">
+  <table class="table table-sm">
+    <thead><tr><th>日時</th><th>操作者</th><th>操作</th><th>対象</th><th>内容</th></tr></thead>
+    <tbody>
+      {{template "audit-rows" .Data}}
+    </tbody>
+  </table>
+</div>
+{{- end}}
+
+{{/* 「さらに古いものを表示」で、この部分を足していく。 */}}
+{{define "audit-rows" -}}
+{{- range .Entries}}
+<tr>
+  <td class="whitespace-nowrap">{{datetime .Time}}</td>
+  <td>{{.Operator}}{{if eq .Source "system"}} <span class="badge badge-ghost badge-sm">自動</span>{{end}}{{with .Remote}}<div class="text-xs text-base-content/60">{{.}}</div>{{end}}</td>
+  <td>{{auditLabel .Action}}</td>
+  <td>{{.Target}}</td>
+  <td class="text-xs">{{range $k, $v := .Detail}}<div>{{$k}}: {{$v}}</div>{{end}}{{with .TraceID}}<div class="text-base-content/50">trace {{short 8 .}}</div>{{end}}</td>
+</tr>
+{{- else}}
+<tr><td colspan="5" class="text-base-content/60">記録はありません。</td></tr>
+{{- end}}
+{{- with .More}}
+<tr id="audit-more"><td colspan="5"><button type="button" class="btn btn-sm" hx-get="{{.}}" hx-target="#audit-more" hx-swap="outerHTML">さらに古いものを表示</button></td></tr>
+{{- end}}
+{{- end}}

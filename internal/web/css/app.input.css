@@ -1,0 +1,7 @@
+/* 画面の CSS の元。scripts/build-css.sh が Tailwind CSS のスタンドアロン CLI で static/app.css を作る。
+   クラス名はテンプレートから拾う（それ以外のファイルは見ない）。daisyui.mjs はスクリプトが版を固定して取得し、ここに置く。 */
+@import "tailwindcss" source(none);
+@source "../templates";
+@plugin "./daisyui.mjs" {
+  themes: light --default, dark --prefersdark;
+}
