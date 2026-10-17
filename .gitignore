@@ -6,3 +6,16 @@ CLAUDE.md
 
 # 段階 0 の検証の道具のビルドの結果（verify/v0/README.md の手順で作る）
 /verify/v0/bin/
+
+# リポジトリ直下で go build したときの成果物
+/radsec-edge
+/radsec-edge-agent
+
+# テストとカバレッジ
+*.test
+*.out
+coverage.*
+
+# エディター
+*.swp
+*~
