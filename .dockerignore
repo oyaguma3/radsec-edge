@@ -1,0 +1,14 @@
+# イメージのビルドに要らないもの。生成物（CSS）は手元のものを持ち込まず、ビルドの段で作り直す。
+.git
+.github
+.cache
+.env
+secrets
+verify
+*.pem
+*.key
+CLAUDE.md
+/radsec-edge
+/radsec-edge-agent
+internal/web/static/app.css
+internal/web/css/daisyui.mjs

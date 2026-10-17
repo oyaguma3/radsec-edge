@@ -24,3 +24,8 @@ coverage.*
 /internal/web/static/app.css
 /internal/web/css/daisyui.mjs
 /.cache/
+
+# 環境変数（機密情報）。.env.example は管理する
+.env
+# Cloudflare Tunnel のトークン（compose の cloudflared がマウントする）
+/secrets/

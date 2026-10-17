@@ -59,3 +59,49 @@ jobs:
             grep -- '--- SKIP' docker.log
             exit 1
           fi
+
+  image:
+    name: イメージと compose の設定
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: イメージのビルド（画面の CSS の生成を含む）
+        run: docker build --build-arg VERSION="${GITHUB_SHA::7}" -t radsec-edge:ci .
+      - name: 生成した CSS とバイナリの確認
+        run: |
+          docker create --name img radsec-edge:ci >/dev/null
+          docker cp img:/radsec-edge ./radsec-edge-bin
+          docker cp img:/radsec-edge-agent ./radsec-edge-agent-bin
+          docker rm img >/dev/null
+          strings ./radsec-edge-bin | grep -q 'daisyUI' || { echo "daisyUI の CSS が埋め込まれていません"; exit 1; }
+          strings ./radsec-edge-bin | grep -q 'prefers-color-scheme:dark' || { echo "ダークテーマの CSS がありません"; exit 1; }
+          test -x ./radsec-edge-agent-bin
+      - name: compose の設定
+        run: |
+          cp .env.example .env
+          sed -i -e 's|^EDGE_DOCKER_GID=.*|EDGE_DOCKER_GID=999|' \
+            -e 's|^EDGE_UPSTREAM_SECRET=.*|EDGE_UPSTREAM_SECRET=ci-secret-123|' \
+            -e 's|^EDGE_ACCESS_TEAM_DOMAIN=.*|EDGE_ACCESS_TEAM_DOMAIN=ci.cloudflareaccess.com|' \
+            -e 's|^EDGE_ACCESS_AUD=.*|EDGE_ACCESS_AUD=ci-aud|' .env
+          docker compose config -q
+          docker compose config --format json > config.json
+          # 動かすのは radsec-edge・agent・cloudflared の 3 つ（radsecproxy のイメージは build のプロファイルだけ）。
+          jq -e '.services | keys == ["cloudflared", "radsec-edge", "radsec-edge-agent"]' config.json
+          # ホストにポートを公開しない（画面は cloudflared から、RadSec のポートは agent が作るテナントのコンテナが公開する）。
+          jq -e '[.services[].ports // [] | .[]] | length == 0' config.json
+          ! grep -q 'EDGE_DEV_USER_EMAIL' config.json
+          # Docker のソケットを持つのは agent だけ。agent はネットワークを使わない。
+          jq -e '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/var/run/docker.sock")) | .key] == ["radsec-edge-agent"]' config.json
+          jq -e '.services["radsec-edge-agent"].network_mode == "none"' config.json
+          # 利用者（設計概要 §10.2）と、読み取り専用・権限なし。
+          jq -e '.services["radsec-edge"].user == "10084:10083" and .services["radsec-edge-agent"].user == "10085:10083"' config.json
+          jq -e '[.services["radsec-edge", "radsec-edge-agent"] | .read_only == true and .cap_drop == ["ALL"]] | all' config.json
+          # テナントのネットワークは名前を固定し、internal にしない（上流に届く）。
+          jq -e '.networks.tenants.name == "radsec-edge-tenants" and (.networks.tenants.internal // false) == false' config.json
+          # Tunnel のトークンはファイルで渡す。
+          jq -e '.services.cloudflared.command | index("--token-file") != null' config.json
+          grep -q 'create_host_path: false' compose.yaml
+          # 必須の設定が空なら、compose が断る。
+          sed -i -e 's|^EDGE_UPSTREAM_SECRET=.*|EDGE_UPSTREAM_SECRET=|' .env
+          ! docker compose config -q 2>/dev/null

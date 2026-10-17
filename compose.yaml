@@ -1,0 +1,131 @@
+# エッジの配備（設計概要 §4、§5.1）。テナントの radsecproxy のコンテナは agent が作る（compose では管理しない）。
+# 導入の前に、ホストのディレクトリと radsecproxy のイメージを用意する（README の「導入」）。
+name: radsec-edge
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  radsec-edge:
+    build:
+      context: .
+      args:
+        VERSION: ${EDGE_VERSION:-dev}
+    image: radsec-edge:${EDGE_VERSION:-dev}
+    <<: *hardening
+    restart: unless-stopped
+    # 停止の合図から、処理中の要求を終えてサーバーを閉じ終えるまで最大 10 秒かかるので、Docker の既定の猶予より長くする。
+    stop_grace_period: 20s
+    # UID 10084、GID 10083（radsecproxy と同じグループ。テナントのファイルはグループで読ませる。設計概要 §10.2）。
+    user: "10084:10083"
+    depends_on:
+      radsec-edge-agent:
+        condition: service_started
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      EDGE_MODE: standalone
+      EDGE_GUI_ADDR: ":8447"
+      EDGE_DATA_DIR: /data
+      # テナントのディレクトリは、ホストと同じパスでマウントする（agent がテナントのコンテナに、このパスをマウントする）。
+      EDGE_TENANTS_DIR: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/tenants
+      EDGE_AGENT_SOCKET: /run/radsec-edge-agent/agent.sock
+      EDGE_URN_PREFIX: ${EDGE_URN_PREFIX:?.env に EDGE_URN_PREFIX を設定してください}
+      EDGE_DNS_DOMAIN: ${EDGE_DNS_DOMAIN:?.env に EDGE_DNS_DOMAIN を設定してください}
+      EDGE_UPSTREAM_AUTH: ${EDGE_UPSTREAM_AUTH:-}
+      EDGE_UPSTREAM_ACCT: ${EDGE_UPSTREAM_ACCT:-}
+      EDGE_UPSTREAM_SECRET: ${EDGE_UPSTREAM_SECRET:?.env に EDGE_UPSTREAM_SECRET を設定してください}
+      EDGE_CRL_BASE_URL: ${EDGE_CRL_BASE_URL:-}
+      EDGE_CRL_INTERVAL: ${EDGE_CRL_INTERVAL:-5m}
+      EDGE_CRL_WARN: ${EDGE_CRL_WARN:-72h}
+      EDGE_RECONCILE_INTERVAL: ${EDGE_RECONCILE_INTERVAL:-1m}
+      EDGE_LOG_LEVEL: ${EDGE_LOG_LEVEL:-info}
+      # 画面の利用者は Cloudflare Access の JWT で識別する（設計概要 §13.1）。compose では開発用の設定は使えない
+      # （ループバックで待ち受けるときだけ）。
+      EDGE_ACCESS_TEAM_DOMAIN: ${EDGE_ACCESS_TEAM_DOMAIN:?.env に EDGE_ACCESS_TEAM_DOMAIN を設定してください}
+      EDGE_ACCESS_AUD: ${EDGE_ACCESS_AUD:?.env に EDGE_ACCESS_AUD を設定してください}
+    volumes:
+      # SQLite と鍵（ホストのディレクトリ。所有者 10084:10083、権限 0750）。
+      - type: bind
+        source: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/data
+        target: /data
+        bind:
+          create_host_path: false
+      # テナントの radsecproxy の設定（ホストのディレクトリ。所有者 10084:10083、権限 0750）。
+      - type: bind
+        source: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/tenants
+        target: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/tenants
+        bind:
+          create_host_path: false
+      - agent-run:/run/radsec-edge-agent
+    # ホストにポートを公開しない。画面への要求は、同じ compose の cloudflared から届く（設計概要 §13.1）。
+    healthcheck:
+      test: ["CMD", "/radsec-edge", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - default
+      # テナントのコンテナのネットワーク（ヘルスチェックで radsecproxy-<slug>:2083 につなぐ。設計概要 §10.2）。
+      - tenants
+
+  radsec-edge-agent:
+    image: radsec-edge:${EDGE_VERSION:-dev}
+    <<: *hardening
+    restart: unless-stopped
+    entrypoint: ["/radsec-edge-agent"]
+    command: ["serve"]
+    # UID 10085、GID 10083。Docker のソケットを使うため、そのグループ（ホストの docker のグループ）を足す。
+    user: "10085:10083"
+    group_add:
+      - ${EDGE_DOCKER_GID:?.env に EDGE_DOCKER_GID（ホストの docker のグループの番号。stat -c %g /var/run/docker.sock）を設定してください}
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      EDGE_AGENT_SOCKET: /run/radsec-edge-agent/agent.sock
+      EDGE_AGENT_SOCKET_GID: "10083"
+      EDGE_TENANTS_DIR: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/tenants
+      EDGE_AGENT_NETWORK: radsec-edge-tenants
+      EDGE_LOG_LEVEL: ${EDGE_LOG_LEVEL:-info}
+    volumes:
+      # Docker のソケットを持つのは agent だけ（設計概要 §5.1）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-run:/run/radsec-edge-agent
+    # agent はネットワークを使わない（unix ソケットだけ）。
+    network_mode: none
+
+  cloudflared:
+    # Cloudflare Tunnel のコネクター。外向きに Cloudflare へ接続し、公開ホスト名への要求を画面
+    # （http://radsec-edge:8447。Tunnel の公開ホスト名の向け先に書く）に届ける。ホストの受信のポートは開けない。
+    image: cloudflare/cloudflared:2026.9.3
+    restart: unless-stopped
+    depends_on:
+      radsec-edge:
+        condition: service_healthy
+    command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/etc/cloudflared/token"]
+    volumes:
+      # Tunnel のトークン（秘密の値）はファイルで渡す。コンテナは UID 65532 で動くので、この UID で読めるようにする。
+      - type: bind
+        source: ./secrets/tunnel-token
+        target: /etc/cloudflared/token
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - default
+
+  # radsecproxy のイメージ（テナントのコンテナに使う。agent の internal/agent の Image と同じタグ）。
+  # docker compose --profile build build radsecproxy-image で作る（動かすサービスではない）。
+  radsecproxy-image:
+    build: images/radsecproxy
+    image: radsec-edge/radsecproxy:1.11.2-1-deb13u1
+    profiles: ["build"]
+
+volumes:
+  agent-run:
+
+networks:
+  # テナントのコンテナを置くネットワーク。上流（トンネルの中の本PoC）に届くよう internal にしない（設計概要 §12.3）。
+  tenants:
+    name: radsec-edge-tenants
