@@ -576,7 +576,7 @@ OSS/BSS の役割（A テナントユーザー、B テナント管理者、C 運
 | 0 | 本書の確認事項の合意、実機の検証（§18 の V1〜V10。テナント 2 つ分の radsecproxy を手で作る） | 2026-10-18 に完了（§18.1、§18.2 を本文に反映。V7 は後回し、V8 は段階 5） |
 | 1 | エッジの単独モード（agent、データ、設定の生成、整合ループ、CRL の取得、最小の画面）。管理API（段階 4）、AP の最後の接続（ログの読み取り）と運用ガイド（段階 3）は含めない。手順は §21 | 単体・結合の試験（2026-10-18 に完了。CI で本物の Docker と radsecproxy を使う結合の試験も動かす） |
 | 2 | CA（CA の管理、署名、失効と CRL、画面、API） | 単体・結合の試験、`openssl verify`（2026-10-18 に完了。radsec-ca の設計概要 §15、§18） |
-| 3 | 単独モードの通し（AP の最後の接続、E2E の道具、エッジの運用ガイド。手順は §22） | E2E（単独モード）、simwifi |
+| 3 | 単独モードの通し（AP の最後の接続、E2E の道具、エッジの運用ガイド。手順は §22） | E2E（単独モード）、simwifi（2026-10-18 に完了。§22.3） |
 | 4 | 管理モード（エッジの管理API、provisioner の変更、OSS/BSS の変更） | provisioner・OSS/BSS の CI |
 | 5 | 複数のエッジ | E2E（管理モード）、simwifi |
 | 6 | PoC セットへの組み入れ（次の版） | pocset の E2E |
@@ -636,3 +636,21 @@ OSS/BSS の役割（A テナントユーザー、B テナント管理者、C 運
 7. コミットと push は手順ごとに `main` に行う（radsec-ca の運用ガイドの直しは radsec-ca に）。
 
 1 台の上でエッジから本PoC へ送るときは、本PoC の RADIUS のポートをテナントのネットワークのゲートウェイの IP に公開し、本PoC には本PoC のネットワークのゲートウェイの IP を RADIUS クライアントとして登録する。別の bridge のネットワークにいる受け手の公開ポートへ送ると、受け手からは送信元が受け手のネットワークのゲートウェイに見える（2026-10-18 に simwifi で確かめた。Docker Desktop では bridge のゲートウェイの IP にポートを公開できない）。
+
+### 22.3 通しの結果（2026-10-18、simwifi）
+
+組み合わせ: radsec-edge（`scripts/e2e.sh` を足した作業ツリー。3-1 は `4e77a0a`）、radsec-ca `2ad5e0f`、本PoC `baa13f3`、eapaka_test `b3f8f25`。`scripts/e2e.sh` の確かめは、すべて通った。
+
+- eapaka_test → AP の役の radsecproxy → エッジ → 本PoC で EAP-AKA の認証が通る。認可ポリシーは、エッジが置き換えた NAS-Identifier（`tenant-a-ap-001`）だけを許し、AP の役が名乗った値は本PoC に届かない。本PoC の auth-server のログでは、送信元が本PoC のネットワークのゲートウェイ（`172.20.0.1`）、NAS-Identifier が置き換えた値だった。
+- Accounting-On が、置き換えた NAS-Identifier で本PoC の acct-server に届く。
+- 画面の AP の一覧に「接続中」、失効の後に「証明書の拒否」が出る（AP の最後の接続。§12.1）。
+- ほかのテナントの CA が発行した証明書では、テナントのポートに入れない（`unable to get local issuer certificate`）。
+- CA で失効させ、エッジが CRL を取り直すと（SIGHUP）、その AP は認証できなくなる。同じ名前で発行し直した証明書では、エッジの設定を変えずにつながる。
+- クライアントCA を差し替えてヘルスチェック用の証明書を出し直さずに反映すると、ヘルスチェックが通らず、前の版に戻る（戻した版のヘルスチェックも通る）。
+
+通しで分かったこと（設計は変えない）:
+
+1. radsecproxy は、User-Name のない Accounting-Request を上流に送らず、自分で Accounting-Response を返す。エッジの置き換えの規則の `supplementAttribute 1`（§10.3）は、このために要る。E2E の AP の役も radsecproxy なので、AP の役を通すために Accounting-On に User-Name を入れて送った（エッジが補う動きは、この試験では確かめていない。本物の AP での確かめは V7 と同じく後回し）。
+2. CA と CRL だけが変わる反映は SIGHUP で行う（§11.1）。radsecproxy は SIGHUP で既存の接続も検証し直す（§18.1 の V1）ので、新しい CA で検証できない AP の接続は、ヘルスチェックの前にその場で切れる。ヘルスチェックが通らなければ前の版に戻すが、その間（ヘルスチェックの上限の 10 秒と再起動）と、AP のつなぎ直しの間隔の分、接続が途切れる。
+3. ヘルスチェック（Go の TLS のクライアント）は、radsecproxy が受け付ける CA の一覧に、ヘルスチェック用の証明書の発行者がないと、証明書を送らない。そのときの誤りは `tls: certificate required` になる。
+4. Docker Desktop では、bridge のネットワークのゲートウェイの IP にポートを公開できないので、E2E は素の Docker（simwifi、GitHub Actions）で動かす。

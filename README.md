@@ -14,9 +14,10 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 
 ## 状態
 
-開発中です。段階 1（単独モードのエッジ: agent、データ、設定の生成、整合ループ、CRL の取得、最小の画面）を作りました。CA（[radsec-ca](https://github.com/oyaguma3/radsec-ca)）、通しの確かめ、管理モードはこれからです。
+開発中です。単独モード（エッジの画面だけで運用する）を作り、CA（[radsec-ca](https://github.com/oyaguma3/radsec-ca)）と本PoC をつないだ通しの確かめ（E2E）まで済ませました。管理モード（OSS/BSS と provisioner から運用する）はこれからです。
 
-- 設計概要: [docs/design-overview.md](docs/design-overview.md)（段階は §20、段階 1 の手順と確認事項は §21）
+- 設計概要: [docs/design-overview.md](docs/design-overview.md)（段階は §20、段階 1 は §21、段階 3 は §22）
+- 運用ガイド（単独モード）: [docs/operations.md](docs/operations.md)
 - 段階 0 の実機の検証（radsecproxy の振る舞いの確認）の道具と手順: [verify/v0/](verify/v0/)
 
 ## 部品
@@ -30,6 +31,8 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 反映は「設定の生成 → `radsecproxy -p` の構文検査 → 版のディレクトリの付け替え → SIGHUP か再起動 → ヘルスチェック（ヘルスチェック用の証明書で Status-Server を送る）」の順に行い、失敗したら前の版に戻します。
 
 ## 導入（単独モード）
+
+詳しくは[運用ガイド](docs/operations.md)を見てください。
 
 イメージは公開していないので、タグからソースでビルドします。
 
@@ -54,6 +57,7 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 ## 開発
 
 - Go 1.27.2 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy`）。
+- `scripts/e2e.sh` は、本PoC・radsec-ca・エッジを 1 台に導入して、eapaka_test と AP の役（radsecproxy）で単独モードの通しを確かめます（Docker Desktop では動きません。運用ガイド 8 章）。GitHub Actions では「E2E」のワークフローを手で起動します。
 - 画面の CSS は `sh scripts/build-css.sh` で作ります（Tailwind CSS のスタンドアロン CLI と daisyUI を、版を固定して取得します）。
 
 ## ライセンス
