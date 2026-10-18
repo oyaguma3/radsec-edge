@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/agent"
 )
@@ -16,6 +17,9 @@ type FakeAgent struct {
 	mu         sync.Mutex
 	Containers map[string]*agent.Container
 	calls      []string
+	// LogsText はテナントごとに LogsSince が返すログ、Since は LogsSince に渡された時刻の記録。
+	LogsText map[string]string
+	Since    []time.Time
 	// ValidateOK は Validate の結果、FailEnsure は Ensure の誤り。
 	ValidateOK bool
 	FailEnsure error
@@ -23,7 +27,7 @@ type FakeAgent struct {
 
 // NewFakeAgent は偽物の agent を作る。
 func NewFakeAgent() *FakeAgent {
-	return &FakeAgent{Containers: map[string]*agent.Container{}, ValidateOK: true}
+	return &FakeAgent{Containers: map[string]*agent.Container{}, LogsText: map[string]string{}, ValidateOK: true}
 }
 
 func (f *FakeAgent) call(s string) {
@@ -98,6 +102,14 @@ func (f *FakeAgent) Remove(_ context.Context, id string) error {
 	return err
 }
 func (f *FakeAgent) Logs(context.Context, string, int) (string, error) { return "", nil }
+
+// LogsSince は SetLogs で与えたログを返す（since は記録する）。
+func (f *FakeAgent) LogsSince(_ context.Context, id string, since time.Time) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Since = append(f.Since, since)
+	return f.LogsText[id], nil
+}
 func (f *FakeAgent) Validate(_ context.Context, slug, gen string) (agent.ValidateResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

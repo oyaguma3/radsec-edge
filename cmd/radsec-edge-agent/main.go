@@ -47,7 +47,8 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	log.Info("starting", "version", version, "image", agent.Image, "network", cfg.Network, "tenants_dir", cfg.TenantsDir)
+	log.Info("starting", "version", version, "image", agent.Image, "network", cfg.Network, "tenants_dir", cfg.TenantsDir,
+		"publish_addr", cfg.PublishAddr)
 
 	d := docker.New(cfg.DockerSocket)
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -56,7 +57,8 @@ func serve(ctx context.Context) error {
 		log.Error("cannot reach the Docker Engine", "socket", cfg.DockerSocket, "error", err)
 	}
 	cancel()
-	srv := agent.NewServer(agent.ServerOptions{Log: log, Version: version, Docker: d, TenantsDir: cfg.TenantsDir, Network: cfg.Network})
+	srv := agent.NewServer(agent.ServerOptions{Log: log, Version: version, Docker: d, TenantsDir: cfg.TenantsDir, Network: cfg.Network,
+		PublishAddr: cfg.PublishAddr})
 	cleanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	if err := srv.Cleanup(cleanCtx); err != nil {
 		log.Warn("cannot remove leftover validation containers", "error", err)

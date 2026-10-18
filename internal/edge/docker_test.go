@@ -102,7 +102,7 @@ func TestDockerApply(t *testing.T) {
 	// AP を登録して反映すると（再起動）、AP の証明書でつながる。
 	_, apKey := pkitest.NewKeyPair(t)
 	csr, _ := pki.NewCSR(apKey, "x")
-	apCert, apPEM := e.ca.SignCSR(t, pkitest.Leaf{URI: names.SANURI("example", "tenant-a", "ap-001")}, csr)
+	apCert, apPEM := e.ca.SignCSR(t, pkitest.Leaf{CN: "tenant-a-ap-001", URI: names.SANURI("example", "tenant-a", "ap-001")}, csr)
 	if err := apProbe(t, e, tn.Port, apPEM, apKey); err == nil {
 		t.Fatal("an unregistered AP connected")
 	}
@@ -115,6 +115,8 @@ func TestDockerApply(t *testing.T) {
 	if err := apProbe(t, e, tn.Port, apPEM, apKey); err != nil {
 		t.Fatalf("registered AP: %v", err)
 	}
+	// AP の最後の接続（ログの接続の確立と切断の行。設計概要 §12.1）。
+	checkSeen(t, e, func(s SeenState) bool { return s.Known && !s.LastUp.IsZero() && !s.LastDown.IsZero() && s.LastIP != "" })
 
 	// AP の証明書を失効させた CRL を入れると、SIGHUP で効き、AP はつながらなくなる（ヘルスチェックは通る）。
 	if err := e.svc.InstallCRL(ctx, e.user, "tenant-a", e.ca.CRL(t, pkitest.CRL{Number: 2, Revoked: []*big.Int{apCert.SerialNumber}})); err != nil {
@@ -127,6 +129,8 @@ func TestDockerApply(t *testing.T) {
 	if err := apProbe(t, e, tn.Port, apPEM, apKey); err == nil {
 		t.Error("a revoked AP connected")
 	}
+	// 失効させた証明書の拒否も残る（verify error の CN）。
+	checkSeen(t, e, func(s SeenState) bool { return !s.LastReject.IsZero() })
 
 	// ヘルスチェックが通らなければ、前の版に戻して再起動する（本物のコンテナで戻す）。
 	goodGen, _, _ := e.svc.Store.Current("tenant-a")
@@ -171,4 +175,27 @@ func TestDockerApply(t *testing.T) {
 	if _, ok := st.Container("tenant-a"); ok {
 		t.Error("container is left")
 	}
+}
+
+// checkSeen は、ログを読んで ap-001 の接続の状態が ok になるのを待つ（ログは少し遅れて届く）。
+func checkSeen(t *testing.T, e *env, ok func(SeenState) bool) {
+	t.Helper()
+	var last SeenState
+	for range 20 {
+		if err := e.svc.RefreshLastSeen(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := e.svc.Agent.Status(t.Context())
+		c, _ := st.Container("tenant-a")
+		seen, err := e.svc.APSeen(t.Context(), "tenant-a", c.StartedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if last = seen["ap-001"]; ok(last) {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	logs, _ := e.svc.Agent.Logs(t.Context(), "tenant-a", 50)
+	t.Fatalf("ap-001 seen = %+v\n%s", last, logs)
 }

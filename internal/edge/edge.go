@@ -32,6 +32,7 @@ type Agent interface {
 	Remove(ctx context.Context, id string) error
 	SIGHUP(ctx context.Context, id string) error
 	Logs(ctx context.Context, id string, lines int) (string, error)
+	LogsSince(ctx context.Context, id string, since time.Time) (string, error)
 	Validate(ctx context.Context, slug, gen string) (agent.ValidateResult, error)
 }
 

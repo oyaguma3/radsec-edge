@@ -427,7 +427,8 @@ func (s *Service) LastReconcile() ReconcileState {
 	return s.lastReconcile
 }
 
-// Run は整合ループ（interval ごと）と CRL の取得（crlInterval ごと）を、ctx が終わるまで動かす。起動したときにも 1 回ずつ行う。
+// Run は整合ループと AP の最後の接続の読み取り（interval ごと）と CRL の取得（crlInterval ごと）を、ctx が終わるまで動かす。
+// 起動したときにも 1 回ずつ行う。
 func (s *Service) Run(ctx context.Context, interval, crlInterval time.Duration) {
 	go func() {
 		for {
@@ -442,6 +443,9 @@ func (s *Service) Run(ctx context.Context, interval, crlInterval time.Duration) 
 	for {
 		if err := s.Reconcile(ctx); err != nil && ctx.Err() == nil {
 			s.Log.Warn("reconcile", "error", err)
+		}
+		if err := s.RefreshLastSeen(ctx); err != nil && ctx.Err() == nil {
+			s.Log.Warn("refresh last seen", "error", err)
 		}
 		select {
 		case <-ctx.Done():

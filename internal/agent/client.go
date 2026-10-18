@@ -116,6 +116,13 @@ func (c *Client) Logs(ctx context.Context, id string, lines int) (string, error)
 	return res.Logs, err
 }
 
+// LogsSince は、テナントのコンテナのログのうち since より後の行を、Docker の時刻を先頭に付けて返す（AP の最後の接続に使う）。
+func (c *Client) LogsSince(ctx context.Context, id string, since time.Time) (string, error) {
+	var res LogsResult
+	err := c.call(ctx, http.MethodGet, tenantPath(id, "logs")+"?timestamps=1&since="+url.QueryEscape(since.UTC().Format(time.RFC3339Nano)), nil, &res)
+	return res.Logs, err
+}
+
 // Validate はテナントの版 gen の設定を radsecproxy -p で検査する。
 func (c *Client) Validate(ctx context.Context, slug, gen string) (ValidateResult, error) {
 	var res ValidateResult

@@ -211,10 +211,30 @@ func (c *Client) Wait(ctx context.Context, id string) (int, error) {
 	return out.StatusCode, nil
 }
 
-// Logs はコンテナのログ（標準出力と標準エラー）の末尾 tail 行を返す。maxBytes を超える分は読まない。
-func (c *Client) Logs(ctx context.Context, id string, tail, maxBytes int) (string, error) {
-	resp, err := c.send(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/logs",
-		url.Values{"stdout": {"1"}, "stderr": {"1"}, "tail": {strconv.Itoa(tail)}}, nil)
+// LogsOptions はログの読み出しの条件。
+type LogsOptions struct {
+	// Tail は末尾の行数（0 ならすべて）。
+	Tail int
+	// Since が非ゼロなら、その時刻より後の行だけ。
+	Since time.Time
+	// Timestamps なら、各行の先頭に Docker が受け取った時刻（RFC 3339 のナノ秒）を付ける。
+	Timestamps bool
+}
+
+// Logs はコンテナのログ（標準出力と標準エラー）を返す。maxBytes を超える分は読まない。
+func (c *Client) Logs(ctx context.Context, id string, o LogsOptions, maxBytes int) (string, error) {
+	q := url.Values{"stdout": {"1"}, "stderr": {"1"}, "tail": {"all"}}
+	if o.Tail > 0 {
+		q.Set("tail", strconv.Itoa(o.Tail))
+	}
+	if !o.Since.IsZero() {
+		// 秒の小数（ナノ秒まで）で渡す。Docker は「この時刻より後」を返す。
+		q.Set("since", fmt.Sprintf("%d.%09d", o.Since.Unix(), o.Since.Nanosecond()))
+	}
+	if o.Timestamps {
+		q.Set("timestamps", "1")
+	}
+	resp, err := c.send(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/logs", q, nil)
 	if err != nil {
 		return "", err
 	}

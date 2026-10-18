@@ -96,6 +96,15 @@ func TestLoadAgent(t *testing.T) {
 	if a.Network != "radsec-edge-tenants" || a.SocketGID != 10083 || a.DockerSocket != "/var/run/docker.sock" {
 		t.Errorf("defaults: %+v", a)
 	}
+	t.Setenv("EDGE_AGENT_PUBLISH_ADDR", "172.31.83.1")
+	if a, err := LoadAgent(); err != nil || a.PublishAddr != "172.31.83.1" {
+		t.Errorf("publish addr: %+v, %v", a, err)
+	}
+	t.Setenv("EDGE_AGENT_PUBLISH_ADDR", "host.docker.internal")
+	if _, err := LoadAgent(); err == nil {
+		t.Error("LoadAgent() with a host name as the publish address = nil")
+	}
+	t.Setenv("EDGE_AGENT_PUBLISH_ADDR", "")
 	t.Setenv("EDGE_AGENT_NETWORK", "bad name")
 	if _, err := LoadAgent(); err == nil {
 		t.Error("LoadAgent() with a bad network = nil")

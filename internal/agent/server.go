@@ -32,8 +32,9 @@ type Server struct {
 	version string
 	docker  *docker.Client
 	// tenantsDir はテナントのディレクトリのホストのパス、network はテナントのコンテナを置くネットワーク。
-	tenantsDir string
-	network    string
+	tenantsDir  string
+	network     string
+	publishAddr string
 	// mu はコンテナの作成・作り直し・削除を 1 つずつにする（同じテナントのコンテナを 2 つ作らないように）。
 	mu sync.Mutex
 }
@@ -45,11 +46,13 @@ type ServerOptions struct {
 	Docker     *docker.Client
 	TenantsDir string
 	Network    string
+	// PublishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス）。
+	PublishAddr string
 }
 
 // NewServer は Server を作る。
 func NewServer(o ServerOptions) *Server {
-	return &Server{log: o.Log, version: o.Version, docker: o.Docker, tenantsDir: o.TenantsDir, network: o.Network}
+	return &Server{log: o.Log, version: o.Version, docker: o.Docker, tenantsDir: o.TenantsDir, network: o.Network, publishAddr: o.PublishAddr}
 }
 
 // Routes は API のハンドラーを返す。
@@ -179,7 +182,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		}
 		if p, err := strconv.Atoi(c.Labels[LabelPort]); err == nil && names.ValidSlug(ct.Slug) {
 			ct.Port = p
-			ct.SpecCurrent = tenantSpec(s.tenantsDir, s.network, ct.TenantID, ct.Slug, p).Labels[LabelSpec] == c.Labels[LabelSpec]
+			ct.SpecCurrent = tenantSpec(s.tenantsDir, s.network, s.publishAddr, ct.TenantID, ct.Slug, p).Labels[LabelSpec] == c.Labels[LabelSpec]
 		}
 		st.Containers = append(st.Containers, ct)
 	}
@@ -205,7 +208,7 @@ func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ctx := r.Context()
-	want := tenantSpec(s.tenantsDir, s.network, id, req.Slug, req.Port)
+	want := tenantSpec(s.tenantsDir, s.network, s.publishAddr, id, req.Slug, req.Port)
 	action := EnsureCreated
 	cur, err := s.find(ctx, id)
 	switch {
@@ -293,21 +296,31 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	lines := 200
-	if v := r.URL.Query().Get("lines"); v != "" {
+	q := r.URL.Query()
+	opts := docker.LogsOptions{Tail: 200, Timestamps: q.Get("timestamps") == "1"}
+	if v := q.Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "since must be an RFC 3339 date-time")
+			return
+		}
+		// 時刻を指定したら、その後の行をすべて返す（大きさは maxLogBytes で切る）。
+		opts.Since, opts.Tail = t, 0
+	}
+	if v := q.Get("lines"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > maxLogLines {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("lines must be between 1 and %d", maxLogLines))
 			return
 		}
-		lines = n
+		opts.Tail = n
 	}
 	c, err := s.find(r.Context(), tid)
 	if err != nil {
 		s.fail(w, r, "logs", err)
 		return
 	}
-	out, err := s.docker.Logs(r.Context(), c.ID, lines, maxLogBytes)
+	out, err := s.docker.Logs(r.Context(), c.ID, opts, maxLogBytes)
 	if err != nil {
 		s.fail(w, r, "logs", err)
 		return
@@ -347,7 +360,7 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "validate: wait", err)
 		return
 	}
-	out, err := s.docker.Logs(ctx, cid, 200, 64<<10)
+	out, err := s.docker.Logs(ctx, cid, docker.LogsOptions{Tail: 200}, 64<<10)
 	if err != nil {
 		s.fail(w, r, "validate: logs", err)
 		return

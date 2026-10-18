@@ -167,7 +167,7 @@
       <h2 class="card-title">AP（{{len .APs}}）</h2>
       <div class="overflow-x-auto">
         <table class="table table-sm">
-          <thead><tr><th>名前</th><th>NAS-Identifier</th><th>SAN（URI）</th><th>証明書</th><th></th></tr></thead>
+          <thead><tr><th>名前</th><th>NAS-Identifier</th><th>SAN（URI）</th><th>証明書</th><th>最後の接続</th><th></th></tr></thead>
           <tbody>
             {{- $id := .Tenant.ID}}
             {{- range .APs}}
@@ -177,6 +177,7 @@
               <td><code class="text-xs">{{.SAN}}</code></td>
               <td class="text-sm">{{if .CertSerial}}<code class="text-xs">{{short 16 .CertSerial}}</code> {{datetime .CertNotAfter}} まで
                 {{- if .Expired}} <span class="badge badge-error badge-sm">期限切れ</span>{{else if .Soon}} <span class="badge badge-warning badge-sm">期限が近い</span>{{end}}{{else}}-{{end}}</td>
+              <td class="text-sm">{{template "seen" .Seen}}</td>
               <td>
                 <form id="ap-delete-{{.Name}}" hx-post="/tenants/{{$id}}/aps/{{.Name}}/delete" hx-target="#tenant" hx-swap="outerHTML"></form>
                 <button type="button" class="btn btn-xs btn-error btn-outline" command="show-modal" commandfor="dialog-ap-{{.Name}}">削除</button>
@@ -185,7 +186,7 @@
               </td>
             </tr>
             {{- else}}
-            <tr><td colspan="5" class="text-base-content/60">AP はありません。</td></tr>
+            <tr><td colspan="6" class="text-base-content/60">AP はありません。</td></tr>
             {{- end}}
           </tbody>
         </table>
@@ -272,6 +273,16 @@
   <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN CERTIFICATE-----" required></textarea>
   <div><button class="btn btn-sm">署名済みの証明書を取り込む</button></div>
 </form>
+{{- end}}
+
+{{/* seen は AP の接続の状態（引数は edge.SeenState。ログを 1 分ごとに読むので、少し遅れて変わる）。 */}}
+{{define "seen" -}}
+{{- if not .Known}}<span class="text-base-content/60">記録なし</span>
+{{- else}}
+  {{- if .Up}}<span class="badge badge-success badge-sm">接続中</span>{{else}}<span class="badge badge-ghost badge-sm">切断</span>{{end}}
+  {{- if not .LastUp.IsZero}} <span class="whitespace-nowrap">{{datetime .LastUp}}</span>{{with .LastIP}} <code class="text-xs">{{.}}</code>{{end}}{{end}}
+  {{- if not .LastReject.IsZero}}<div class="text-error text-xs">証明書の拒否 {{datetime .LastReject}}</div>{{end}}
+{{- end}}
 {{- end}}
 
 {{/* logs はログの末尾（GET /tenants/{id}/logs で差し替える）。 */}}

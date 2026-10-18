@@ -152,6 +152,8 @@ type apRow struct {
 	SAN string
 	// Expired と Soon は証明書の期限が切れたか、30 日を切ったか（証明書を取り込んでいなければ両方 false）。
 	Expired, Soon bool
+	// Seen は接続の状態（radsecproxy のログから。設計概要 §12.1）。
+	Seen edge.SeenState
 }
 
 // tenantData はテナントの詳細の画面に出す値。
@@ -218,6 +220,17 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 		d.AgentError = err.Error()
 	} else if c, ok := st.Container(id); ok {
 		d.Container = &c
+	}
+	var started time.Time
+	if d.Container != nil && d.Container.Running {
+		started = d.Container.StartedAt
+	}
+	seen, err := h.Edge.APSeen(ctx, id, started)
+	if err != nil {
+		return tenantData{}, err
+	}
+	for i := range d.APs {
+		d.APs[i].Seen = seen[d.APs[i].Name]
 	}
 	if d.Plan, err = h.Edge.Plan(ctx, id); err != nil {
 		d.PlanError = err.Error()

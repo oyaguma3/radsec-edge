@@ -125,7 +125,7 @@ type SignalRequest struct {
 	Signal string `json:"signal"`
 }
 
-// LogsResult は Logs の結果。
+// LogsResult は Logs の結果。Timestamps を指定したときは、各行の先頭に Docker が受け取った時刻（RFC 3339 のナノ秒）が付く。
 type LogsResult struct {
 	Logs string `json:"logs"`
 }
@@ -193,13 +193,14 @@ type logConfig struct {
 }
 
 // tenantSpec はテナントのコンテナのひな形を作る（設計概要 §10.2）。値はすべて検証済みのもの。
-func tenantSpec(tenantsDir, network, tenantID, slug string, port int) spec {
+// publishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。§10.2）。
+func tenantSpec(tenantsDir, network, publishAddr, tenantID, slug string, port int) spec {
 	s := baseSpec(network)
 	s.Cmd = []string{"radsecproxy", "-f", "-c", confPath}
 	s.Labels = map[string]string{LabelTenant: tenantID, LabelSlug: slug, LabelPort: strconv.Itoa(port)}
 	s.ExposedPorts = map[string]struct{}{ContainerPort: {}}
 	s.HostConfig.Mounts = []mount{{Type: "bind", Source: path.Join(tenantsDir, slug), Target: MountTarget, ReadOnly: true}}
-	s.HostConfig.PortBindings = map[string][]portBinding{ContainerPort: {{HostIP: "", HostPort: strconv.Itoa(port)}}}
+	s.HostConfig.PortBindings = map[string][]portBinding{ContainerPort: {{HostIP: publishAddr, HostPort: strconv.Itoa(port)}}}
 	s.HostConfig.RestartPolicy = restartPolicy{Name: "unless-stopped"}
 	s.Labels[LabelSpec] = specHash(s)
 	return s

@@ -256,6 +256,8 @@ type Agent struct {
 	TenantsDir string
 	// Network はテナントのコンテナを置く Docker のネットワーク。
 	Network string
+	// PublishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。設計概要 §10.2）。
+	PublishAddr string
 }
 
 // LoadAgent は環境変数から agent の設定を読む。
@@ -283,6 +285,14 @@ func LoadAgent() (Agent, error) {
 	for name, p := range map[string]string{"EDGE_AGENT_SOCKET": a.Socket, "EDGE_AGENT_DOCKER_SOCKET": a.DockerSocket, "EDGE_TENANTS_DIR": a.TenantsDir} {
 		if !filepath.IsAbs(p) {
 			errs = append(errs, fmt.Errorf("%s: must be an absolute path", name))
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("EDGE_AGENT_PUBLISH_ADDR")); v != "" {
+		ip, err := netip.ParseAddr(v)
+		if err != nil || ip.Zone() != "" {
+			errs = append(errs, errors.New("EDGE_AGENT_PUBLISH_ADDR: must be an IP address (or empty for all addresses)"))
+		} else {
+			a.PublishAddr = ip.String()
 		}
 	}
 	if !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`).MatchString(a.Network) {

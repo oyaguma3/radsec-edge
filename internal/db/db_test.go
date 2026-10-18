@@ -37,7 +37,7 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("second Migrate = %v, %v", applied, err)
 	}
 	v, err := d.SchemaVersion(t.Context())
-	if err != nil || v != 1 {
+	if err != nil || v != 2 {
 		t.Fatalf("SchemaVersion = %d, %v", v, err)
 	}
 	// 新しい版で移行した DB は、古い版では使わない。
@@ -228,5 +228,37 @@ func TestCRLAppliesAudit(t *testing.T) {
 	}
 	if err := d.InsertAudit(ctx, AuditEntry{Source: "bad", Action: "x"}); err == nil {
 		t.Error("bad source accepted")
+	}
+}
+
+func TestSeen(t *testing.T) {
+	d := open(t)
+	ctx := t.Context()
+	if _, err := d.CreateTenant(ctx, spec("a", 20830)); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := d.LogCursor(ctx, "a"); err != nil || !c.IsZero() {
+		t.Fatalf("LogCursor = %v, %v", c, err)
+	}
+	t0 := time.UnixMilli(1_800_000_000_000)
+	cursor := time.Date(2027, 1, 15, 8, 0, 0, 123456789, time.UTC)
+	err := d.ApplySeen(ctx, "a", []SeenEvent{
+		{AP: "ap-1", Kind: SeenUp, At: t0, IP: "192.0.2.1"},
+		{AP: "ap-2", Kind: SeenReject, At: t0},
+		{AP: "ap-1", Kind: SeenDown, At: t0.Add(time.Minute)},
+		{AP: "ap-1", Kind: SeenUp, At: t0.Add(2 * time.Minute), IP: "192.0.2.2"},
+	}, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := d.Seen(ctx, "a")
+	if a := s["ap-1"]; !a.Connected || a.LastIP != "192.0.2.2" || !a.LastUp.Equal(t0.Add(2*time.Minute)) || !a.LastDown.Equal(t0.Add(time.Minute)) {
+		t.Errorf("ap-1 = %+v", a)
+	}
+	if b := s["ap-2"]; b.Connected || !b.LastReject.Equal(t0) {
+		t.Errorf("ap-2 = %+v", b)
+	}
+	if c, _ := d.LogCursor(ctx, "a"); !c.Equal(cursor) {
+		t.Errorf("LogCursor = %v", c)
 	}
 }

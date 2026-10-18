@@ -87,6 +87,8 @@ services:
       EDGE_AGENT_SOCKET_GID: "10083"
       EDGE_TENANTS_DIR: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/tenants
       EDGE_AGENT_NETWORK: radsec-edge-tenants
+      # テナントのポートを公開するホストのアドレス（空ならすべてのアドレス。設計概要 §10.2）。
+      EDGE_AGENT_PUBLISH_ADDR: ${EDGE_AGENT_PUBLISH_ADDR:-}
       EDGE_LOG_LEVEL: ${EDGE_LOG_LEVEL:-info}
     volumes:
       # Docker のソケットを持つのは agent だけ（設計概要 §5.1）。

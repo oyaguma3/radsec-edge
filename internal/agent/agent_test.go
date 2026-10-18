@@ -68,7 +68,7 @@ func TestRejectsBadRequests(t *testing.T) {
 }
 
 func TestSpec(t *testing.T) {
-	s := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "12", "tenant-a", 20831)
+	s := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "12", "tenant-a", 20831)
 	hc := s.HostConfig
 	if s.Image != Image || s.User != "10083:10083" || !hc.Init || !hc.ReadonlyRootfs || hc.Privileged ||
 		len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" || hc.SecurityOpt[0] != "no-new-privileges:true" {
@@ -86,8 +86,13 @@ func TestSpec(t *testing.T) {
 	if s.Labels[LabelTenant] != "12" || s.Labels[LabelSlug] != "tenant-a" || s.Labels[LabelPort] != "20831" || s.Labels[LabelSpec] == "" {
 		t.Errorf("labels: %v", s.Labels)
 	}
-	if other := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "12", "tenant-a", 20832); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
+	if other := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "12", "tenant-a", 20832); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
 		t.Error("spec hash does not change with the port")
+	}
+	// 公開するアドレスを指定すると、そのアドレスだけに公開し、ひな形も変わる（作り直す）。
+	bound := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "192.0.2.1", "12", "tenant-a", 20831)
+	if b := bound.HostConfig.PortBindings[ContainerPort]; b[0].HostIP != "192.0.2.1" || bound.Labels[LabelSpec] == s.Labels[LabelSpec] {
+		t.Errorf("publish address: %+v", bound.HostConfig.PortBindings)
 	}
 	v := validateSpec("/t", "n", "tenant-a", "0123456789abcdef")
 	if v.HostConfig.Mounts[0].Source != "/t/tenant-a/gen/0123456789abcdef" || v.HostConfig.Mounts[0].Target != "/conf/current" {
