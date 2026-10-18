@@ -48,6 +48,16 @@
   </div>
 </div>
 
+{{- if .ProbeProblems}}
+<div class="card bg-base-100 shadow mb-6">
+  <div class="card-body">
+    <h2 class="card-title">ヘルスチェック用の証明書に問題のあるテナント</h2>
+    <p class="text-sm">出し直すまで反映できません。失効した場合も CRL は置きますが、反映の後の Status-Server の確かめは省きます。</p>
+    <ul class="list-disc ml-6">{{range .ProbeProblems}}<li><a class="link" href="/tenants/{{.ID}}">{{.Slug}}</a> <span class="text-sm text-base-content/60">{{.ProbeProblem}}</span></li>{{end}}</ul>
+  </div>
+</div>
+{{- end}}
+
 <div class="grid gap-4 md:grid-cols-2">
   <div class="card bg-base-100 shadow">
     <div class="card-body">

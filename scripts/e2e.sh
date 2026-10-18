@@ -213,19 +213,6 @@ expect_accept() {
 	pass "$1"
 }
 
-# expect_accept_retry は、AP の役がエッジにつなぎ直すまで（つなぎ直しの間隔は 2・4・8 秒と延びる。設計概要 §18.1 の V6）、
-# 5 秒ごとに最大 60 秒くり返して Accept を待つ。
-expect_accept_retry() {
-	for _ in $(seq 12); do
-		auth "$2" "$3" && {
-			pass "$1"
-			return
-		}
-		sleep 5
-	done
-	fail "$1: 認証が Accept にならない（$LOGS の eapaka_test のログ）"
-}
-
 expect_no_accept() {
 	if auth "$2" "$3"; then
 		fail "$1: 認証が Accept になった"
@@ -428,7 +415,7 @@ for kind in server probe; do
 		"$WORK/r.html" >"$PKI/$kind.csr"
 done
 ca_sign tenant-server "$TENANT" "edge=$EDGE_NAME" "$PKI/server.csr" "$PKI/edge-server.pem" >/dev/null
-ca_sign probe-client "$TENANT" "edge=$EDGE_NAME" "$PKI/probe.csr" "$PKI/edge-probe.pem" >/dev/null
+PROBE_SERIAL=$(ca_sign probe-client "$TENANT" "edge=$EDGE_NAME" "$PKI/probe.csr" "$PKI/edge-probe.pem")
 edge_pem "/tenants/$TENANT/cert/server" "$PKI/edge-server.pem" >"$WORK/r.html"
 expect_html "サーバー証明書の取り込み" "$WORK/r.html" "サーバー証明書を取り込みました"
 edge_pem "/tenants/$TENANT/cert/probe" "$PKI/edge-probe.pem" >"$WORK/r.html"
@@ -488,25 +475,48 @@ pass "画面の AP の一覧に「証明書の拒否」"
 
 step "証明書の更新: 同じ名前で発行し直すと、エッジの設定を変えずにつながる"
 ap_key ap-a2
-ca_sign ap-client "$TENANT" ap=ap-001 "$PKI/ap-a2.csr" "$PKI/ap-a2.pem" >/dev/null
+AP2_SERIAL=$(ca_sign ap-client "$TENANT" ap=ap-001 "$PKI/ap-a2.csr" "$PKI/ap-a2.pem")
 ap_start a ap-a2 11812
 expect_accept "新しい証明書の AP は認証できる" a 11812
 
-step "戻し: クライアントCA を差し替えて、ヘルスチェック用の証明書を出し直さずに反映する"
+step "反映の前の確認: クライアントCA を差し替えて、ヘルスチェック用の証明書を出し直さないままの反映は断る"
 edge POST "/tenants/$TENANT/update" -d "port=$PORT" -d "auth=$GW:1812" -d "acct=$GW:1813" \
 	-d "crl_url=http://$GW:8449/crl/tenant.tenant-x.pem" >/dev/null
 edge_pem "/tenants/$TENANT/client-ca" "$PKI/ca-tenant-x.pem" >"$WORK/r.html"
 expect_html "別の CA の取り込み" "$WORK/r.html" "CRL も取得しました"
-# 反映は失敗する（422）ので、curl の誤りは無視して本文を見る。
+# 反映は断られる（422）ので、curl の誤りは無視して本文を見る。
 edge POST "/tenants/$TENANT/apply" >"$WORK/r.html" || true
-expect_html "反映（戻し）" "$WORK/r.html" "前の版に戻した"
-# 反映の SIGHUP で、新しい CA で検証できない AP の接続はその場で切れる（§18.1 の V1）。前の版に戻した後、AP がつなぎ直すのを待つ。
-expect_accept_retry "前の版に戻ったので、AP はつなぎ直して認証できる" a 11812
+expect_html "反映を断る" "$WORK/r.html" "今のクライアントCA で検証できません"
+# radsecproxy には何もしていないので、AP の接続は切れていない。
+expect_accept "反映を断ったので、AP はそのまま認証できる" a 11812
 edge POST "/tenants/$TENANT/update" -d "port=$PORT" -d "auth=$GW:1812" -d "acct=$GW:1813" -d "crl_url=" >/dev/null
 edge_pem "/tenants/$TENANT/client-ca" "$PKI/ca-$TENANT.pem" >"$WORK/r.html"
 expect_html "CA を戻す" "$WORK/r.html" "CRL も取得しました"
 edge POST "/tenants/$TENANT/apply" >"$WORK/r.html"
 expect_html "反映（正しい CA）" "$WORK/r.html" "反映しました"
-expect_accept_retry "正しい CA に戻して反映した後も、AP は認証できる" a 11812
+expect_accept "正しい CA に戻して反映した後も、AP は認証できる" a 11812
+
+step "ヘルスチェック用の証明書の失効: CRL は戻さずに置き、その後の AP の失効も効く"
+ca_api POST "/certs/$PROBE_SERIAL/revoke" '{"reason":"keyCompromise"}' >/dev/null
+edge POST "/tenants/$TENANT/crl/refresh" >"$WORK/r.html"
+expect_html "CRL の取り直し（probe の失効）" "$WORK/r.html" "ヘルスチェック用の証明書が失効しています"
+expect_accept "ヘルスチェック用の証明書を失効させても、AP は認証できる" a 11812
+ca_api POST "/certs/$AP2_SERIAL/revoke" '{"reason":"keyCompromise"}' >/dev/null
+edge POST "/tenants/$TENANT/crl/refresh" >/dev/null
+sleep 2
+expect_no_accept "ヘルスチェック用の証明書が失効していても、AP の失効は効く" a 11812
+edge POST "/tenants/$TENANT/apply" >"$WORK/r.html" || true
+expect_html "失効した probe での反映を断る" "$WORK/r.html" "ヘルスチェック用の証明書が失効しています"
+edge POST "/tenants/$TENANT/csr/probe" >"$WORK/r.html"
+python3 -c 'import html,re,sys; print(html.unescape(re.search(r"-----BEGIN CERTIFICATE REQUEST-----.*?-----END CERTIFICATE REQUEST-----", open(sys.argv[1]).read(), re.S).group(0)))' \
+	"$WORK/r.html" >"$PKI/probe2.csr"
+ca_sign probe-client "$TENANT" "edge=$EDGE_NAME" "$PKI/probe2.csr" "$PKI/edge-probe2.pem" >/dev/null
+edge_pem "/tenants/$TENANT/cert/probe" "$PKI/edge-probe2.pem" >/dev/null
+edge POST "/tenants/$TENANT/apply" >"$WORK/r.html"
+expect_html "probe を出し直して反映" "$WORK/r.html" "反映しました"
+ap_key ap-a3
+ca_sign ap-client "$TENANT" ap=ap-001 "$PKI/ap-a3.csr" "$PKI/ap-a3.pem" >/dev/null
+ap_start a ap-a3 11812
+expect_accept "ヘルスチェック用の証明書を出し直した後、新しい証明書の AP は認証できる" a 11812
 
 step "すべて成功"

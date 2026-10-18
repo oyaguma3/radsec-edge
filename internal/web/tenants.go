@@ -183,6 +183,8 @@ type tenantData struct {
 	Message, Error string
 	// APName は AP の登録のフォームの値（誤りのときに戻す）。
 	APName string
+	// ProbeProblem はヘルスチェック用の証明書の問題（失効など。なければ空。設計概要 §11.3）。
+	ProbeProblem string
 }
 
 // loadTenant は詳細の画面の値を集める。
@@ -234,6 +236,9 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 	}
 	if d.Plan, err = h.Edge.Plan(ctx, id); err != nil {
 		d.PlanError = err.Error()
+	}
+	if d.ProbeProblem, err = h.Edge.ProbeProblem(ctx, t); err != nil {
+		return tenantData{}, err
 	}
 	if d.Applies, err = h.DB.Applies(ctx, id, 20); err != nil {
 		return tenantData{}, err

@@ -8,6 +8,7 @@
 <div id="tenant">
   <h1 class="text-2xl font-bold mb-4">テナント {{.Tenant.Slug}}{{if not .Tenant.Enabled}} <span class="badge badge-ghost align-middle">停止中</span>{{end}}</h1>
   {{template "alerts" (dict "Message" .Message "Error" .Error)}}
+  {{- with .ProbeProblem}}<div role="alert" class="alert alert-warning mb-4"><span>{{.}}</span></div>{{end}}
 
   {{/* ---- 状態と運用の操作 ---- */}}
   <div class="card bg-base-100 shadow mb-6">
@@ -131,6 +132,7 @@
 
       <h3 class="font-semibold mt-4">ヘルスチェック用の証明書（SAN <code>{{.ProbeSAN}}</code>）</h3>
       {{template "cert-info" .ProbeCert}}
+      {{- with .ProbeProblem}}<p class="text-sm text-warning">{{.}}</p>{{end}}
       {{- if .ProbePending}}<p class="text-sm"><span class="badge badge-info badge-sm">CSR を出した鍵が証明書を待っています</span></p>{{end}}
       {{template "csr-and-import" (dict "ID" .Tenant.ID "Kind" "probe" "CSR" .CSR "CSRKind" .CSRKind
         "Help" (printf "CA のプロファイル probe-client で署名します（テナント %s）。" .Tenant.Slug))}}

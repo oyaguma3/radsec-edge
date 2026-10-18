@@ -55,6 +55,8 @@ type tenantRow struct {
 	// Container はテナントのコンテナ（なければ nil）。
 	Container *agent.Container
 	CRL       crlState
+	// ProbeProblem はヘルスチェック用の証明書の問題（失効など。なければ空）。
+	ProbeProblem string
 }
 
 // ContainerProblem は、起動しているテナントで反映済みなのに、コンテナが動いていないか。
@@ -97,6 +99,9 @@ func (h *Handler) overview(ctx context.Context) (overview, error) {
 			return overview{}, err
 		}
 		r.CRL = h.crlState(crl)
+		if r.ProbeProblem, err = h.Edge.ProbeProblem(ctx, t); err != nil {
+			return overview{}, err
+		}
 		o.Rows = append(o.Rows, r)
 	}
 	return o, nil
@@ -111,9 +116,10 @@ type homeData struct {
 	Reconcile  edge.ReconcileState
 	// Tenants はテナントの数、Capacity はポートの範囲から決まる上限。
 	Tenants, Capacity int
-	// Pending は未反映の変更のあるテナント、CRLProblems は CRL に警告のあるテナント、Down はコンテナが動いていないテナント。
-	Pending, CRLProblems, Down []tenantRow
-	CRLWarn                    time.Duration
+	// Pending は未反映の変更のあるテナント、CRLProblems は CRL に警告のあるテナント、Down はコンテナが動いていないテナント、
+	// ProbeProblems はヘルスチェック用の証明書に問題のあるテナント。
+	Pending, CRLProblems, Down, ProbeProblems []tenantRow
+	CRLWarn                                   time.Duration
 }
 
 func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +137,9 @@ func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
 		}
 		if t.ClientCAPEM != "" && t.CRL.Problem() {
 			d.CRLProblems = append(d.CRLProblems, t)
+		}
+		if t.ProbeProblem != "" {
+			d.ProbeProblems = append(d.ProbeProblems, t)
 		}
 		if o.AgentError == "" && t.ContainerProblem() {
 			d.Down = append(d.Down, t)

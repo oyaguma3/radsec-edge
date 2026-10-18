@@ -221,7 +221,8 @@ func (s *Service) pushCRL(ctx context.Context, t db.Tenant, crlPEM []byte) error
 	if t.Enabled {
 		err = s.Agent.SIGHUP(ctx, t.ID)
 		if err == nil {
-			err = s.probeUntil(ctx, t, port)
+			// ヘルスチェック用の証明書を失効させた CRL でも、戻さずに置く（失効を優先する。§11.3）。
+			err = s.healthCheck(ctx, t, port, crlPEM)
 		}
 		if err != nil {
 			rerr := s.Store.Activate(t.Slug, oldGen)

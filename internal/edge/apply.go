@@ -67,6 +67,11 @@ func (s *Service) render(ctx context.Context, t db.Tenant) (rsconf.Bundle, error
 	if err != nil {
 		return nil, err
 	}
+	// ヘルスチェック用の証明書が今のクライアントCA で検証できなければ、反映してもヘルスチェックが通らず、その間 AP の接続が
+	// 途切れるので、反映の前に断る。失効していれば、出し直すまで反映を断る（設計概要 §11.2、§11.3、§22.4）。
+	if err := s.checkProbeCert(t, []byte(crl.PEM)); err != nil {
+		return nil, invalid("%v", err)
+	}
 	key, err := s.Keys.Current(t.ID, keystore.Server)
 	if err != nil {
 		return nil, err
@@ -264,7 +269,11 @@ func (s *Service) rollback(ctx context.Context, t db.Tenant, oldGen string) erro
 			return err
 		}
 	}
-	if err := s.probeUntil(ctx, t, port); err != nil {
+	crl, err := s.DB.CRL(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	if err := s.healthCheck(ctx, t, port, []byte(crl.PEM)); err != nil {
 		return fmt.Errorf("前の版のヘルスチェック: %w", err)
 	}
 	return nil
@@ -343,7 +352,10 @@ func (s *Service) syncTenant(ctx context.Context, t db.Tenant, st agent.Status, 
 		return nil
 	}
 	if err == nil {
-		err = s.probeUntil(ctx, t, port)
+		var crl db.CRL
+		if crl, err = s.DB.CRL(ctx, t.ID); err == nil {
+			err = s.healthCheck(ctx, t, port, []byte(crl.PEM))
+		}
 	}
 	if err != nil {
 		rec.Result, rec.Error = db.ResultFailed, err.Error()
