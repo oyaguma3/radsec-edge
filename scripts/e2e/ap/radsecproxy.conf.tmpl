@@ -1,0 +1,31 @@
+# E2E の AP の役の radsecproxy の設定（scripts/e2e.sh が @@...@@ を置き換える）。
+ListenUDP *:1812
+ListenUDP *:1813
+LogLevel 3
+
+tls ap {
+    CACertificateFile  /conf/server-ca.pem
+    CertificateFile    /conf/ap.pem
+    CertificateKeyFile /conf/ap.key
+    TlsVersion TLS1_2:TLS1_3
+}
+
+# eapaka_test と radclient（ホストからポートの公開を通して届く）。
+client local {
+    type udp
+    host 0.0.0.0/0
+    secret @@SECRET@@
+}
+
+server edge {
+    type tls
+    host @@HOST@@
+    port @@PORT@@
+    tls ap
+    statusServer on
+}
+
+realm * {
+    server edge
+    accountingServer edge
+}

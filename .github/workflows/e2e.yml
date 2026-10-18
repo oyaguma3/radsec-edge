@@ -1,0 +1,30 @@
+# 単独モードの通し（scripts/e2e.sh。設計概要 §22.2 の 5）。本PoC・radsec-ca・エッジを 1 台に導入して確かめる。
+# ビルドと導入に時間がかかるので、push では動かさず、Actions の画面の「Run workflow」で手で起動する。
+name: E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: 単独モードの通し
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: E2E
+        run: scripts/e2e.sh "$RUNNER_TEMP/e2e-work"
+      - name: ログ
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e-work/logs
+          if-no-files-found: ignore
