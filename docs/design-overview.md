@@ -71,7 +71,8 @@
 | 15 | 段階 3 の確認事項（§22.2 の 1〜7）は、すべて推奨案とする。テナントのポートを公開するアドレスを agent の設定にする（§10.2）、AP の最後の接続をログから作る（§12.1、§13.1）、E2E は本PoC と radsec-ca をつないで simwifi で行う（§17、§22） | 2026-10-18 |
 | 16 | §22.4 の 1・2 を採る。反映の前に、ヘルスチェック用の証明書が今のクライアントCA で検証でき、期限の中にあり、失効していないことを確かめる（§11.2）。ヘルスチェック用の証明書を失効させた CRL も戻さずに置き、Status-Server の確かめを省いてコンテナが動いていることだけを見る。出し直すまで反映は断る（§11.3） | 2026-10-18 |
 | 17 | 段階 4 の確認事項（§23.2）を合意した。1 は推奨案と変え、pocset-v1.0.0 のタグを付け終えてから provisioner（4-2）に取り掛かる。2〜8 は推奨案とする | 2026-10-18 |
-| 18 | MVP セット（aka-mvpset の決定事項 29・30）に合わせ、エッジがテナントの ID を VSA で刻印する。AP の見分け方はテナントごとにモード 1（URI SAN）かモード 3（CA でテナントを決め、NAS-Identifier をそのまま通す）を選び、モード 3 では持ち込みの CA（テナント専用、CRL 必須）と Box を受ける（§24） | 2026-10-20 |
+| 18 | MVP セット（aka-mvpset の決定事項 29・30）に合わせ、エッジがテナントの ID を VSA で刻印する（AP の見分け方は決定事項 19 で改めた）。AP の見分け方はテナントごとにモード 1（URI SAN）かモード 3（CA でテナントを決め、NAS-Identifier をそのまま通す）を選び、モード 3 では持ち込みの CA（テナント専用、CRL 必須）と Box を受ける（§24） | 2026-10-20 |
+| 19 | テナントごとのモードをやめ、AP（AP ごとの証明書）・グループ（共有の証明書。Box を含む）・持ち込みの CA（任意）を混ぜて登録できる形にする。持ち込みの CA はテナント専用で、自己署名でない CA（Meraki）は `PartialChain` で起点にし、CRL が取れない CA はそのテナントだけ `CRLCheck off` にして共通のブロックを業者の証明書の形で絞る。radsecproxy は 1.11.4 に PartialChain（と、そのときの CRL の確認をリーフだけにする）パッチを当ててソースからビルドする。テナントごとに送信元の範囲を任意で持つ（§24.3〜§24.5。aka-mvpset の決定事項 31〜35） | 2026-10-21 |
 
 ## 4. 技術方針
 
@@ -118,7 +119,7 @@ PoC セットの他の Go のリポジトリと同じ流儀にそろえる。
 |---|---|
 | `radsec-edge` | テナントと AP の望む状態を持つ（単独モードでは正本、管理モードでは中央の写し）。設定を生成し、整合ループで反映する（§11）。Web GUI と管理API。radsecproxy のログを agent から受け取って、AP ごとの最後の接続などを出す。CRL を CA から取ってくる |
 | `radsec-edge-agent` | Docker Engine を操作する唯一の部品。決まった操作だけを受け付ける（§10） |
-| radsecproxy | テナントごとに 1 つ。AP の RadSec を受け、証明書で AP を識別し、NAS-Identifier を置き換えて（モード 3 ではそのまま通す）、テナントの刻印を付けて（§24）、上流（本PoC など）へ RADIUS（UDP）で送る |
+| radsecproxy | テナントごとに 1 つ。AP の RadSec を受け、証明書で AP を識別し、NAS-Identifier を置き換えて（グループと持ち込みの CA ではそのまま通す）、テナントの刻印を付けて（§24）、上流（本PoC など）へ RADIUS（UDP）で送る |
 
 ### 5.2 CA
 
@@ -167,7 +168,7 @@ PoC セットの他の Go のリポジトリと同じ流儀にそろえる。
 | 表 | 主な項目 |
 |---|---|
 | `tenants` | ID（管理モードでは OSS/BSS の値。単独モードでは slug と同じ。形は §8.1 の slug の規則）、名前（slug）、ポート、上流（認証・課金のホストとポート）、クライアントCA の証明書、CRL の取得先、サーバー証明書（鍵はファイル）、有効・無効、望む状態の版の番号、反映済みの版の番号。MVP セットでは、見分け方のモードとクライアントCA の一覧を足す（§24.5） |
-| `aps` | テナント、AP の名前、NAS-Identifier、CN、SAN（URI）、証明書のシリアル番号・期限（表示用。照合は CN と SAN で行う）。MVP セットでは種類（`ap` / `box`）を足す（§24.5） |
+| `aps` | テナント、AP の名前、NAS-Identifier、CN、SAN（URI）、証明書のシリアル番号・期限（表示用。照合は CN と SAN で行う）。MVP セットでは種類（`ap` / `group`）を足す（§24.6） |
 | `applies` | テナント、版の番号、設定のハッシュ、操作（SIGHUP / 再起動）、結果、時刻、エラー |
 | `crls` | テナント、最後に置いた CRL（番号、thisUpdate、nextUpdate、本体）、取得の状態（ETag、最後に試みた時刻と結果） |
 | `audit` | 誰が（GUI の利用者のメールアドレス、または `X-Operator-Id`）、何を、いつ |
@@ -203,7 +204,7 @@ CA のデータ（CA、発行した証明書、CRL、画面の利用者、監査
 - `-` が slug の中に入るので、NAS-Identifier だけからはテナントと AP の境目が決まらない。照合と表示には、テナントと AP の名前を別に持つ（`aps` の表）。
 - 名前は設定ファイルと正規表現に入るので、上の規則で必ず検証してから使う（設定の書き換えの防止。§11.2）。
 - ポートの範囲の大きさが、全体のテナントの数の上限になる（170）。
-- MVP セットの Box の名前・SAN・既定の NAS-Identifier は §24.5。モード 3 のテナントの AP が送る NAS-Identifier は、この規則の外にある（§24.3）。
+- MVP セットのグループの名前・SAN・既定の NAS-Identifier は §24.6。グループと持ち込みの CA の AP が送る NAS-Identifier は、この規則の外にある（§24.3）。
 
 ### 8.2 一意を誰が保証するか
 
@@ -228,7 +229,7 @@ CA のデータ（CA、発行した証明書、CRL、画面の利用者、監査
 | テナントのクライアントCA | テナントごと（自己署名） | そのテナントの AP の証明書 | そのテナントの radsecproxy（全エッジ） |
 
 - テナントのクライアントCA を共通のルートの下に置かないのは、radsecproxy にルートを信頼させると、別のテナントの証明書も検証を通り、テナントの分離が `matchCertificateAttribute` だけに頼ることになるためである（決定事項 7）。
-- MVP セットでは、モード 3 のテナントに、テナント専用の持ち込みの CA（CRL 必須）を加えられる（§24.3）。
+- MVP セットでは、テナントにテナント専用の持ち込みの CA を加えられる（§24.3）。
 - 管理API の mTLS（provisioner とエッジ・CA の間）の証明書は、CA では発行しない。PoC セットの他の部品と同じく、自己署名の証明書をフィンガープリントで照合する（`gen-client-cert` と同じ形）。
 
 ### 9.2 証明書の形
@@ -265,7 +266,7 @@ CA のデータ（CA、発行した証明書、CRL、画面の利用者、監査
 - 取得先の既定は `EDGE_CRL_BASE_URL` に `/crl/tenant.<slug>.pem` を足したもので、テナントごとに上書きできる。単独モードでは、画面から CRL の PEM を貼り付けて取り込むこともできる（CA に届かない環境のためと、段階 2 の CA ができる前の試験のため。取り込みの検証は取得と同じ）。
 - 中央が止まって CRL を取れない間に nextUpdate を過ぎると、既存の接続は使えるが、新しい接続は拒否される（§18.1 の V2）。AP の再起動や回線の瞬断でつなぎ直した AP から順に使えなくなる。nextUpdate を長めにするのはこのためである。
 - 期限の切れた CRL を読み込ませる（SIGHUP）と、既存の接続もすべて切れる（§18.1 の V2）。エッジは、取ってきた CRL の署名をそのテナントのクライアントCA の証明書で確かめ、番号が今の CRL より小さくないこと、nextUpdate が未来であることを確かめてから置き、過ぎていれば置かずに古い CRL のまま警告する（§11.2）。
-- MVP セットのモード 3 のテナントは、クライアントCA ごとに CRL を取る。持ち込みの CA の CRL も、CA が取り直して同じ配布の口で配る（§24.3）。
+- MVP セットでは、クライアントCA ごとに CRL を取る。持ち込みの CA の CRL も、CA が取り直して同じ配布の口で配る。CRL の取れない持ち込みの CA のテナントは `CRLCheck off` にする（§24.3）。
 - CRL の古さを監視する。エッジの `/status`（§12.1）と画面（§13.1）に、テナントごとの CRL の番号と nextUpdate を出し、残りが閾値（案: 3 日）を切ったら警告する。管理モードでは、OSS/BSS の中央の整合（§15）でも同じ値を見る。
 
 ## 10. radsecproxy のコンテナと agent
@@ -311,7 +312,7 @@ D-08 §5.8 の検証の結果を、ひな形に入れる。
   - probe の client ブロックにも、AP と同じ rewrite（NAS-Identifier `<テナント>-probe`）を付ける。probe は Status-Server しか送らない（radsecproxy が自分で応える）が、上流に届くものの NAS-Identifier を必ず置き換えるため。この値も NAS-Identifier の一意の確認（§8.2）に含める。テナント `a` の AP `x-probe` と、テナント `a-x` の probe（`a-x-probe`）のように重なりうるため、どちらの登録のときも断る。
   - 照合は SAN の URI だけで行う（CN は照合しない）。radsecproxy は、AP がつなぐたびに、一致するまでの client ブロックのそれぞれについて、照合した属性ごとに「一致しない」の行をログに出す（LogLevel 2 でも出る。500 台目の AP の 1 回の接続で、CN と SAN の両方を照合すると 998 行。§18.1 の V4）。CN も SAN も CA が登録の情報から決めるので、片方で足りる。
 - server ブロックは上流の認証と課金（`type udp`、`statusServer on`）。`realm *` で両方に送る。上流の `host` は、ホスト名ではなく IP アドレス（トンネルの IP）で書く。radsecproxy は、起動のときに server のホスト名を引けないと終了する（§18.1 の V3）。
-- MVP セットでは、どの rewrite にもテナントの刻印の取り除きと付与を入れる。モード 3 のテナントは、Box ごとのブロック・probe・共通のブロックの順に並べる（§24.2、§24.4）。
+- MVP セットでは、どの rewrite にもテナントの刻印の取り除きと付与を入れる。AP・グループ・probe・共通のブロック（持ち込みの CA があるときだけ）の順に並べる（§24.2、§24.4）。
 - `LogLevel 2` にする。LogLevel 3 は認証ごとの行と Status-Server の行が加わり、LogLevel 1 は拒否した証明書の CN も出なくなる（§18.1 の V4）。
 - radsecproxy は `-f`（フォアグラウンド）で動かす。ログは標準エラーに出て、Docker のログで読める（`LogDestination` は無視される）。
 - 正規表現に入れる値は §8.1 の規則で検証済みのものだけで、`.` など正規表現の記号は含まない（slug には英小文字・数字・`-` しかない）。
@@ -480,7 +481,7 @@ OSS/BSS の役割（A テナントユーザー、B テナント管理者、C 運
 4. OSS/BSS が、テナントを置いた全エッジに `PUT .../aps/{apName}` を送り、1 台ずつ反映する（§11.4）。
 5. 認可ポリシーの `nas_id` に、この AP を選べるようになる。
 
-MVP セットのモード 3 のテナントでは、持ち込みの CA の AP は登録しない。Box は、この流れで種類 `box` として登録する（§24.3、§24.4）。
+MVP セットでは、持ち込みの CA の AP は登録しない。グループ（Box を含む）は、この流れで種類 `group` として登録する（CSR は顧客が作る。§24.3）。
 
 ### 14.4 AP の削除（失効）
 
@@ -678,7 +679,7 @@ MVP セットのモード 3 のテナントでは、持ち込みの CA の AP �
 
 | 手順 | リポジトリ | 内容 | 確かめ |
 |---|---|---|---|
-| 4-1 | radsec-edge | 先に §24.6 の V11〜V13 を検証機で確かめる。管理API（9447、mTLS。§12.1）、テナントの刻印・見分け方のモード・Box・クライアントCA の一覧・CA ごとの CRL（§24）、`EDGE_MODE=managed`、管理モードの画面（変更の操作を止める）、OpenAPI（`docs/openapi/edge-api.yaml`） | 単体・結合、OpenAPI と実装の口の突き合わせ |
+| 4-1 | radsec-edge | 管理API（9447、mTLS。§12.1）、テナントの刻印・AP とグループ・持ち込みの CA・クライアントCA の一覧と CA ごとの CRL・送信元の範囲・radsecproxy のソースからのビルド（§24）、`EDGE_MODE=managed`、管理モードの画面（変更の操作を止める）、OpenAPI（`docs/openapi/edge-api.yaml`） | 単体・結合、OpenAPI と実装の口の突き合わせ |
 | 4-2 | eapaka-node-provisioner | 下流に CA とエッジ（複数）を足し、`/ca/...`・`/edges/{edgeId}/...` を中継する（冪等・監査ログ・操作者）。`/status` に CA とエッジの状態 | 契約テスト（エッジと radsec-ca を CI で起動） |
 | 4-3 | eapaka-ossbss-sample | エッジの台帳、テナントの RadSec の設定と配置（スロット）、AP の台帳（CSR の提出・証明書の取り出し・削除は失効）、§13.3 の権限、認可ポリシーの `nas_id` の制限（§19 の 9） | 単体・結合、provisioner との契約テスト |
 | 4-4 | eapaka-ossbss-sample | 中央の整合のループ（§15）と、配置したエッジへの 1 台ずつの反映（§11.4） | 結合（偽物の provisioner）、契約テスト |
@@ -701,8 +702,8 @@ E2E（エッジ 2 台、テナント 2 つ、WireGuard）は段階 5 で行う�
 ### 24.1 背景
 
 - 本PoC・aka-only-server・provisioner・OSS/BSS とエッジ・CA を、VPS に分けて置いて顧客を収容できる MVP セット（[aka-mvpset](https://github.com/oyaguma3/aka-mvpset)）にする。MVP セットでは、本PoC は aka-radius、provisioner は aka-provisioner、OSS/BSS は aka-ossbss という名前になる。
-- 2026-10-20 に、MVP セットの要件と構成の概要（aka-mvpset の `docs/requirements-overview.md`）の決定事項 29（テナントの刻印）と 30（AP の見分け方）を合意した。本節はそのエッジの側の作りを書く（決定事項 18）。
-- 背景: テナント 1,000・加入者 20 万の規模では、加入者ごとの認可ポリシーにテナントの AP の NAS-Identifier を並べる運用が成り立たない。また、NAS-Identifier の前方一致でテナントを判定すると、slug に `-` が入るので別のテナントに一致しうる（`tenant-a-` が `tenant-a-b` の AP にも一致する）。そこで、エッジがテナントの識別子を専用の属性で刻印し、上流がそれでテナントを判定する。あわせて、URI SAN を入れられない AP（業者の CA の証明書を使う AP）と、RadSec に対応しない AP をまとめる Box を受けられるようにする。
+- 2026-10-20 に、MVP セットの要件と構成の概要（aka-mvpset の `docs/requirements-overview.md`）の決定事項 29（テナントの刻印）と 30（AP の見分け方）を合意した。本節はそのエッジの側の作りを書く（決定事項 18）。2026-10-21 に、業者の製品の調べとラボ（aka-mvpset の `verify/r10/`）をもとに、AP の見分け方を改めた（決定事項 19。aka-mvpset の決定事項 31〜35）。
+- 背景: テナント 1,000・加入者 20 万の規模では、加入者ごとの認可ポリシーにテナントの AP の NAS-Identifier を並べる運用が成り立たない。また、NAS-Identifier の前方一致でテナントを判定すると、slug に `-` が入るので別のテナントに一致しうる（`tenant-a-` が `tenant-a-b` の AP にも一致する）。そこで、エッジがテナントの識別子を専用の属性で刻印し、上流がそれでテナントを判定する。あわせて、業者の CA の証明書を使う AP（Meraki、Mist）と、証明書を AP のグループで共有する製品（UniFi、Extreme など）と、RadSec に対応しない AP をまとめる Box を受けられるようにする。
 
 ### 24.2 テナントの刻印
 
@@ -728,55 +729,84 @@ rewrite nasid-tenant-a-ap-001 {
 - 上流（aka-radius）は、RADIUS クライアント（エッジのトンネルの IP）に「刻印を信頼する」の印を持たせ、印のあるクライアントからの刻印だけを使う。刻印が 2 つ以上なら拒否し、テナントの条件があるルールで刻印がなければ拒否する。Accounting では刻印のテナントの ID をセッションに残す。
 - NAS-Identifier の規則（モード 1 の `<slug>-<AP の名前>`、全体で一意。§8.1）は変えない。テナントの判定は刻印で行うが、NAS-Identifier が全体で重ならない性質はログを読むときに役立つ。
 
-### 24.3 AP の見分け方
+### 24.3 登録するもの
 
-| モード | 見分け方 | NAS-Identifier | テナントが持つ CA | 実装 |
+2026-10-21 に、テナントごとのモード（決定事項 18 の当初の形）をやめ、次の 3 種類を混ぜて登録できる形に改めた（決定事項 19。aka-mvpset の決定事項 33）。
+
+| 種類 | 証明書 | 照合 | NAS-Identifier | 最後の接続 | 1 つだけ止める |
+|---|---|---|---|---|---|
+| AP（`ap`） | CA が AP ごとに発行（AP が CSR を作る。今の作り） | URI SAN `urn:<接頭辞>:nas:<テナント>:<AP>` | `<slug>-<AP の名前>` に置き換える | AP ごと | 証明書を失効させる |
+| グループ（`group`） | CA が発行し、AP のグループで共有する（業者の製品が証明書と鍵を 1 組だけ入れる作りのとき。Box を含む） | URI SAN `urn:<接頭辞>:grp:<テナント>:<グループ>` | AP が送った値をそのまま通す（ないときは `<slug>-<グループ>`） | グループごと（送信元の IP つき） | 証明書を失効させる、またはブロックを消す |
+| 持ち込みの CA（任意） | 業者の CA が AP ごとに発行（Meraki、Mist の既定） | 共通のブロック（CA の束と CRL。CRL のない CA では業者の証明書の形も） | そのまま通す（ないときは `<slug>`） | 送信元の IP ごと | 上流の認可ポリシー（その NAS-Identifier を拒否）か業者の CRL |
+
+- AP とグループは、どちらもテナントのクライアントCA（テナントごとの自己署名。決定事項 7）の証明書を URI SAN で照合するので、同じテナントに混ぜても守りは崩れない。
+- 持ち込みの CA を足すと、設定の最後に共通のブロックを置く。足す・外すのは運用者の中でもシステム管理者だけ（受ける範囲が広がるため。OSS/BSS の権限）。
+- テナントの tls ブロックは 1 つなので、CA の束・`CRLCheck`・`PartialChain`（§24.5）はテナント全体で共通の設定になる。
+- テナントごとに、許す送信元のアドレスの範囲（任意）を持つ。設定したときは、そのテナントのすべての client ブロックの `host` に入れる（既定は `0.0.0.0/0`）。
+- テナントの中での NAS-Identifier の名乗りの偽りは受け入れる（テナントをまたぐ偽りは刻印で防ぐ）。
+- 持ち込みの CA の AP は、エッジに 1 台ずつ登録しない。AP を 1 台ずつ見分けるのは NAS-Identifier の役目になる。
+
+持ち込みの CA の条件（aka-mvpset の決定事項 34）:
+
+| CA の形 | 例 | 束に置くもの | `PartialChain` | CRL |
 |---|---|---|---|---|
-| 1 `uri-san` | AP ごとの証明書の URI SAN（今の作り） | AP ごとの値に置き換える | CA が発行したテナントのクライアントCA だけ | する |
-| 2 `cert-ledger` | リーフ証明書のフィンガープリントかシリアル番号の台帳 | AP ごとの値に置き換える | — | データモデルに余地だけ（radsecproxy の設定で表せるかは実装するときに確かめる） |
-| 3 `ca-only` | テナントのクライアントCA でテナントを決める | AP（Box の配下の AP）が送った値をそのまま通す。ないときは補う | 発行したクライアントCA（必須。ヘルスチェックと Box 用）と、持ち込みの CA（1 つ以上） | する |
+| 業者の組織ごとの自己署名の CA | Mist の既定（推定） | その CA | 不要 | 取れれば必須。取れなければ下の扱い |
+| 業者の組織ごとだが自己署名でない CA | Meraki（PureCA）の RadSec 用の CA | その CA だけ（共通のルートと共通の中間 CA は置かない） | `on` | 必須（CA が Meraki の Dashboard API で取る） |
+| 全顧客で共通の CA | Aruba の工場出荷の証明書 | — | — | 受けない |
 
-- モードはテナントごとに選ぶ。tls ブロックがテナントに 1 つで（§10.3）、信頼する CA の束と `CRLCheck on` がテナント全体で共通になるため、テナントの中でモードを混ぜない。
-- 持ち込みの CA の条件:
-  - そのテナント専用の CA に限る（業者の組織ごとの CA など）。業者がすべての顧客に共通で使う CA を持ち込むと、別の顧客の AP もこのテナントのポートにつながり、テナントの刻印が付いてしまう。持ち込むときの確かめ方（発行の範囲）は受入試験（§18 の V7）の項目にする。
-  - 自己署名の CA に限る。radsecproxy（OpenSSL）が自己署名でない中間 CA を信頼の起点にできるかは V14（radsec-ca の設計概要 §19.6）で確かめ、それまで中間 CA は受けない（業者のルートを束に入れると、ルートの下の別の顧客の証明書も検証を通るため）。
-  - CRL を必須にする。CRL のない CA が 1 つでもあると、`CRLCheck on` によりその CA の AP はすべて拒否される。オフにすると、発行した CA の失効（Box とヘルスチェック）も効かなくなる。CRL が手に入らない機種は MVP では受けない。
-  - 持ち込みの CA と CRL の取得先（URL）は CA（radsec-ca）に登録する。CA が CRL を定期的に取り直して（またはアップロードを受けて）署名を確かめ、今の配布の口（`GET /crl/{caId}.pem`。§12.2）で配る。エッジは今と同じ口から CA ごとに取る（エッジからインターネットの業者の口へ出なくて済む）。
-- モード 3 の NAS-Identifier は、AP が送った値をそのまま通す。届かないときは補う（Box のブロックでは `<slug>-<Box の名前>`、共通のブロックでは `<slug>`。`supplementAttribute`）。テナントの中での名乗りの偽りは受け入れる（テナントをまたぐ偽りは刻印で防ぐ）。
-- モード 3 では、持ち込みの CA の AP をエッジに登録しない。最後の接続（§12.1 の `last-seen`）は、共通のブロックの分を送信元の IP ごとに出す。AP を 1 台だけ止めるには、上流の認可ポリシー（その NAS-Identifier を拒否）か、業者の CRL を使う。
-- モードはテナントを作るときに決める。後から変えられるのはシステム管理者だけで、NAS-Identifier の意味が変わるので、そのテナントの認可ポリシーを見直すよう警告を出す（OSS/BSS の画面）。
+- テナント専用であること（1 テナント = 1 業者の組織。同じ CA を 2 つのテナントに登録できない）は、CA（radsec-ca）が登録のときに検査する。
+- CRL が取れない CA を持つテナントは `CRLCheck off` にする。代わりに、共通のブロックを業者の証明書の形（例: Mist の CN が MAC の 12 桁。`matchCertificateAttribute CN:/^[0-9a-f]{12}$/`）で絞り、こちらが発行した証明書が共通のブロックに入らないようにする。こちらが発行した証明書の失効は、ブロックを消すことで行う（`CRLCheck off` では失効させた証明書も TLS の検証を通るため）。共通のブロックの照合の形は、持ち込みの CA の登録の項目として OSS/BSS から受け取る。
+- CRL は、クライアントCA ごと（発行した CA と持ち込みの CA のそれぞれ）に、CA の配布の口から取る（§9.5）。
+- 業者の CA の入れ替え（Meraki の Keeper から PureCA への移行のような）に備え、移行の間は新旧の CA を同じテナントに並べて登録できる。
 
-### 24.4 モード 3 の設定
+### 24.4 設定の並べ方
 
-radsecproxy は、TLS のハンドシェイクで証明書を CA の束と CRL で確かめた後、client ブロックを書いた順に照らし合わせ、最初に一致したブロックを使う。モード 3 のテナントでは、Box ごとのブロック、ヘルスチェック（probe）のブロック、共通のブロックの順に並べる。
+radsecproxy は TLS で証明書を確かめた後、client ブロックを書いた順に照らし合わせ、最初に一致したブロックを使う。並べる順は、AP（名前の順）、グループ（名前の順）、ヘルスチェック（probe）、共通のブロック（持ち込みの CA があるときだけ）とする。共通のブロックはどの証明書にも一致しうるので必ず最後に置き、設定の生成で順番を固定し、生成するときにも確かめる（§11.2 の検査に加える）。
 
 ```
 tls tenant {
     CACertificateFile  /conf/current/ca-bundle.pem   # 発行した CA と CRL、持ち込みの CA と CRL
     CertificateFile    /conf/current/server.pem
     CertificateKeyFile /conf/current/server.key
-    CRLCheck on
+    CRLCheck on                                     # CRL の取れない持ち込みの CA があれば off
+    PartialChain on                                 # 自己署名でない持ち込みの CA（Meraki）があるときだけ
     TlsVersion TLS1_2:TLS1_3
 }
 
-rewrite box-office-1 {
+rewrite nasid-tenant-b-ap-001 {                     # AP
     removeVendorAttribute 32473:1
     addVendorAttribute    32473:1:'42
-    supplementAttribute   32:'tenant-b-office-1
-    supplementAttribute   1:'tenant-b-office-1
+    removeAttribute 32
+    addAttribute 32:'tenant-b-ap-001
+    supplementAttribute 1:'tenant-b-ap-001
 }
-client box-office-1 {
+client tenant-b-ap-001 {
     type tls
     host 0.0.0.0/0
     tls tenant
     certificateNameCheck off
-    matchCertificateAttribute SubjectAltName:URI:/^urn:example:box:tenant-b:office-1$/
-    rewriteIn box-office-1
+    matchCertificateAttribute SubjectAltName:URI:/^urn:example:nas:tenant-b:ap-001$/
+    rewriteIn nasid-tenant-b-ap-001
+}
+
+rewrite grp-hq-unifi {                              # グループ
+    removeVendorAttribute 32473:1
+    addVendorAttribute    32473:1:'42
+    supplementAttribute   32:'tenant-b-hq-unifi
+    supplementAttribute   1:'tenant-b-hq-unifi
+}
+client grp-hq-unifi {
+    type tls
+    host 0.0.0.0/0
+    tls tenant
+    certificateNameCheck off
+    matchCertificateAttribute SubjectAltName:URI:/^urn:example:grp:tenant-b:hq-unifi$/
+    rewriteIn grp-hq-unifi
 }
 
 # probe のブロック（今と同じ。NAS-Identifier は tenant-b-probe に置き換え、刻印も付ける）
 
-rewrite shared {
+rewrite shared {                                    # 共通（持ち込みの CA があるときだけ。必ず最後）
     removeVendorAttribute 32473:1
     addVendorAttribute    32473:1:'42
     supplementAttribute   32:'tenant-b
@@ -787,46 +817,54 @@ client shared {
     host 0.0.0.0/0
     tls tenant
     certificateNameCheck off
+    # CRL の取れない持ち込みの CA のときは、業者の証明書の形で絞る（例 matchCertificateAttribute CN:/^[0-9a-f]{12}$/）
     rewriteIn shared
 }
 ```
 
-| 接続してくるもの | 一致するブロック | NAS-Identifier | 最後の接続 | 1 台だけ止める |
-|---|---|---|---|---|
-| Box（発行した CA の証明書） | その Box のブロック | 配下の AP の値をそのまま（ないときは `<slug>-<Box の名前>`） | Box ごと | Box の証明書を失効させる |
-| ヘルスチェック | probe のブロック | `<slug>-probe` に置き換える | — | — |
-| 業者の AP（持ち込みの CA の証明書） | 共通のブロック | AP の値をそのまま（ないときは `<slug>`） | 送信元の IP ごと | 上流の認可ポリシーか業者の CRL |
+- client ブロックの名前は、AP は NAS-Identifier（今の作り）、グループは `grp-<グループの名前>`、共通は `shared`。グループの名前は AP の名前と重ならないよう OSS/BSS が保証する（CN が同じになるため）。そのため、slug が `grp` のテナントでも、AP のブロック（`grp-<AP>`）とグループのブロック（`grp-<グループ>`）の名前は衝突しない。
+- 共通のブロックがないテナントでは、どのブロックにも一致しない証明書は拒否される（`no matching TLS client`）。
+- 業者の AP が接続するたびに、共通のブロックより前のブロックの数だけ「一致しない」の行がログに出る（§10.3）。AP の多いテナントで持ち込みの CA を使うときは、ログの回転（§10.2）に気をつける。
 
-- 共通のブロックは照合の条件を持たず、どの証明書にも一致するので、必ず最後に置く。設定の生成で順番を固定し、生成するときにも確かめる（§11.2 の検査に加える）。
-- 発行した CA の証明書で Box のブロックに一致しないもの（消した Box の証明書など）は共通のブロックで受け付けられてしまう。Box を消すときは必ず証明書を失効させる。CA が発行するのは、登録した Box と probe の証明書だけにする（§9.3 の規則のまま）。
-- 業者の AP が接続するたびに、Box のブロックの数だけ「一致しない」の行がログに出る（§10.3。Box はテナントに数台の想定なので問題にならない）。
-- ブロックの名前は、Box は `box-<Box の名前>`、共通は `shared`。モード 3 には AP のブロックがないので、AP の名前とは重ならない。
+### 24.5 radsecproxy のビルド
 
-### 24.5 データと API の変更
+- テナントの radsecproxy のイメージ（`images/radsecproxy`）は、Debian のパッケージをやめ、radsecproxy 1.11.4 のソースの tar（SHA-256 を固定）に次のパッチを当ててビルドする（aka-mvpset の決定事項 32。パッチとラボは aka-mvpset の `verify/r10/`）。
+  - tls ブロックごとのオプション `PartialChain`（on のとき、`CACertificateFile` の自己署名でない CA も信頼の起点にする。OpenSSL の `X509_V_FLAG_PARTIAL_CHAIN`）。
+  - `PartialChain on` で `CRLCheck on` のときは、CRL の確認を相手の証明書（リーフ）だけにする。無改造の radsecproxy はチェーン全体を確かめる（`CRL_CHECK_ALL`）ので、起点にした CA そのものの CRL を求められ、正当な AP も拒否される。起点にした CA は設定で信頼しているものなので、その失効は束から外すことで扱う。
+- `PartialChain` を書かないテナントの振る舞いは無改造と同じなので、すべてのテナントでこの版を使う。`PartialChain on` は、自己署名でない持ち込みの CA があるテナントにだけ書く。
+- 新しい版が出たら追いかけ、パッチを当て直して aka-mvpset の `verify/r10` のラボを通す。パッチは upstream に提案する。
+- イメージのタグは、radsecproxy の版とパッチの版を表すものにする（例 `radsec-edge/radsecproxy:1.11.4-pc1`）。agent のイメージの名前（`internal/agent` の `Image`）も一緒に変える。
+
+### 24.6 データと API の変更
 
 | 対象 | 変更 |
 |---|---|
-| エッジの `tenants` | 見分け方のモード（`uri-san` / `ca-only`。`cert-ledger` は予約）を足す。クライアントCA を 1 つから一覧（CA の ID、種類 `issued` / `brought`、CRL の取得先）に広げる |
-| エッジの `aps` | 種類（`ap` / `box`）を足す。モード 3 のテナントでは `box` だけを持つ |
+| エッジの `tenants` | クライアントCA を 1 つから一覧（CA の ID、種類 `issued` / `brought`、自己署名か、CRL の有無）に広げる。`CRLCheck` と `PartialChain` は、この一覧から決める（CRL のない持ち込みの CA があれば `CRLCheck off`、自己署名でない持ち込みの CA があれば `PartialChain on`）。共通のブロックの照合の形（CRL のない持ち込みの CA のとき）。許す送信元のアドレスの範囲（任意） |
+| エッジの `aps` | 種類（`ap` / `group`）と、グループの用途（`box` / `unifi` / `extreme` / `aruba` / `mist` / `other`。表示だけ）を足す |
 | エッジの `crls` | テナントと CA の組ごとに持つ |
-| エッジの管理API（§12.1） | `PUT /tenants/{tenantId}` に、見分け方のモードとクライアントCA の一覧を加える。`PUT .../aps/{apName}` に種類を加える。`last-seen` に、共通のブロックの送信元の IP ごとの行を加える |
-| 名前の規則（§8.1） | Box の名前（AP と同じ規則。テナントの中で一意）、Box の SAN（`urn:<URN の接頭辞>:box:<テナント>:<Box の名前>`）、Box の既定の NAS-Identifier（`<slug>-<Box の名前>`） |
+| エッジの管理API（§12.1） | `PUT /tenants/{tenantId}` に、クライアントCA の一覧、共通のブロックの照合の形、送信元の範囲を加える。`PUT .../aps/{apName}` に種類と用途を加える。`last-seen` に、共通のブロックの送信元の IP ごとの行を加える |
+| 名前の規則（§8.1） | グループの名前（AP と同じ規則。テナントの中で一意で、AP の名前とも重ならない）、グループの SAN（`urn:<URN の接頭辞>:grp:<テナント>:<グループ>`）、グループの既定の NAS-Identifier（`<slug>-<グループ>`） |
 | 環境変数 | `EDGE_STAMP_VENDOR_ID`、`EDGE_STAMP_VENDOR_TYPE`（§24.2） |
-| CA（radsec-ca） | 持ち込みの CA と CRL の取得先の登録、CRL の定期の取り直し（またはアップロード）と署名の確認、配布の口での配布、Box の証明書のプロファイル（`box-client`）。radsec-ca の設計概要 §19 |
-| OSS/BSS（aka-ossbss） | テナントの RadSec の設定に見分け方のモード、持ち込みの CA の登録、Box の台帳、モード 3 のテナントの NAS-Identifier の一覧（任意。認可ポリシーの入力の補助） |
+| CA（radsec-ca） | 持ち込みの CA の登録（テナント専用の確認、フィンガープリントの重複の検査、自己署名か、CRL の取得先: URL・Meraki の Dashboard API・アップロード・なし）、CRL の取り直しと配布、グループの証明書のプロファイル（`group-client`）。radsec-ca の設計概要 §19 |
+| OSS/BSS（aka-ossbss） | AP とグループの台帳（グループの CSR の提出と証明書の取り出し、用途ごとの手順書の案内）、持ち込みの CA の登録（システム管理者）、送信元の範囲 |
 | provisioner（aka-provisioner） | 中継するだけ（中身は解釈しない。§23.2 の 6） |
 | 上流（aka-radius） | 刻印の読み取り、RADIUS クライアントの「刻印を信頼する」の印、セッションへのテナントの ID の記録、テナントの条件つきの認可ポリシー |
 
-### 24.6 確かめること（段階 4 の最初に検証機で）
+### 24.7 確かめたこと（2026-10-20、検証機のラボ）
 
-| # | 内容 |
+段階 4 の最初に予定していた V11〜V13 と、radsec-ca の V14 は、aka-mvpset の `verify/r10/` のラボ（radsecproxy を 4 つ、業者の CA の模型、52 の場面。すべて期待どおり）で確かめた。結果のまとめは aka-mvpset の概要 §20.2。
+
+| # | 結果 |
 |---|---|
-| V11 | radsecproxy 1.11.2 の `addVendorAttribute` と `removeVendorAttribute` の書き方と効き方。AP が偽の刻印を送ったときに取り除かれること。認証と Accounting の両方に付くこと |
-| V12 | CA の束に CA と CRL を 2 組入れたときの照合と失効（それぞれの CA の証明書が通ること、それぞれの CRL の失効が効くこと、片方の CRL の期限が切れたときの振る舞い） |
-| V13 | Box ごとのブロックの後ろに共通のブロックを置いたときの選ばれ方（Box は Box のブロック、業者の AP と登録していない証明書は共通のブロック）と、照合の条件のない client ブロックが受け付けられること |
+| V11 | `addVendorAttribute` と `removeVendorAttribute` は Debian の 1.11.2 でも 1.11.4 でも効く。AP が送った偽の刻印は消して付け直され、別の業者の VSA は残る。認証と Accounting の両方に付く |
+| V12 | こちらの CA と業者の CA を CRL とともに同じ束に入れても、それぞれ正しく受け入れ・失効・拒否される（PartialChain の版） |
+| V13 | ブロックは書いた順に選ばれる。共通のブロックがなければ、登録していない証明書・ブロックを消した証明書は拒否される。照合の条件のない client ブロックはどの証明書にも一致する |
+| V14 | 無改造の radsecproxy は自己署名でない CA を信頼の起点にできない（共通のルートを信頼すると他の組織の AP も通る）。PartialChain の版なら組織の CA を起点にでき、他の組織の AP を拒否できる。ただし CRL の確認をリーフだけにする変更が要る（§24.5） |
 
-### 24.7 段階 4 への入れ方
+残り（実機が手に入ったときに確かめる）: 業者の実物の証明書と CRL、AP が送るチェーン、テナントのポートを設定できるか、NAS-Identifier の実際の値、証明書の差し替えが効くか（V7 と合わせて受入試験の項目にする）。
 
-- 4-1（エッジの管理API）の前に、V11〜V13 と、radsec-ca の V14（中間 CA を信頼の起点にできるか。radsec-ca の設計概要 §19.6）を検証機で確かめる。radsec-ca の変更（持ち込みの CA と CRL、Box の証明書。radsec-ca の設計概要 §19）は 4-1 と並べて行う。4-1 に、刻印、見分け方のモード、Box、クライアントCA の一覧、CA ごとの CRL を含める。
+### 24.8 段階 4 への入れ方
+
+- 4-1（エッジの管理API）に、テナントの刻印、AP とグループ、持ち込みの CA、クライアントCA の一覧と CA ごとの CRL、送信元の範囲（§24.3〜§24.6）、radsecproxy のイメージのソースからのビルド（§24.5）を含める。radsec-ca の変更（radsec-ca の設計概要 §19）は 4-1 と並べて行う。
 - 4-2（provisioner）と 4-3・4-4（OSS/BSS）は、MVP セットで改名したリポジトリ（aka-provisioner、aka-ossbss）の上で行う（aka-mvpset の概要 §18.1）。
 - MVP セットで決めた、エッジにかかわる他のこと（データ面と管理面の両方とピアを張る、`userland-proxy: false` と `live-restore: true`、4 GB のエッジで 150 テナント、長い時間の試験）は、aka-mvpset の概要の決定事項 14・25・27・28 にある。本書の本文（§1 の図、§8.1 のポートの範囲、§12.3 など）への反映は、段階 4 に入るときに行う。
