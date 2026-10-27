@@ -1,5 +1,5 @@
 # radsec-edge と radsec-edge-agent のイメージ（設計概要 §4。1 つのイメージに 2 つのバイナリを入れ、compose で別のコマンドで動かす）。
-FROM golang:1.27.2 AS build
+FROM golang:1.27.3 AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./

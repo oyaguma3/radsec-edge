@@ -56,7 +56,7 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 
 ## 開発
 
-- Go 1.27.2 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy`）。
+- Go 1.27.3 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy`）。
 - `scripts/e2e.sh` は、本PoC・radsec-ca・エッジを 1 台に導入して、eapaka_test と AP の役（radsecproxy）で単独モードの通しを確かめます（Docker Desktop では動きません。運用ガイド 8 章）。GitHub Actions では「E2E」のワークフローを手で起動します。
 - 画面の CSS は `sh scripts/build-css.sh` で作ります（Tailwind CSS のスタンドアロン CLI と daisyUI を、版を固定して取得します）。
 

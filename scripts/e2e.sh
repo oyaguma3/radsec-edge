@@ -272,7 +272,7 @@ echo "radsec-edge: $(git -C "$ROOT" log -1 --format='%h %s')$(git -C "$ROOT" dif
 step "試験の道具（eapaka_test、AP の役のイメージ）"
 # ホストに Go がなくても動くよう、コンテナでビルドする。
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CGO_ENABLED=0 -e GOFLAGS=-buildvcs=false \
-	-v "$EAPAKA_TEST:/src" -w /src golang:1.27.2 go build -o /src/eapaka_test.bin ./cmd/eapaka_test
+	-v "$EAPAKA_TEST:/src" -w /src golang:1.27.3 go build -o /src/eapaka_test.bin ./cmd/eapaka_test
 mv "$EAPAKA_TEST/eapaka_test.bin" "$BIN/eapaka_test"
 docker build -q -t radsec-edge-e2e-ap "$ROOT/scripts/e2e/ap" >/dev/null
 pass "eapaka_test と AP の役のイメージ"

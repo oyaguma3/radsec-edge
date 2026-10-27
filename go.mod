@@ -1,6 +1,6 @@
 module github.com/oyaguma3/radsec-edge
 
-go 1.27.2
+go 1.27.3
 
 require modernc.org/sqlite v1.60.1
 

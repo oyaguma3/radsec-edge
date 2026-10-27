@@ -79,7 +79,7 @@
 
 PoC セットの他の Go のリポジトリと同じ流儀にそろえる。
 
-- 言語: Go 1.27.2。標準ライブラリを優先する（`net/http` のメソッドつき ServeMux、`html/template`、`text/template`、`embed`、`log/slog`、`encoding/json/v2`、`crypto/x509`、`crypto/tls`）。
+- 言語: Go 1.27.3。標準ライブラリを優先する（`net/http` のメソッドつき ServeMux、`html/template`、`text/template`、`embed`、`log/slog`、`encoding/json/v2`、`crypto/x509`、`crypto/tls`）。
 - 外部依存（Go）: SQLite のドライバー（§19 の 5）。Docker Engine の API は、公式の SDK を使わず、unix ソケットへの HTTP で必要な口だけを呼ぶ（依存を増やさない）。
 - 画面: OSS/BSS と同じ Go + htmx + daisyUI（JavaScript は書かない）。OSS/BSS の画面の土台と Cloudflare Access の JWT の検証をコピーして手直しする（共有モジュールにはしない）。
 - リポジトリ: エッジは `radsec-edge`（module パス `github.com/oyaguma3/radsec-edge`）。CA は別のリポジトリ `radsec-ca` にする（§19 の 7。作業ディレクトリは `~/projects/radsec-ca`）。CA の詳しい設計は `radsec-ca` の設計概要に書き、本書には全体に関わることだけを残す。名前に eapaka を入れない（本PoC に依存しない汎用の部品として作る）。
