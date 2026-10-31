@@ -26,7 +26,7 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 |---|---|
 | `radsec-edge` | テナントと AP の望む状態（SQLite）、設定の生成と反映、整合ループ、CRL の取得、運用者向けの画面（8447。Cloudflare Access の JWT で利用者を確かめる） |
 | `radsec-edge-agent` | Docker を操作する唯一の部品。`radsec-edge` から unix ソケットで決まった操作だけを受け、テナントの radsecproxy のコンテナを固定のひな形から作る |
-| radsecproxy（テナントごと） | `images/radsecproxy` のイメージ（Debian trixie の radsecproxy 1.11.2）。ポート 20830〜20999 の 1 つで AP の RadSec を受ける |
+| radsecproxy（テナントごと） | `images/radsecproxy` のイメージ（radsecproxy 1.11.4 に PartialChain のパッチを当ててソースからビルドしたもの）。ポート 20000〜21999 の 1 つで AP の RadSec を受ける |
 
 反映は「設定の生成 → `radsecproxy -p` の構文検査 → 版のディレクトリの付け替え → SIGHUP か再起動 → ヘルスチェック（ヘルスチェック用の証明書で Status-Server を送る）」の順に行い、失敗したら前の版に戻します。
 

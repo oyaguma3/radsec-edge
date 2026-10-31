@@ -320,7 +320,6 @@ setenv .env CA_ORG "E2E Org"
 setenv .env CA_URN_PREFIX "$URN_PREFIX"
 setenv .env CA_DNS_DOMAIN "$DOMAIN"
 setenv .env CA_BIND_ADDR "$GW"
-setenv .env CA_ADMIN_CLIENTS "e2e=$(fingerprint "$PKI/e2e-client.pem")"
 setenv .env CA_TLS_HOSTS "$GW"
 setenv .env CA_ACCESS_TEAM_DOMAIN unused.cloudflareaccess.com
 setenv .env CA_ACCESS_AUD unused
@@ -330,6 +329,10 @@ mkdir -p secrets
 openssl rand -hex 32 >secrets/kek
 sudo chown 65532 secrets/kek
 sudo chmod 600 secrets/kek
+# 管理クライアントのピン（ファイルがあると管理API を待ち受ける。radsec-ca の運用ガイド 3.1）。
+echo "e2e=$(fingerprint "$PKI/e2e-client.pem")" >secrets/admin-clients
+sudo chown 65532 secrets/admin-clients
+sudo chmod 600 secrets/admin-clients
 # 画面は開発用の設定でループバックだけ（E2E は管理API で操作する）。cloudflared は動かさない。
 cat >"$WORK/ca-override.yaml" <<EOF
 services:
@@ -339,8 +342,13 @@ services:
       CA_DEV_USER_EMAIL: e2e@example.com
       CA_ACCESS_TEAM_DOMAIN: ""
       CA_ACCESS_AUD: ""
+    secrets:
+      - admin-clients
   cloudflared:
     profiles: ["off"]
+secrets:
+  admin-clients:
+    file: $CA/secrets/admin-clients
 EOF
 ca_compose up -d --build --quiet-pull --wait --wait-timeout 600
 ca_compose exec -T radsec-ca /radsec-ca server-cert >"$WORK/ca-server.pem" 2>/dev/null </dev/null

@@ -9,7 +9,7 @@
 |---|---|
 | `radsec-edge` | 画面（8447。cloudflared からだけ受ける）、テナントと AP の望む状態（SQLite）、設定の生成と反映、整合ループ、CRL の取得、AP の最後の接続 |
 | `radsec-edge-agent` | Docker を操作する唯一の部品（docker.sock を持つ）。ネットワークを使わず、unix ソケットだけで `radsec-edge` と話す |
-| `radsecproxy-<テナント>` | テナントごとの radsecproxy（agent が作る。compose の管理の外）。テナントのポート（20830〜20999）で AP の RadSec を受ける |
+| `radsecproxy-<テナント>` | テナントごとの radsecproxy（agent が作る。compose の管理の外）。テナントのポート（20000〜21999）で AP の RadSec を受ける |
 | `cloudflared` | Cloudflare Tunnel のコネクター（画面を Cloudflare Access の後ろに出す） |
 
 - ホストのディレクトリ `EDGE_HOST_DIR`（既定 `/var/lib/radsec-edge`）の `data` に SQLite と鍵、`tenants` にテナントの radsecproxy の設定を置く。`tenants` はホストと同じパスでマウントする（agent がテナントのコンテナにそのパスをマウントするため）。
@@ -35,6 +35,7 @@ stat -c %g /var/run/docker.sock   # EDGE_DOCKER_GID に書く
 | `EDGE_URN_PREFIX`・`EDGE_DNS_DOMAIN` | CA の `CA_URN_PREFIX`・`CA_DNS_DOMAIN` と同じ値 |
 | `EDGE_UPSTREAM_AUTH`・`EDGE_UPSTREAM_ACCT` | 新しいテナントの上流の既定（IP アドレス:ポート。ホスト名は使えない。radsecproxy は名前を引けないと起動しないため） |
 | `EDGE_UPSTREAM_SECRET` | 上流との共有シークレット（8〜128 文字の英数字と `._~+/=@-`） |
+| `EDGE_STAMP_VENDOR_ID`・`EDGE_STAMP_VENDOR_TYPE` | テナントの刻印の VSA（既定 32473・1。起動のときにログに出す）。単独モードの刻印の値はテナントの slug。上流が使わなければ無視される |
 | `EDGE_CRL_BASE_URL` | CA の配布の口（例 `http://10.0.0.1:8449`）。空なら、テナントの画面で CRL を貼り付けて取り込む |
 | `EDGE_AGENT_PUBLISH_ADDR` | テナントのポートを公開するアドレス。空ならすべてのアドレス。公開のアドレスを 1 つに絞るときに書く |
 | `EDGE_ACCESS_TEAM_DOMAIN`・`EDGE_ACCESS_AUD` | Cloudflare Access のチームのドメインと AUD タグ |
@@ -43,7 +44,7 @@ Cloudflare Tunnel のトークンは `secrets/tunnel-token` に置き、`sudo ch
 
 ### 2.3 イメージと起動
 
-イメージは公開していないので、タグからソースでビルドする。radsecproxy のイメージ（`radsec-edge/radsecproxy:1.11.2-1-deb13u1`）も作る。
+イメージは公開していないので、タグからソースでビルドする。radsecproxy のイメージ（`radsec-edge/radsecproxy:1.11.4-pc1`。radsecproxy 1.11.4 のソースを GitHub から取り、SHA-256 を確かめてパッチを当ててビルドする）も作る。VPS の上ではビルドせず、手元か CI で作って `docker save` で送る。
 
 ```bash
 docker compose --profile build build
