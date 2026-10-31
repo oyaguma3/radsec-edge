@@ -1,0 +1,52 @@
+diff -u -r a/tlscommon.c c/tlscommon.c
+--- a/tlscommon.c	2026-08-08 00:33:11.000000000 +0900
++++ b/tlscommon.c	2026-10-20 23:05:09.989602152 +0900
+@@ -513,10 +513,27 @@
+         X509_STORE_free(x509_s);
+         return 0;
+     }
+-    if (conf->crlcheck)
+-        X509_STORE_set_flags(x509_s, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
++    if (conf->crlcheck) {
++        /* With PartialChain, the configured (possibly non self-signed) CAs are the trust anchors.
++         * CRL_CHECK_ALL would also require a CRL for the anchor itself, whose issuer is outside the
++         * trusted set, so only the peer certificate is checked against its issuer's CRL. */
++        if (conf->partialchain)
++            X509_STORE_set_flags(x509_s, X509_V_FLAG_CRL_CHECK);
++        else
++            X509_STORE_set_flags(x509_s, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
++    }
+     if (conf->vpm)
+         X509_STORE_set1_param(x509_s, conf->vpm);
++    if (conf->partialchain) {
++#ifdef X509_V_FLAG_PARTIAL_CHAIN
++        /* treat (non self-signed) CAs in CACertificateFile/Path as trust anchors */
++        X509_STORE_set_flags(x509_s, X509_V_FLAG_PARTIAL_CHAIN);
++#else
++        debug(DBG_ERR, "tlsaddcacrl: PartialChain is not supported by this OpenSSL version");
++        X509_STORE_free(x509_s);
++        return 0;
++#endif
++    }
+     SSL_CTX_set_cert_store(ctx, x509_s);
+ 
+     calist = sk_X509_NAME_new_null();
+@@ -1153,6 +1170,7 @@
+                           "CertificateKeyPassword", CONF_STR, &conf->certkeypwd,
+                           "CacheExpiry", CONF_LINT, &conf->cacheexpiry,
+                           "CRLCheck", CONF_BLN, &conf->crlcheck,
++                          "PartialChain", CONF_BLN, &conf->partialchain,
+                           "PolicyOID", CONF_MSTR, &conf->policyoids,
+                           "CipherList", CONF_STR, &conf->cipherlist,
+                           "CipherSuites", CONF_STR, &conf->ciphersuites,
+diff -u -r a/tlscommon.h c/tlscommon.h
+--- a/tlscommon.h	2026-08-08 00:33:11.000000000 +0900
++++ b/tlscommon.h	2026-10-20 22:58:08.295387935 +0900
+@@ -24,6 +24,7 @@
+     char *certkeyfile;
+     char *certkeypwd;
+     uint8_t crlcheck;
++    uint8_t partialchain;
+     char **policyoids;
+     char *cipherlist;
+     char *ciphersuites;

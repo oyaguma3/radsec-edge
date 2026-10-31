@@ -9,7 +9,7 @@ import (
 )
 
 // testImage は結合の試験に使う radsecproxy のイメージ（images/radsecproxy から作る）。
-const testImage = "radsec-edge/radsecproxy:1.11.2-1-deb13u1"
+const testImage = "radsec-edge/radsecproxy:1.11.4-pc1"
 
 // radsecproxyCheck は、本物の radsecproxy の `-p`（構文検査）でバンドルを確かめる。
 // EDGE_TEST_DOCKER=1 のときだけ動かす（Docker とイメージが要る。CI では必ず動かす）。

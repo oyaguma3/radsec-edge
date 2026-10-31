@@ -46,7 +46,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: radsecproxy のイメージのビルド
-        run: docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy
+        run: docker build -t radsec-edge/radsecproxy:1.11.4-pc1 images/radsecproxy
       - name: 結合の試験
         env:
           EDGE_TEST_DOCKER: "1"

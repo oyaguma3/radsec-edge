@@ -17,7 +17,7 @@ import (
 )
 
 // Image は radsecproxy のイメージ（images/radsecproxy で作る。設計概要 §4）。
-const Image = "radsec-edge/radsecproxy:1.11.2-1-deb13u1"
+const Image = "radsec-edge/radsecproxy:1.11.4-pc1"
 
 // コンテナのラベル（設計概要 §10.2）。ラベルのないコンテナには触れない。
 const (
