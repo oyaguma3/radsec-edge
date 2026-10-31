@@ -194,10 +194,22 @@ type logConfig struct {
 	Config map[string]string `json:"Config"`
 }
 
+// fluentdLog は、テナントのコンテナのログを Fluent Bit に送る設定（§24.11 の EA14。aka-mvpset の verify/edge-logs）。待ち行列はコンテナごとに確保され、
+// 既定の値（1,048,576 件）だと 150 テナントで dockerd が約 480 MiB 増えるので絞る。docker logs は dual logging のキャッシュで読める（last-seen が使う）。
+func fluentdLog(address, tenantID string) logConfig {
+	return logConfig{Type: "fluentd", Config: map[string]string{
+		"fluentd-address": address, "fluentd-async": "true", "fluentd-buffer-limit": "8192", "tag": "tenant." + tenantID,
+		"cache-max-size": "10m", "cache-max-file": "2",
+	}}
+}
+
 // tenantSpec はテナントのコンテナのひな形を作る（設計概要 §10.2）。値はすべて検証済みのもの。
-// publishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。§10.2）。
-func tenantSpec(tenantsDir, network, publishAddr, tenantID, slug string, port int) spec {
+// publishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。§10.2）。fluentd は Fluent Bit のアドレス（空なら json-file のまま）。
+func tenantSpec(tenantsDir, network, publishAddr, fluentd, tenantID, slug string, port int) spec {
 	s := baseSpec(network)
+	if fluentd != "" {
+		s.HostConfig.LogConfig = fluentdLog(fluentd, tenantID)
+	}
 	s.Cmd = []string{"radsecproxy", "-f", "-c", confPath}
 	s.Labels = map[string]string{LabelTenant: tenantID, LabelSlug: slug, LabelPort: strconv.Itoa(port)}
 	s.ExposedPorts = map[string]struct{}{ContainerPort: {}}

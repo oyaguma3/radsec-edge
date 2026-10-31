@@ -5,7 +5,9 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -19,11 +21,15 @@ import (
 
 	"github.com/oyaguma3/radsec-edge/internal/access"
 	"github.com/oyaguma3/radsec-edge/internal/agent"
+	"github.com/oyaguma3/radsec-edge/internal/api"
+	"github.com/oyaguma3/radsec-edge/internal/audit"
 	"github.com/oyaguma3/radsec-edge/internal/auth"
+	"github.com/oyaguma3/radsec-edge/internal/certs"
 	"github.com/oyaguma3/radsec-edge/internal/config"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge"
 	"github.com/oyaguma3/radsec-edge/internal/keystore"
+	"github.com/oyaguma3/radsec-edge/internal/names"
 	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 	"github.com/oyaguma3/radsec-edge/internal/server"
 	"github.com/oyaguma3/radsec-edge/internal/web"
@@ -37,9 +43,11 @@ const usage = `usage: radsec-edge <command>
 commands:
   serve        サーバーを起動する（コマンド省略時の既定）。起動時に DB のスキーマを移行する
   migrate      DB のスキーマを移行して終わる
+  server-cert  管理API のサーバー証明書（なければ作る）を標準出力に、フィンガープリントを標準エラーに出す（管理モード）
+  replace-server-cert  管理API のサーバー証明書を作り直して標準出力に出す（動いているサーバーは SIGHUP で読み直す。管理モード）
   healthcheck  動いている radsec-edge の /healthz を確かめる（compose の healthcheck 用）
 
-設定は環境変数（接頭辞 EDGE_）で与える。
+設定は環境変数（接頭辞 EDGE_）で与える。管理クライアントのピンとサーバー証明書は SIGHUP で読み直す。
 `
 
 func main() {
@@ -56,6 +64,10 @@ func main() {
 		err = serve(ctx)
 	case "migrate":
 		err = migrate(ctx)
+	case "server-cert":
+		err = serverCert(os.Stdout, os.Stderr)
+	case "replace-server-cert":
+		err = replaceServerCert(ctx, os.Stdout, os.Stderr)
 	case "healthcheck":
 		err = healthcheck(ctx)
 	case "-h", "-help", "--help", "help":
@@ -76,7 +88,8 @@ func openDB(ctx context.Context) (config.Config, *slog.Logger, *db.DB, error) {
 	if err != nil {
 		return cfg, nil, nil, err
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	// ログは標準エラーに出す（コマンドの標準出力に証明書を出すものがあるため。Docker は両方をコンテナのログにする）。
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	log.Info("starting", "version", version, "mode", cfg.Mode)
 	file := filepath.Join(cfg.DataDir, "radsec-edge.db")
 	d, err := db.Open(ctx, file)
@@ -94,6 +107,7 @@ func openDB(ctx context.Context) (config.Config, *slog.Logger, *db.DB, error) {
 		return cfg, log, nil, err
 	}
 	log.Info("database", "file", file, "schema_version", v, "applied", applied)
+	d.SetAuditSink(audit.NewFiles(cfg.AuditDir, cfg.AuditRetentionDays))
 	return cfg, log, d, nil
 }
 
@@ -103,17 +117,29 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	defer d.Close()
+	if err := audit.CheckWritableDir(cfg.AuditDir); err != nil {
+		return err
+	}
+	if cfg.Mode == config.ModeManaged {
+		if err := checkManagedTenants(ctx, d); err != nil {
+			return err
+		}
+	}
 	svc := edge.New(edge.Options{
 		Log: log, DB: d, Agent: agent.NewClient(cfg.AgentSocket),
 		Store: rsconf.Store{Root: cfg.TenantsDir}, Keys: keystore.Store{Dir: filepath.Join(cfg.DataDir, "keys")},
 		URNPrefix: cfg.URNPrefix, DNSDomain: cfg.DNSDomain, Secret: cfg.Upstream.Secret, CRLBaseURL: cfg.CRLBaseURL,
-		ProbeTimeout: cfg.ProbeTimeout, Stamp: rsconf.Stamp{VendorID: cfg.StampVendorID, VendorType: cfg.StampVendorType},
+		ProbeTimeout: cfg.ProbeTimeout, ApplyTimeout: cfg.ApplyTimeout, Capacity: cfg.TenantCapacity,
+		Stamp: rsconf.Stamp{VendorID: cfg.StampVendorID, VendorType: cfg.StampVendorType},
 	})
 	log.Info("edge", "tenants_dir", cfg.TenantsDir, "agent_socket", cfg.AgentSocket, "urn_prefix", cfg.URNPrefix,
 		"dns_domain", cfg.DNSDomain, "crl_base_url", cfg.CRLBaseURL, "reconcile_interval", cfg.ReconcileInterval.String(),
-		"crl_interval", cfg.CRLInterval.String(),
+		"crl_interval", cfg.CRLInterval.String(), "tenant_capacity", cfg.TenantCapacity,
 		"stamp_vendor_id", cfg.StampVendorID, "stamp_vendor_type", cfg.StampVendorType)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	go svc.Run(ctx, cfg.ReconcileInterval, cfg.CRLInterval)
+	go maintain(ctx, log, d, audit.NewFiles(cfg.AuditDir, cfg.AuditRetentionDays))
 
 	ident, err := newIdentifier(ctx, cfg, log)
 	if err != nil {
@@ -124,9 +150,190 @@ func serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 画面から待つ反映は、構文検査とヘルスチェックを含めて時間がかかるので、上限を長くする。
-	return server.Run(ctx, server.Options{Addr: cfg.GUIAddr, Handler: h.Routes(), Log: log,
-		WriteTimeout: max(3*time.Minute, cfg.ApplyTimeout+time.Minute)})
+	runs := []func(context.Context) error{
+		func(ctx context.Context) error {
+			// 画面から待つ反映は、構文検査とヘルスチェックを含めて時間がかかるので、上限を長くする。
+			return server.Run(ctx, server.Options{Addr: cfg.GUIAddr, Handler: h.Routes(), Log: log.With("listener", "gui"),
+				WriteTimeout: max(3*time.Minute, cfg.ApplyTimeout+time.Minute)})
+		},
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			// 裏の反映を取り消し、前の版に戻すのを待つ（compose の stop_grace_period は 20 秒。§24.11 の EA5）。
+			svc.Shutdown(shutdownWait)
+			return nil
+		},
+	}
+	// 管理API は管理モードだけ待ち受ける（§12.1）。
+	if cfg.Mode == config.ModeManaged {
+		run, reload, err := apiRunner(cfg, log, d, svc)
+		if err != nil {
+			return err
+		}
+		runs = append(runs, run)
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hup:
+					reload()
+				}
+			}
+		}()
+	}
+	return runAll(ctx, cancel, runs...)
+}
+
+// shutdownWait は停止のときに裏の反映を待つ時間。
+const shutdownWait = 15 * time.Second
+
+// checkManagedTenants は、管理モードでは数字でない ID のテナント（単独モードで作ったもの）があれば起動しない（§6、§24.11 の EA4）。
+func checkManagedTenants(ctx context.Context, d *db.DB) error {
+	tenants, err := d.Tenants(ctx)
+	if err != nil {
+		return err
+	}
+	for _, t := range tenants {
+		if !names.ValidManagedID(t.ID) {
+			return fmt.Errorf("tenant %q was created in standalone mode; managed mode cannot take it over (remove the tenants in standalone mode, or start with an empty data directory)", t.ID)
+		}
+	}
+	return nil
+}
+
+// maintain は、監査ログのファイルと冪等の記録を、起動のときと 1 時間ごとに整理する。
+func maintain(ctx context.Context, log *slog.Logger, d *db.DB, f *audit.Files) {
+	for {
+		if err := f.Maintain(time.Now()); err != nil {
+			log.Error("cannot maintain audit files", "event_id", "EDGE_AUDIT_FILE_ERR", "error", err)
+		}
+		if _, err := d.PurgeIdempotency(ctx); err != nil && ctx.Err() == nil {
+			log.Warn("cannot purge idempotency records", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Hour):
+		}
+	}
+}
+
+// apiRunner は管理API（mTLS）のリスナーと、SIGHUP で動かす読み直しを用意する。サーバー証明書がなければ自己署名で作る（§12.1）。
+func apiRunner(cfg config.Config, log *slog.Logger, d *db.DB, svc *edge.Service) (func(context.Context) error, func(), error) {
+	pins, err := api.LoadPins(cfg.AdminClientsFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("admin clients: %w", err)
+	}
+	certPath, keyPath := filepath.Join(cfg.TLSDir, "server.pem"), filepath.Join(cfg.TLSDir, "server.key")
+	if created, err := certs.EnsureFiles(certPath, keyPath, cfg.TLSHosts); err != nil {
+		return nil, nil, err
+	} else if created {
+		log.Info("created a self-signed server certificate for the management API", "hosts", cfg.TLSHosts)
+	}
+	f, err := certs.LoadFile(certPath, keyPath, log)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Info("management API", "fingerprint", certs.Fingerprint(f.Leaf()), "not_after", f.Leaf().NotAfter, "admin_clients", pins.Names())
+	apiLog := log.With("listener", "api")
+	h := &api.Handler{Log: apiLog, DB: d, Edge: svc, Version: version, Mode: cfg.Mode, CRLWarn: cfg.CRLWarn, MgmtClient: pins.NameFromRequest, AdminClients: pins.Names}
+	run := func(ctx context.Context) error {
+		return api.Run(ctx, api.ListenOptions{Addr: cfg.AdminAddr, GetCertificate: f.GetCertificate, Pins: pins, Handler: h.Routes(), Log: apiLog})
+	}
+	// 読み直しは、それぞれ失敗したら前のまま続ける。
+	reload := func() {
+		if err := pins.Reload(); err != nil {
+			log.Error("failed to reload admin clients (keeping the previous ones)", "event_id", "EDGE_ADMIN_CLIENTS_RELOAD_ERR", "error", err.Error())
+		} else {
+			log.Info("reloaded admin clients", "event_id", "EDGE_ADMIN_CLIENTS_RELOADED", "admin_clients", pins.Names(), "fingerprints", pins.Fingerprints())
+		}
+		if err := f.Reload(); err != nil {
+			log.Error("failed to reload server certificate (keeping the previous one)", "event_id", "EDGE_SERVER_CERT_RELOAD_ERR", "error", err.Error())
+		} else {
+			log.Info("reloaded server certificate", "event_id", "EDGE_SERVER_CERT_RELOADED", "fingerprint", certs.Fingerprint(f.Leaf()), "not_after", f.Leaf().NotAfter)
+		}
+	}
+	return run, reload, nil
+}
+
+// runAll は fns を並べて動かし、最初のものが終わったら残りも止めて待つ。
+func runAll(ctx context.Context, cancel context.CancelFunc, fns ...func(context.Context) error) error {
+	errc := make(chan error, len(fns))
+	for _, fn := range fns {
+		go func() { errc <- fn(ctx) }()
+	}
+	first := <-errc
+	cancel()
+	for range len(fns) - 1 {
+		if err := <-errc; first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// serverCert は管理API のサーバー証明書（なければ作る）を標準出力に、フィンガープリントを標準エラーに出す。
+func serverCert(stdout, stderr io.Writer) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.Mode != config.ModeManaged {
+		return errors.New("the management API is only used in managed mode (EDGE_MODE=managed)")
+	}
+	certPath, keyPath := filepath.Join(cfg.TLSDir, "server.pem"), filepath.Join(cfg.TLSDir, "server.key")
+	created, err := certs.EnsureFiles(certPath, keyPath, cfg.TLSHosts)
+	if err != nil {
+		return err
+	}
+	f, err := certs.LoadFile(certPath, keyPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return err
+	}
+	stdout.Write(b)
+	if created {
+		fmt.Fprintf(stderr, "サーバー証明書を作りました（SAN: %v）。\n", cfg.TLSHosts)
+	}
+	fmt.Fprintf(stderr, "SHA-256 フィンガープリント: %s（有効期限 %s）\n", certs.Fingerprint(f.Leaf()), f.Leaf().NotAfter.Local().Format(time.DateOnly))
+	return nil
+}
+
+// replaceServerCert は管理API のサーバー証明書を作り直す（SAN は EDGE_TLS_HOSTS）。新しい証明書を標準出力に出す。
+// 動いているサーバーは SIGHUP で読み直す。監査ログに残す。
+func replaceServerCert(ctx context.Context, stdout, stderr io.Writer) error {
+	cfg, _, d, err := openDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if cfg.Mode != config.ModeManaged {
+		return errors.New("the management API is only used in managed mode (EDGE_MODE=managed)")
+	}
+	certPath, keyPath := filepath.Join(cfg.TLSDir, "server.pem"), filepath.Join(cfg.TLSDir, "server.key")
+	certPEM, err := certs.Replace(certPath, keyPath, cfg.TLSHosts)
+	if err != nil {
+		return err
+	}
+	f, err := certs.LoadFile(certPath, keyPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		return err
+	}
+	fp := certs.Fingerprint(f.Leaf())
+	if err := d.InsertAudit(ctx, db.AuditEntry{Operator: "cli", Source: db.SourceSystem, Action: "server-cert.replace", Target: fp,
+		Detail: map[string]any{"hosts": cfg.TLSHosts, "not_after": f.Leaf().NotAfter.UTC().Format(time.RFC3339)}}); err != nil {
+		return err
+	}
+	stdout.Write(certPEM)
+	fmt.Fprintf(stderr, "サーバー証明書を作り直しました（SAN: %v）。SHA-256 フィンガープリント: %s（有効期限 %s）。SIGHUP を送ると新しい証明書を使います。\n",
+		cfg.TLSHosts, fp, f.Leaf().NotAfter.Local().Format(time.DateOnly))
+	return nil
 }
 
 // newIdentifier は、要求から利用者を決める方法を作る（Cloudflare Access の JWT、または開発用の設定）。

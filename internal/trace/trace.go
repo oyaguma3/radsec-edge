@@ -10,6 +10,22 @@ import (
 	"encoding/hex"
 )
 
+// Header はトレースID のヘッダー。
+const Header = "X-Trace-ID"
+
+// Valid は、受け取ったトレースID の形か（英数字と - の 1〜64 文字）。
+func Valid(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 type key struct{}
 
 // New はトレースID（16進32桁。provisioner が自分で採番する形式と同じ）を作る。

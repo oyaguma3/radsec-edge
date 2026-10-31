@@ -58,7 +58,7 @@ func serve(ctx context.Context) error {
 	}
 	cancel()
 	srv := agent.NewServer(agent.ServerOptions{Log: log, Version: version, Docker: d, TenantsDir: cfg.TenantsDir, Network: cfg.Network,
-		PublishAddr: cfg.PublishAddr})
+		PublishAddr: cfg.PublishAddr, FluentdAddress: cfg.FluentdAddress})
 	cleanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	if err := srv.Cleanup(cleanCtx); err != nil {
 		log.Warn("cannot remove leftover validation containers", "error", err)

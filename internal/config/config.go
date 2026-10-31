@@ -40,7 +40,7 @@ const (
 
 // Config は radsec-edge の設定。
 type Config struct {
-	// Mode は standalone か managed（段階 1 では standalone だけ）。
+	// Mode は standalone か managed（§6）。
 	Mode     string
 	LogLevel slog.Level
 
@@ -53,6 +53,17 @@ type Config struct {
 	TenantsDir string
 	// AgentSocket は agent の unix ソケット。
 	AgentSocket string
+
+	// AdminAddr は管理API の待ち受けアドレス（管理モードだけ。§12.1）。AdminClientsFile は管理クライアントのピンのファイル（SIGHUP で読み直す）。
+	AdminAddr, AdminClientsFile string
+	// TLSDir は管理API のサーバー証明書と鍵を置くディレクトリ（EDGE_DATA_DIR の tls）。TLSHosts はその SAN。
+	TLSDir   string
+	TLSHosts []string
+	// AuditDir は監査ログの日ごとのファイルを置くディレクトリ、AuditRetentionDays は保存の日数。
+	AuditDir           string
+	AuditRetentionDays int
+	// TenantCapacity は 1 台のテナントの数の上限（aka-mvpset の決定事項 25。§24.11 の EA12）。
+	TenantCapacity int
 
 	// URNPrefix は AP の証明書の SAN の URI の接頭辞（urn:<接頭辞>:nas:...）。DNSDomain はスロットの名前のドメイン。
 	// どちらも CA（CA_URN_PREFIX、CA_DNS_DOMAIN）と同じ値にそろえる。
@@ -96,15 +107,19 @@ func (c Config) DevMode() bool { return c.DevUserEmail != "" }
 // Load は環境変数から設定を読む。誤りはまとめて返す。
 func Load() (Config, error) {
 	c := Config{
-		Mode:        cmp.Or(os.Getenv("EDGE_MODE"), ModeStandalone),
-		GUIAddr:     cmp.Or(os.Getenv("EDGE_GUI_ADDR"), ":8447"),
-		DataDir:     cmp.Or(os.Getenv("EDGE_DATA_DIR"), "/data"),
-		TenantsDir:  cmp.Or(os.Getenv("EDGE_TENANTS_DIR"), "/var/lib/radsec-edge/tenants"),
-		AgentSocket: cmp.Or(os.Getenv("EDGE_AGENT_SOCKET"), "/run/radsec-edge-agent/agent.sock"),
-		URNPrefix:   os.Getenv("EDGE_URN_PREFIX"),
-		DNSDomain:   strings.ToLower(os.Getenv("EDGE_DNS_DOMAIN")),
-		CRLBaseURL:  strings.TrimSuffix(os.Getenv("EDGE_CRL_BASE_URL"), "/"),
+		Mode:             cmp.Or(os.Getenv("EDGE_MODE"), ModeStandalone),
+		GUIAddr:          cmp.Or(os.Getenv("EDGE_GUI_ADDR"), ":8447"),
+		DataDir:          cmp.Or(os.Getenv("EDGE_DATA_DIR"), "/data"),
+		TenantsDir:       cmp.Or(os.Getenv("EDGE_TENANTS_DIR"), "/var/lib/radsec-edge/tenants"),
+		AgentSocket:      cmp.Or(os.Getenv("EDGE_AGENT_SOCKET"), "/run/radsec-edge-agent/agent.sock"),
+		URNPrefix:        os.Getenv("EDGE_URN_PREFIX"),
+		DNSDomain:        strings.ToLower(os.Getenv("EDGE_DNS_DOMAIN")),
+		CRLBaseURL:       strings.TrimSuffix(os.Getenv("EDGE_CRL_BASE_URL"), "/"),
+		AdminAddr:        cmp.Or(os.Getenv("EDGE_ADMIN_ADDR"), ":9447"),
+		AdminClientsFile: cmp.Or(os.Getenv("EDGE_ADMIN_CLIENTS_FILE"), "/run/secrets/admin-clients"),
 	}
+	c.TLSDir = filepath.Join(c.DataDir, "tls")
+	c.AuditDir = cmp.Or(os.Getenv("EDGE_AUDIT_DIR"), filepath.Join(c.DataDir, "audit"))
 	var errs []error
 	if v := os.Getenv("EDGE_LOG_LEVEL"); v != "" {
 		if err := c.LogLevel.UnmarshalText([]byte(v)); err != nil {
@@ -114,14 +129,33 @@ func Load() (Config, error) {
 	switch c.Mode {
 	case ModeStandalone:
 	case ModeManaged:
-		errs = append(errs, errors.New("EDGE_MODE: managed is not implemented yet (use standalone)"))
+		errs = append(errs, c.loadManaged()...)
 	default:
 		errs = append(errs, errors.New("EDGE_MODE: must be standalone or managed"))
+	}
+	for _, d := range []struct {
+		env           string
+		dst           *int
+		def, min, max int
+	}{
+		{"EDGE_TENANT_CAPACITY", &c.TenantCapacity, 150, 1, PortMax - PortMin + 1},
+		{"EDGE_AUDIT_RETENTION_DAYS", &c.AuditRetentionDays, 14, 1, 3650},
+	} {
+		*d.dst = d.def
+		if v := os.Getenv(d.env); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < d.min || n > d.max {
+				errs = append(errs, fmt.Errorf("%s: must be an integer between %d and %d", d.env, d.min, d.max))
+				continue
+			}
+			*d.dst = n
+		}
 	}
 	if _, _, err := net.SplitHostPort(c.GUIAddr); err != nil {
 		errs = append(errs, fmt.Errorf("EDGE_GUI_ADDR: %w", err))
 	}
-	for name, p := range map[string]string{"EDGE_DATA_DIR": c.DataDir, "EDGE_TENANTS_DIR": c.TenantsDir, "EDGE_AGENT_SOCKET": c.AgentSocket} {
+	for name, p := range map[string]string{"EDGE_DATA_DIR": c.DataDir, "EDGE_TENANTS_DIR": c.TenantsDir, "EDGE_AGENT_SOCKET": c.AgentSocket,
+		"EDGE_ADMIN_CLIENTS_FILE": c.AdminClientsFile, "EDGE_AUDIT_DIR": c.AuditDir} {
 		if !filepath.IsAbs(p) {
 			errs = append(errs, fmt.Errorf("%s: must be an absolute path", name))
 		}
@@ -166,6 +200,32 @@ func Load() (Config, error) {
 	}
 	errs = append(errs, c.loadAuth()...)
 	return c, errors.Join(errs...)
+}
+
+// loadManaged は管理モードの設定を確かめる（ピンのファイルは起動のときに読むので、ここでは見ない）。
+func (c *Config) loadManaged() []error {
+	var errs []error
+	if _, _, err := net.SplitHostPort(c.AdminAddr); err != nil {
+		errs = append(errs, fmt.Errorf("EDGE_ADMIN_ADDR: %w", err))
+	}
+	// 管理モードでは CRL を貼り付ける画面がないので、取得先が要る。
+	if c.CRLBaseURL == "" {
+		errs = append(errs, errors.New("EDGE_CRL_BASE_URL is required in managed mode"))
+	}
+	for h := range strings.SplitSeq(os.Getenv("EDGE_TLS_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(h); err != nil && !hostnamePattern.MatchString(h) && !names.ValidSlug(h) {
+			errs = append(errs, fmt.Errorf("EDGE_TLS_HOSTS: %q is neither an IP address nor a host name", h))
+			continue
+		}
+		c.TLSHosts = append(c.TLSHosts, h)
+	}
+	if len(c.TLSHosts) == 0 {
+		errs = append(errs, errors.New("EDGE_TLS_HOSTS is required in managed mode (the SAN of the API server certificate, e.g. the tunnel address aka-provisioner connects to)"))
+	}
+	return errs
 }
 
 // loadStamp はテナントの刻印の VSA を読む。
@@ -291,6 +351,8 @@ type Agent struct {
 	Network string
 	// PublishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。設計概要 §10.2）。
 	PublishAddr string
+	// FluentdAddress はテナントのコンテナのログを送る Fluent Bit のアドレス（空なら json-file のまま。§24.11 の EA14）。
+	FluentdAddress string
 }
 
 // LoadAgent は環境変数から agent の設定を読む。
@@ -326,6 +388,13 @@ func LoadAgent() (Agent, error) {
 			errs = append(errs, errors.New("EDGE_AGENT_PUBLISH_ADDR: must be an IP address (or empty for all addresses)"))
 		} else {
 			a.PublishAddr = ip.String()
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("EDGE_AGENT_FLUENTD_ADDRESS")); v != "" {
+		if _, _, err := net.SplitHostPort(v); err != nil {
+			errs = append(errs, errors.New("EDGE_AGENT_FLUENTD_ADDRESS: must be a host and port such as localhost:24224"))
+		} else {
+			a.FluentdAddress = v
 		}
 	}
 	if !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`).MatchString(a.Network) {

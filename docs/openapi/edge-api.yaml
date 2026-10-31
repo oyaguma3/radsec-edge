@@ -1,0 +1,882 @@
+openapi: 3.1.0
+info:
+  title: radsec-edge 管理API
+  version: 1.0.0
+  description: |
+    radsec-edge（RadSec のエッジ）の管理API（設計概要 §12.1、§24.11）。管理モード（`EDGE_MODE=managed`）だけ待ち受ける。呼び出し側は aka-provisioner だけで、全権として扱う。
+
+    - 認証は mTLS。管理クライアントの証明書の SHA-256 フィンガープリントを、ピンのファイル（`EDGE_ADMIN_CLIENTS_FILE`。`SIGHUP` で読み直す）と
+      照合する（CA は使わない）。証明書なし・未登録・有効期間外の接続は TLS のハンドシェイクで断る。サーバー証明書は自己署名
+      （`radsec-edge server-cert` で取り出す）。
+    - `X-Operator-Id`（任意）は監査ログの操作者になる。`X-Trace-ID`（任意）は受け取るか採番し、応答のヘッダーで返す。
+    - 変更の口は `Idempotency-Key` が必須。同じ鍵・同じ本文の再送には前の応答を返し（`Idempotent-Replayed: true`）、本文が違えば 409 `IDEMPOTENCY_CONFLICT`。
+      応答は 24 時間覚える（5xx は覚えない）。**`apply`・`crl:refresh`・`restart` は実行のたびに新しい鍵を使う**（同じ鍵だと前の応答を返すだけで何もしない）。
+    - 変更の口はテナントの排他を最大 5 秒待ち、取れなければ 503 `TENANT_BUSY` と `Retry-After` を返す（反映などが動いている）。読み出しの口は待たない。
+    - 宣言は `PUT /tenants/{tenantId}` 1 本で、AP とグループの一覧を含めてまるごと置き換える。エッジは `revision` を覚えるだけで新旧を判断しない。
+      呼び出し側は「`revision` が違えば PUT、`pending` が true か `appliedRevision` が違えば `apply`」と判断する。
+    - 要求の本文は 1 MiB まで。時刻は RFC 3339（UTC）。
+    - エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。
+servers:
+  - url: https://{host}:9447
+    variables:
+      host:
+        default: localhost
+paths:
+  /status:
+    get:
+      summary: エッジの状態
+      operationId: getStatus
+      parameters:
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: 状態
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+  /tenants:
+    get:
+      summary: 全テナントの要約（整合のループはエッジごとにこれを 1 回読む）
+      operationId: listTenants
+      parameters:
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: テナントの要約の一覧（slug の順）。証明書の本体と AP の一覧は含めない
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TenantSummary"
+  /tenants/{tenantId}:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    get:
+      summary: テナントの詳細
+      operationId: getTenant
+      parameters:
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: テナント
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "404":
+          $ref: "#/components/responses/Problem"
+    put:
+      summary: テナントの望む状態をまるごと置き換える（なければ作る）
+      description: |
+        反映（`apply`）するまで radsecproxy には効かない。設定が変わらなければ（版だけ、または表示だけの違い）`pending` にならない。
+        発行した CA の証明書を替えると、その CRL は消える（次の反映の最初に取りに行く）。
+      operationId: putTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantDeclaration"
+      responses:
+        "200":
+          description: 置き換えた
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "201":
+          description: 作った
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "409":
+          description: "`SLUG_IMMUTABLE`、`CAPACITY_EXCEEDED`、`CONFLICT`（ポート・slug・NAS-Identifier の重なり）、`IDEMPOTENCY_CONFLICT`"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+    delete:
+      summary: テナントを消す（コンテナ・設定・鍵・AP を消す）
+      operationId: deleteTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "204":
+          description: 消した
+        "404":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/server-csr:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    post:
+      summary: テナントのサーバー証明書の鍵を作り、CSR を返す（鍵はエッジの外に出さない）
+      operationId: createServerCSR
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: CSR
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CSR"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/server-cert:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    put:
+      summary: 署名済みのサーバー証明書を置く（CSR を出した鍵か今の鍵に合うものだけ）
+      operationId: putServerCert
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Certificate"
+      responses:
+        "200":
+          description: 置いた
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/probe-csr:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    post:
+      summary: ヘルスチェック用の証明書の鍵を作り、CSR を返す（鍵はエッジの外に出さない）
+      operationId: createProbeCSR
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: CSR
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CSR"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/probe-cert:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    put:
+      summary: 署名済みのヘルスチェック用の証明書を置く（発行した CA で検証できるものだけ）
+      operationId: putProbeCert
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Certificate"
+      responses:
+        "200":
+          description: 置いた
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/apply:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    post:
+      summary: 反映を裏で始める
+      description: |
+        最大 2 分かかる（`EDGE_APPLY_TIMEOUT`）。結果は `GET /tenants/{tenantId}` の `apply` と `appliedRevision` で見る。足りない CRL は裏の処理の最初に取りに行く。
+        すでに動いていれば、重ねずに `started: false` を返す。
+      operationId: applyTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "202":
+          description: 受け付けた
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [started, state]
+                properties:
+                  started:
+                    type: boolean
+                  state:
+                    type: string
+                    enum: [running]
+                  startedAt:
+                    type: string
+                    format: date-time
+        "404":
+          $ref: "#/components/responses/Problem"
+        "422":
+          description: "`TENANT_STOPPED`（停止している）、`NOT_READY`（証明書が足りない）"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /tenants/{tenantId}/crl:refresh:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    post:
+      summary: CRL をすぐ取りに行き、CA ごとの結果を返す（全体で 25 秒まで）
+      operationId: refreshTenantCRL
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: 取りに行った結果（1 つの CA で失敗しても 200 で、`ok` が false になる）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, items]
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CRLState"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/restart:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    post:
+      summary: テナントのコンテナを再起動する（そのテナントの AP の接続がいったん切れる）
+      operationId: restartTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/OperatorID"
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "204":
+          description: 再起動した
+        "404":
+          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/Problem"
+        "503":
+          $ref: "#/components/responses/Busy"
+  /tenants/{tenantId}/logs:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    get:
+      summary: radsecproxy のログの末尾
+      operationId: getTenantLogs
+      parameters:
+        - $ref: "#/components/parameters/TraceID"
+        - name: lines
+          in: query
+          description: 行数（既定 200）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: ログ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [logs]
+                properties:
+                  logs:
+                    type: string
+        "400":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+  /tenants/{tenantId}/last-seen:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    get:
+      summary: AP・グループごとの接続の状態と、共通のブロックの送信元の IP ごとの接続の状態（1 分ほど遅れて変わる）
+      operationId: getTenantLastSeen
+      parameters:
+        - $ref: "#/components/parameters/TraceID"
+      responses:
+        "200":
+          description: 接続の状態
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LastSeen"
+        "404":
+          $ref: "#/components/responses/Problem"
+components:
+  parameters:
+    TenantID:
+      name: tenantId
+      in: path
+      required: true
+      description: テナントの ID（OSS/BSS のテナントの番号。刻印の値にもなる）
+      schema:
+        type: string
+        pattern: "^[1-9][0-9]{0,18}$"
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^[\\x21-\\x7E]{1,128}$"
+    OperatorID:
+      name: X-Operator-Id
+      in: header
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._@-]{1,64}$"
+    TraceID:
+      name: X-Trace-ID
+      in: header
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9-]{1,64}$"
+  responses:
+    Problem:
+      description: 誤り
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Busy:
+      description: "`TENANT_BUSY`。反映などが動いている（`Retry-After` のあとに同じ鍵でやり直せる）"
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Problem:
+      type: object
+      required: [title, status]
+      properties:
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        cause:
+          type: string
+          description: |
+            `VALIDATION`、`TENANT_NOT_FOUND`、`CONTAINER_NOT_FOUND`、`TENANT_BUSY`、`TENANT_STOPPED`、`NOT_READY`、`CAPACITY_EXCEEDED`、`SLUG_IMMUTABLE`、`CONFLICT`、
+            `IDEMPOTENCY_CONFLICT`、`SYSTEM_FAILURE`
+        invalidParams:
+          type: array
+          items:
+            type: object
+            required: [param]
+            properties:
+              param:
+                type: string
+              reason:
+                type: string
+    Name:
+      type: string
+      pattern: "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    CSR:
+      type: object
+      required: [csr]
+      properties:
+        csr:
+          type: string
+          description: CSR（PEM）
+    Certificate:
+      type: object
+      required: [certificate]
+      properties:
+        certificate:
+          type: string
+          description: 証明書（PEM）
+    Match:
+      type: object
+      description: 共通のブロックの照合の形。CRL のない持ち込みの CA があるときは必須
+      required: [attr, pattern]
+      properties:
+        attr:
+          type: string
+          enum: [CN, "SubjectAltName:URI", "SubjectAltName:DNS"]
+        pattern:
+          type: string
+          maxLength: 128
+          description: POSIX の拡張正規表現。`^` で始めて `$` で終わる
+    TenantDeclaration:
+      type: object
+      required: [revision, slug, port, authUpstream, acctUpstream, clientCas]
+      properties:
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 中央が付けた望む状態の版
+        slug:
+          allOf:
+            - $ref: "#/components/schemas/Name"
+          description: テナントの名前（作った後は変えられない）
+        port:
+          type: integer
+          minimum: 20000
+          maximum: 21999
+        authUpstream:
+          type: string
+          description: 上流の認証（IP アドレス:ポート。ホスト名は使えない）
+        acctUpstream:
+          type: string
+          description: 上流の課金（IP アドレス:ポート）
+        clientCas:
+          type: array
+          minItems: 1
+          description: 発行した CA（`kind` が `issued`。ID は `tenant.<slug>`。必ず 1 つ）と持ち込みの CA（`kind` が `brought`。ID は `brought.<slug>.<名前>`）。同じ Subject の CA は並べられない
+          items:
+            type: object
+            required: [id, kind, certificate, hasCrl]
+            properties:
+              id:
+                type: string
+              kind:
+                type: string
+                enum: [issued, brought]
+              certificate:
+                type: string
+              hasCrl:
+                type: boolean
+                description: CRL があるか（持ち込みの CA で false なら、テナント全体が CRLCheck off になる）
+        sharedMatch:
+          $ref: "#/components/schemas/Match"
+        sourceCidrs:
+          type: array
+          maxItems: 32
+          description: 許す送信元のアドレスの範囲（空なら制限なし）
+          items:
+            type: string
+        aps:
+          type: array
+          maxItems: 2000
+          description: AP とグループの一覧（名前は種類をまたいで一意）。証明書の情報は表示だけ
+          items:
+            $ref: "#/components/schemas/APDeclaration"
+    APDeclaration:
+      type: object
+      required: [name, kind]
+      properties:
+        name:
+          $ref: "#/components/schemas/Name"
+        kind:
+          type: string
+          enum: [ap, group]
+        purpose:
+          type: string
+          enum: [box, unifi, extreme, aruba, mist, other]
+          description: グループの用途（グループでは必須、AP では書けない）
+        certSerial:
+          type: string
+        certNotAfter:
+          type: string
+          format: date-time
+    TenantSummary:
+      type: object
+      required: [id, slug, port, enabled, revision, appliedRevision, pending, missing, apply, apCount]
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+        port:
+          type: integer
+        enabled:
+          type: boolean
+          description: 運用の状態（エッジの画面で停止すると false）
+        revision:
+          type: integer
+          format: int64
+          description: 最後に受け取った宣言の版
+        appliedRevision:
+          type: integer
+          format: int64
+          description: 反映済みの版
+        pending:
+          type: boolean
+          description: 未反映の変更があるか（証明書の更新を含む）
+        configHash:
+          type: string
+          description: 反映済みの設定のハッシュ
+        appliedAt:
+          type: string
+          format: date-time
+        missing:
+          type: array
+          description: 反映に足りないもの（表示の文）
+          items:
+            type: string
+        probeProblem:
+          type: string
+          description: ヘルスチェック用の証明書の問題（失効など）
+        apply:
+          $ref: "#/components/schemas/ApplyState"
+        container:
+          $ref: "#/components/schemas/Container"
+        apCount:
+          type: integer
+    ApplyState:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [idle, running]
+        startedAt:
+          type: string
+          format: date-time
+        lastResult:
+          type: string
+          enum: [ok, failed, rolled_back, interrupted]
+        lastError:
+          type: string
+        lastRevision:
+          type: integer
+          format: int64
+        lastFinishedAt:
+          type: string
+          format: date-time
+    Container:
+      type: object
+      required: [state, running]
+      properties:
+        state:
+          type: string
+        running:
+          type: boolean
+        restarting:
+          type: boolean
+        restartCount:
+          type: integer
+        startedAt:
+          type: string
+          format: date-time
+        port:
+          type: integer
+    Tenant:
+      allOf:
+        - $ref: "#/components/schemas/TenantSummary"
+        - type: object
+          required: [authUpstream, acctUpstream, clientCas, crls, sourceCidrs, aps, applies]
+          properties:
+            authUpstream:
+              type: string
+            acctUpstream:
+              type: string
+            clientCas:
+              type: array
+              items:
+                $ref: "#/components/schemas/ClientCA"
+            crls:
+              type: array
+              items:
+                $ref: "#/components/schemas/CRLState"
+            sharedMatch:
+              $ref: "#/components/schemas/Match"
+            sourceCidrs:
+              type: array
+              items:
+                type: string
+            aps:
+              type: array
+              items:
+                type: object
+                required: [name, kind]
+                properties:
+                  name:
+                    type: string
+                  kind:
+                    type: string
+                  purpose:
+                    type: string
+                  nasId:
+                    type: string
+                  certSerial:
+                    type: string
+                  certNotAfter:
+                    type: string
+                    format: date-time
+            serverCert:
+              $ref: "#/components/schemas/CertInfo"
+            probeCert:
+              $ref: "#/components/schemas/CertInfo"
+            applies:
+              type: array
+              description: 反映の履歴（新しい順に 10 件）
+              items:
+                type: object
+                required: [trigger, result, startedAt, finishedAt]
+                properties:
+                  revision:
+                    type: integer
+                    format: int64
+                  trigger:
+                    type: string
+                    enum: [apply, reconcile, crl]
+                  action:
+                    type: string
+                  result:
+                    type: string
+                  error:
+                    type: string
+                  operator:
+                    type: string
+                  startedAt:
+                    type: string
+                    format: date-time
+                  finishedAt:
+                    type: string
+                    format: date-time
+    ClientCA:
+      type: object
+      required: [id, kind, subject, serial, notAfter, selfSigned, hasCrl]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [issued, brought]
+        subject:
+          type: string
+        serial:
+          type: string
+        notAfter:
+          type: string
+          format: date-time
+        selfSigned:
+          type: boolean
+          description: エッジが証明書から判定する（自己署名でなければ PartialChain on）
+        hasCrl:
+          type: boolean
+    CRLState:
+      type: object
+      required: [caId, ok]
+      properties:
+        caId:
+          type: string
+        number:
+          type: string
+        thisUpdate:
+          type: string
+          format: date-time
+        nextUpdate:
+          type: string
+          format: date-time
+        lastAttemptAt:
+          type: string
+          format: date-time
+        lastSuccessAt:
+          type: string
+          format: date-time
+        lastError:
+          type: string
+        ok:
+          type: boolean
+          description: CRL があり、最後の取得に失敗していないか
+        expired:
+          type: boolean
+        warn:
+          type: boolean
+          description: nextUpdate までの残りが EDGE_CRL_WARN を切った
+    CertInfo:
+      type: object
+      required: [serial, notAfter, subject]
+      properties:
+        serial:
+          type: string
+        notAfter:
+          type: string
+          format: date-time
+        subject:
+          type: string
+    LastSeen:
+      type: object
+      required: [aps, shared]
+      properties:
+        aps:
+          type: array
+          items:
+            type: object
+            required: [name, kind, connected]
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+              connected:
+                type: boolean
+              lastUp:
+                type: string
+                format: date-time
+              lastDown:
+                type: string
+                format: date-time
+              lastIp:
+                type: string
+              lastReject:
+                type: string
+                format: date-time
+        shared:
+          type: array
+          description: 共通のブロック（持ち込みの CA の AP）の送信元の IP ごと。テナントごとに新しい 1,000 件まで
+          items:
+            type: object
+            required: [ip, connections]
+            properties:
+              ip:
+                type: string
+              connections:
+                type: integer
+              lastUp:
+                type: string
+                format: date-time
+              lastDown:
+                type: string
+                format: date-time
+    Status:
+      type: object
+      required: [service, version, mode, urnPrefix, dnsDomain, stamp, agent, capacity, reconcile, adminClients, tenants]
+      properties:
+        service:
+          type: string
+          enum: [radsec-edge]
+        version:
+          type: string
+        mode:
+          type: string
+          enum: [managed]
+        urnPrefix:
+          type: string
+        dnsDomain:
+          type: string
+        stamp:
+          type: object
+          required: [vendorId, vendorType]
+          description: テナントの刻印の VSA（上流の設定と食い違うとすべて拒否になる）
+          properties:
+            vendorId:
+              type: integer
+            vendorType:
+              type: integer
+        agent:
+          type: object
+          required: [ok, dockerOk, imagePresent, networkPresent]
+          properties:
+            ok:
+              type: boolean
+            error:
+              type: string
+            version:
+              type: string
+            dockerOk:
+              type: boolean
+            dockerError:
+              type: string
+            image:
+              type: string
+            imagePresent:
+              type: boolean
+            network:
+              type: string
+            networkPresent:
+              type: boolean
+        capacity:
+          type: object
+          required: [max, used, free]
+          properties:
+            max:
+              type: integer
+            used:
+              type: integer
+            free:
+              type: integer
+        reconcile:
+          type: object
+          properties:
+            at:
+              type: string
+              format: date-time
+            error:
+              type: string
+        adminClients:
+          type: array
+          items:
+            type: string
+        tenants:
+          type: array
+          items:
+            type: object
+            required: [id, slug, crls]
+            properties:
+              id:
+                type: string
+              slug:
+                type: string
+              crls:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CRLState"

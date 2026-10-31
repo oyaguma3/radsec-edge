@@ -37,11 +37,34 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadManaged(t *testing.T) {
+	setBase(t)
+	t.Setenv("EDGE_MODE", "managed")
+	t.Setenv("EDGE_CRL_BASE_URL", "http://10.0.0.1:8449")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "EDGE_TLS_HOSTS") {
+		t.Fatalf("Load() = %v", err)
+	}
+	t.Setenv("EDGE_TLS_HOSTS", "10.0.0.2, edge-01.example.net")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AdminAddr != ":9447" || c.AdminClientsFile != "/run/secrets/admin-clients" || c.TLSDir != "/data/tls" || c.AuditDir != "/data/audit" ||
+		c.AuditRetentionDays != 14 || c.TenantCapacity != 150 || len(c.TLSHosts) != 2 {
+		t.Errorf("managed: %+v", c)
+	}
+	t.Setenv("EDGE_TLS_HOSTS", "bad host")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "EDGE_TLS_HOSTS") {
+		t.Errorf("bad host = %v", err)
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	cases := []struct {
 		env, value, want string
 	}{
-		{"EDGE_MODE", "managed", "not implemented"},
+		{"EDGE_MODE", "managed", "EDGE_CRL_BASE_URL is required"},
+		{"EDGE_TENANT_CAPACITY", "0", "EDGE_TENANT_CAPACITY"},
 		{"EDGE_MODE", "x", "EDGE_MODE"},
 		{"EDGE_URN_PREFIX", "ex:ample", "EDGE_URN_PREFIX"},
 		{"EDGE_DNS_DOMAIN", "*.example.net", "EDGE_DNS_DOMAIN"},

@@ -35,6 +35,7 @@ type Server struct {
 	tenantsDir  string
 	network     string
 	publishAddr string
+	fluentd     string
 	// mu はコンテナの作成・作り直し・削除を 1 つずつにする（同じテナントのコンテナを 2 つ作らないように）。
 	mu sync.Mutex
 }
@@ -48,11 +49,13 @@ type ServerOptions struct {
 	Network    string
 	// PublishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス）。
 	PublishAddr string
+	// FluentdAddress はテナントのコンテナのログを送る Fluent Bit のアドレス（空なら json-file のまま）。
+	FluentdAddress string
 }
 
 // NewServer は Server を作る。
 func NewServer(o ServerOptions) *Server {
-	return &Server{log: o.Log, version: o.Version, docker: o.Docker, tenantsDir: o.TenantsDir, network: o.Network, publishAddr: o.PublishAddr}
+	return &Server{log: o.Log, version: o.Version, docker: o.Docker, tenantsDir: o.TenantsDir, network: o.Network, publishAddr: o.PublishAddr, fluentd: o.FluentdAddress}
 }
 
 // Routes は API のハンドラーを返す。
@@ -188,7 +191,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		}
 		if p, err := strconv.Atoi(c.Labels[LabelPort]); err == nil && names.ValidSlug(ct.Slug) {
 			ct.Port = p
-			ct.SpecCurrent = tenantSpec(s.tenantsDir, s.network, s.publishAddr, ct.TenantID, ct.Slug, p).Labels[LabelSpec] == c.Labels[LabelSpec]
+			ct.SpecCurrent = tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, ct.TenantID, ct.Slug, p).Labels[LabelSpec] == c.Labels[LabelSpec]
 		}
 		st.Containers = append(st.Containers, ct)
 	}
@@ -214,7 +217,7 @@ func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ctx := r.Context()
-	want := tenantSpec(s.tenantsDir, s.network, s.publishAddr, id, req.Slug, req.Port)
+	want := tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, id, req.Slug, req.Port)
 	action := EnsureCreated
 	cur, err := s.find(ctx, id)
 	switch {
