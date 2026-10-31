@@ -29,3 +29,6 @@ coverage.*
 .env
 # Cloudflare Tunnel のトークン（compose の cloudflared がマウントする）
 /secrets/
+
+# 手順の通し確認（scripts/check-guide.sh）の作業用
+/.guide-host/

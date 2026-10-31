@@ -102,6 +102,27 @@ jobs:
           # Tunnel のトークンはファイルで渡す。
           jq -e '.services.cloudflared.command | index("--token-file") != null' config.json
           grep -q 'create_host_path: false' compose.yaml
+          # 単独モードの土台は管理API を公開せず、モードは standalone。
+          jq -e '.services["radsec-edge"].environment.EDGE_MODE == "standalone"' config.json
+          # 管理モードの重ね合わせ: 管理API だけをトンネルのアドレスで公開する。ピンを secrets で渡す。Fluent Bit はループバックだけ。
+          mkdir -p secrets && : > secrets/admin-clients
+          EDGE_BIND_ADDR=100.64.0.21 EDGE_TLS_HOSTS=100.64.0.21 EDGE_CRL_BASE_URL=http://100.64.0.1:8449 \
+            docker compose -f compose.yaml -f compose.managed.yaml -f compose.fluent-bit.yaml config --format json > managed.json
+          jq -e '.services["radsec-edge"].environment.EDGE_MODE == "managed"' managed.json
+          jq -e '[.services["radsec-edge"].ports[] | "\(.host_ip):\(.published)->\(.target)"] == ["100.64.0.21:9447->9447"]' managed.json
+          jq -e '[.services["radsec-edge"].secrets[].source] == ["admin-clients"]' managed.json
+          jq -e '[.services["fluent-bit"].ports[] | .host_ip] == ["127.0.0.1"]' managed.json
+          jq -e '.services["radsec-edge-agent"].environment.EDGE_AGENT_FLUENTD_ADDRESS == "localhost:24224"' managed.json
+          jq -e '.services["radsec-edge"].logging.options.tag == "app.radsec-edge" and .services["radsec-edge-agent"].logging.options.tag == "app.radsec-edge-agent"' managed.json
           # 必須の設定が空なら、compose が断る。
           sed -i -e 's|^EDGE_UPSTREAM_SECRET=.*|EDGE_UPSTREAM_SECRET=|' .env
           ! docker compose config -q 2>/dev/null
+
+  guide:
+    name: 運用ガイドの手順の通し確認
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: 管理モードの手順を compose で流す
+        run: scripts/check-guide.sh

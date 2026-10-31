@@ -1,0 +1,49 @@
+# ログをエッジの Fluent Bit に送るときに重ねる設定（aka-mvpset の概要 §13、§18.9 の S4-4。設計概要 §24.11 の EA14）。
+# テナントのコンテナのログも agent が同じ Fluent Bit に送る（EDGE_AGENT_FLUENTD_ADDRESS）。docker logs は dual logging のキャッシュで読める（last-seen が使う）。
+# 有効にすると、テナントのコンテナはひな形が変わるので、次の整合ループで 1 回作り直される（AP の接続がいったん切れる）。
+# Fluent Bit に届かなくても、fluentd-async でコンテナは動き続け、ログはメモリーに溜めて送り直す。
+# .env の COMPOSE_FILE に compose.fluent-bit.yaml を足すと有効になる。
+
+x-logging: &fluent-bit-logging
+  driver: fluentd
+  options: &fluent-bit-options
+    fluentd-address: localhost:${EDGE_FLUENT_BIT_PORT:-24224}
+    fluentd-async: "true"
+    fluentd-buffer-limit: "8192"
+
+services:
+  radsec-edge:
+    logging:
+      <<: *fluent-bit-logging
+      options:
+        <<: *fluent-bit-options
+        tag: app.radsec-edge
+
+  radsec-edge-agent:
+    environment:
+      EDGE_AGENT_FLUENTD_ADDRESS: localhost:${EDGE_FLUENT_BIT_PORT:-24224}
+    logging:
+      <<: *fluent-bit-logging
+      options:
+        <<: *fluent-bit-options
+        tag: app.radsec-edge-agent
+
+  cloudflared:
+    logging:
+      <<: *fluent-bit-logging
+      options:
+        <<: *fluent-bit-options
+        tag: app.radsec-edge-cloudflared
+
+  fluent-bit:
+    image: fluent/fluent-bit:4.2.8
+    restart: always
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.yaml"]
+    # Docker のログドライバーはホストの localhost に接続する。外部には公開しない。
+    ports:
+      - "127.0.0.1:${EDGE_FLUENT_BIT_PORT:-24224}:24224"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - ./configs/fluent-bit/fluent-bit.yaml:/fluent-bit/etc/fluent-bit.yaml:ro
+      - ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/logs:/output_logs

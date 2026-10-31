@@ -1,0 +1,57 @@
+# エッジの Fluent Bit（aka-mvpset の概要 §13、§18.9 の S4-4。radsec-edge の設計概要 §24.11 の EA14）。
+# Docker のログドライバー（fluentd）から受けたログを、ファイルに書く。ホストの logrotate で日ごとに圧縮し、2 週間持つ。
+#
+# テナントのコンテナごとに forward の接続が 1 本できる。受信バッファーの既定（1 接続あたり約 1 MiB）だと 150 テナントで約 150 MiB 増えるので絞る
+# （aka-mvpset の verify/edge-logs）。
+service:
+  flush: 1
+  daemon: false
+  log_level: info
+
+parsers:
+  - name: json
+    format: json
+    time_key: false
+
+pipeline:
+  inputs:
+    - name: forward
+      listen: 0.0.0.0
+      port: 24224
+      mem_buf_limit: 5MB
+      buffer_chunk_size: 32K
+      buffer_max_size: 512K
+
+  filters:
+    # radsec-edge と agent のログは JSON（radsecproxy のログは JSON でないので、タグを分けてそのまま書く）。
+    - name: parser
+      match: "app.*"
+      key_name: log
+      parser: json
+      reserve_data: false
+
+  outputs:
+    - name: file
+      match: app.radsec-edge
+      path: /output_logs
+      file: radsec-edge.log
+      format: plain
+
+    - name: file
+      match: app.radsec-edge-agent
+      path: /output_logs
+      file: radsec-edge-agent.log
+      format: plain
+
+    - name: file
+      match: app.radsec-edge-cloudflared
+      path: /output_logs
+      file: radsec-edge-cloudflared.log
+      format: plain
+
+    # テナントの radsecproxy（タグは tenant.<テナントの ID>。行の container_name でテナントを見分ける）。
+    - name: file
+      match: "tenant.*"
+      path: /output_logs
+      file: radsecproxy.log
+      format: plain

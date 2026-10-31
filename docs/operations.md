@@ -1,7 +1,8 @@
-# radsec-edge 運用ガイド（単独モード）
+# radsec-edge 運用ガイド
 
-- 状態: 2026-10-18。段階 3（単独モードの通し）の時点の手順。管理モード（段階 4）の手順は、その段階で足す。
+- 状態: 2026-10-31。単独モードの手順は `scripts/e2e.sh`（simwifi）で確かめた。管理モードの手順（10 章）は `scripts/check-guide.sh`（CI のジョブ「運用ガイドの手順の通し確認」）で確かめる。aka-provisioner・radsec-ca とつないだ通しと、WireGuard・Cloudflare を通す部分は MVP セットの段階 4・5 の通しで確かめる。
 - 対象: エッジを導入・運用する人（事業者の運用者）。CA（radsec-ca）の導入と運用は、radsec-ca の運用ガイドを見る。
+- 2〜9 章は単独モード（エッジの画面だけで運用する）を中心に書いている。管理モード（MVP セットで aka-provisioner から使う）は 10 章を先に読み、共通の部分（1 章、5〜7 章）を参照する。
 
 ## 1. 構成
 
@@ -37,6 +38,7 @@ stat -c %g /var/run/docker.sock   # EDGE_DOCKER_GID に書く
 | `EDGE_UPSTREAM_SECRET` | 上流との共有シークレット（8〜128 文字の英数字と `._~+/=@-`） |
 | `EDGE_STAMP_VENDOR_ID`・`EDGE_STAMP_VENDOR_TYPE` | テナントの刻印の VSA（既定 32473・1。起動のときにログに出す）。単独モードの刻印の値はテナントの slug。上流が使わなければ無視される |
 | `EDGE_CRL_BASE_URL` | CA の配布の口（例 `http://10.0.0.1:8449`）。空なら、テナントの画面で CRL を貼り付けて取り込む |
+| `EDGE_TENANT_CAPACITY` | 1 台に置くテナントの数の上限（既定 150）。4 GB のエッジで 150、2 GB で 60 が保証値。超える新しいテナントは断る |
 | `EDGE_AGENT_PUBLISH_ADDR` | テナントのポートを公開するアドレス。空ならすべてのアドレス。公開のアドレスを 1 つに絞るときに書く |
 | `EDGE_ACCESS_TEAM_DOMAIN`・`EDGE_ACCESS_AUD` | Cloudflare Access のチームのドメインと AUD タグ |
 
@@ -113,6 +115,7 @@ AP の NAS-Identifier は `<テナント>-<AP>` になり、AP が名乗る値�
 - バックアップの対象は `EDGE_HOST_DIR/data`（SQLite と、サーバー証明書・ヘルスチェック用の証明書の鍵）。`tenants` は SQLite と鍵から作り直せる（反映すると生成する）。
 - `docker compose stop radsec-edge` で止めてから `data` を写す（動かしたままだと、SQLite の WAL の途中を写すことがある）。鍵が入るので、写しの置き場所に気を付ける。
 - 戻すときは、止めてから `data` を置き換え（所有者 10084:10083）、起動して、テナントごとに反映する。
+- 古いバックアップに戻して、DB の反映済みの版と `tenants` の今の版が違うと、次の整合ループが DB の反映済みの版に戻して再起動する（その版のディレクトリが残っていなければ、次の反映で再起動して読み込ませる）。
 
 ## 8. 試験（E2E）
 
@@ -132,3 +135,145 @@ docker ps -aq --filter label=radsec-edge.tenant | xargs -r docker rm -f   # テ�
 ```
 
 `EDGE_HOST_DIR` はコンテナの利用者のファイルを含むので、消すときは `sudo rm -rf` を使う。
+
+## 10. 管理モード（aka-provisioner から使う）
+
+望む状態の正本は中央（aka-ossbss）にあり、aka-provisioner を通して管理API（9447、mTLS）で届く。エッジの SQLite は写しで、画面はテナント・AP・証明書・CRL の変更ができない（反映のやり直し、再起動、停止と起動、CRL の取り直し、ログは使える）。単独モードのデータは引き継がない（数字でない ID のテナントがある DB では、管理モードは起動しない。単独モードでテナントを消すか、空の `data` で始める）。
+
+### 10.1 Docker の設定
+
+`/etc/docker/daemon.json` に次を書いて dockerd を再起動する（aka-mvpset の決定事項 27）。`userland-proxy` をオフにすると公開ポートごとの docker-proxy がなくなり、1 テナントあたり約 3.6 MiB 減る。`live-restore` をオンにすると、dockerd を再起動してもテナントのコンテナと AP の接続が続く。
+
+```json
+{ "userland-proxy": false, "live-restore": true }
+```
+
+WireGuard（`wg-quick@wg0`）を Docker より先に上げる。トンネルのアドレスがホストにないと、管理API のポートを公開できずに `radsec-edge` が起動しない。
+
+### 10.2 導入
+
+2.1 に加えて、監査ログとログのディレクトリを作る。
+
+```bash
+sudo install -d -o 10084 -g 10083 -m 0750 /var/lib/radsec-edge/audit
+```
+
+```bash
+sudo install -d -m 0755 /var/lib/radsec-edge/logs
+```
+
+`.env` に 2.2 の項目と次を書く。
+
+| 項目 | 内容 |
+|---|---|
+| `COMPOSE_FILE` | `compose.yaml:compose.managed.yaml`（Fluent Bit も使うときは `:compose.fluent-bit.yaml` を足す） |
+| `EDGE_BIND_ADDR` | 管理API を公開するトンネルのアドレス |
+| `EDGE_TLS_HOSTS` | 管理API のサーバー証明書の SAN（aka-provisioner がつなぐアドレス。ふつうは `EDGE_BIND_ADDR` と同じ） |
+| `EDGE_CRL_BASE_URL` | radsec-ca の配布の口（管理モードでは必須） |
+| `EDGE_UPSTREAM_SECRET` | aka-radius に登録する、このエッジの共有シークレット |
+
+管理クライアント（aka-provisioner）のピンのファイルを置く。1 行に `識別名=SHA-256 フィンガープリント`。UID 10084 で読めるようにする。
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+```
+
+```bash
+echo "provisioner=$(openssl x509 -in client.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr 'A-F' 'a-f')" > secrets/admin-clients
+```
+
+```bash
+sudo chown 10084 secrets/admin-clients && sudo chmod 400 secrets/admin-clients
+```
+
+起動して、管理API のサーバー証明書とフィンガープリントを取り出す（aka-provisioner の登録簿の `serverFingerprint` に書く）。
+
+```bash
+docker compose up -d
+```
+
+```bash
+docker compose exec -T radsec-edge /radsec-edge server-cert > edge-admin.pem
+```
+
+エッジを足す手順の全体（WireGuard のピア、aka-radius の RADIUS クライアントのコマンド、aka-provisioner の登録簿、aka-ossbss のエッジの台帳）は設計概要 §14.1 と aka-ossbss のガイドを見る。
+
+### 10.3 ピンの入れ替え（aka-provisioner のクライアント証明書を替えるとき）
+
+新旧の 2 行を**その場で**書き、`SIGHUP` で読み直す（`sed -i` などでファイルを置き換えると、動いているコンテナは古い中身を読み続ける）。aka-provisioner が新しい証明書を使い始めたら古い行を消して、もう一度 `SIGHUP` を送る。読めないときは前のピンのまま続け、ログに `EDGE_ADMIN_CLIENTS_RELOAD_ERR` を出す。
+
+```bash
+docker compose kill -s SIGHUP radsec-edge
+```
+
+### 10.4 管理API のサーバー証明書の入れ替え
+
+作り直して（監査ログに残る）新しいフィンガープリントを aka-provisioner の登録簿に書き、`SIGHUP` で読み直す。
+
+```bash
+docker compose exec -T radsec-edge /radsec-edge replace-server-cert > edge-admin.pem
+```
+
+```bash
+docker compose kill -s SIGHUP radsec-edge
+```
+
+### 10.5 ログと監査ログ
+
+`compose.fluent-bit.yaml` を重ねると、エッジの Fluent Bit（ループバックの `EDGE_FLUENT_BIT_PORT`、既定 24224）にログを送り、`EDGE_HOST_DIR/logs` の `radsec-edge.log`・`radsec-edge-agent.log`・`radsec-edge-cloudflared.log`・`radsecproxy.log`（全テナント。行の `container_name` で見分ける）に書く。`docker logs` と画面の「ログの末尾」も読める。
+
+- **有効にすると、テナントのコンテナはひな形が変わるので、次の整合ループで 1 回作り直され、そのエッジの AP の接続がいったん切れる。** 導入のときに有効にするか、エッジを 1 台ずつ切り替える。
+- Fluent Bit が止まっていても、コンテナは動き続け、ログはメモリーに溜めて戻ったときに送る。ただし、止まっている間に作り直した・再起動したコンテナの未送信の行は失われる。
+- `fluentd-buffer-limit` と forward の受信バッファーは絞ってある。既定の値に戻すと、150 テナントで約 700 MiB 増える（aka-mvpset の `verify/edge-logs/`）。
+
+ファイルはホストの logrotate で日ごとに圧縮し、2 週間持つ。監視用の PC が取りに行く。`/etc/logrotate.d/radsec-edge`:
+
+```
+/var/lib/radsec-edge/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+}
+```
+
+監査ログは SQLite に加えて、日ごとの `EDGE_HOST_DIR/audit/audit-YYYYMMDD.jsonl` にも書く（日本時間で区切り、前の日までを gzip で圧縮し、`EDGE_AUDIT_RETENTION_DAYS`、既定 14 日で消す）。監視用の PC が取りに行く。操作者は `operator`（`X-Operator-Id`）、管理クライアントは `mgmtClient`、トレースID は `traceId`。ログの `event_id`:
+
+| `event_id` | 内容 |
+|---|---|
+| `EDGE_AUTH_REJECTED` | 管理API が断ったクライアント証明書（登録していない、有効期間の外） |
+| `EDGE_ADMIN_CLIENTS_RELOADED`・`EDGE_ADMIN_CLIENTS_RELOAD_ERR` | ピンの読み直し |
+| `EDGE_SERVER_CERT_RELOADED`・`EDGE_SERVER_CERT_RELOAD_ERR` | サーバー証明書の読み直し |
+| `EDGE_AUDIT_FILE_ERR` | 監査ログのファイルの圧縮か削除に失敗した |
+
+### 10.6 反映の見方
+
+中央からの `apply` は裏で動き、結果は `GET /tenants/{id}` の `apply` と画面の「反映の履歴」に出る。
+
+| 結果 | 内容 |
+|---|---|
+| 成功 | 反映した |
+| 失敗（前の版のまま） | 構文検査の誤りなど。radsecproxy は変わっていない |
+| 失敗（前の版に戻した） | ヘルスチェックが通らなかったので前の版に戻した |
+| 途中で止まった（前の版に戻した） | 反映の途中で `radsec-edge` が止まっていた。次の整合ループか次の反映で、反映済みの版に戻して再起動した（AP の接続がいったん切れる）。望む状態は変わらないので、中央が反映し直す |
+
+反映やその他の処理が動いている間の変更の要求は、5 秒待って `503 TENANT_BUSY` を返す（中央が次の周回でやり直す）。
+
+### 10.7 業者の CA の侵害・失効を知ったとき
+
+持ち込みの CA は束に業者の CA だけを置くので、業者の CA が上位の CA に失効させられても、エッジも CA も気づけない。業者の CA の侵害・失効を知ったら、**新しい CA を待たずに**システム管理者がその CA をテナントから外す（設計概要 §24.9）。
+
+1. aka-ossbss でその持ち込みの CA をテナントから外す。そのテナントを置いたすべてのエッジに宣言と反映が届く。
+2. 各エッジの画面の「持ち込みの CA」から消え、「反映の履歴」が成功になったことを確かめる。束だけが変わるときは SIGHUP で効き、既存の接続も検証し直して切る。そのテナントの最後の持ち込みの CA を外して共通のブロックが消えるときと、`CRLCheck`・`PartialChain` が変わるときは再起動になる。
+3. 外し終わってから、radsec-ca でその CA を止める（radsec-ca の運用ガイド 4.4）。
+
+業者の新しい CA を登録するまで、その業者の AP はつながらない。
+
+### 10.8 バックアップ
+
+7 章と同じ（`EDGE_HOST_DIR/data` を止めて写す。管理API のサーバー証明書の鍵 `data/tls/` と、テナントの鍵 `data/keys/` を含むので、写しの置き場所に気を付ける）。`data` を失っても望む状態は中央から届くが、テナントのサーバー証明書とヘルスチェック用の証明書は鍵ごと作り直しになる（`missing` に出るので、中央が CSR から出し直す）。管理API のサーバー証明書も変わるので、aka-provisioner の登録簿を書き換える。

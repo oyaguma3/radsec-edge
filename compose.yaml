@@ -1,5 +1,6 @@
 # エッジの配備（設計概要 §4、§5.1）。テナントの radsecproxy のコンテナは agent が作る（compose では管理しない）。
 # 導入の前に、ホストのディレクトリと radsecproxy のイメージを用意する（README の「導入」）。
+# 管理モードでは compose.managed.yaml を重ねる（運用ガイド 10 章）。ログをエッジの Fluent Bit に送るときは compose.fluent-bit.yaml を重ねる（同 10.5）。
 name: radsec-edge
 
 x-hardening: &hardening
@@ -42,6 +43,8 @@ services:
       EDGE_CRL_BASE_URL: ${EDGE_CRL_BASE_URL:-}
       EDGE_CRL_INTERVAL: ${EDGE_CRL_INTERVAL:-5m}
       EDGE_CRL_WARN: ${EDGE_CRL_WARN:-72h}
+      # 1 台に置くテナントの数の上限（aka-mvpset の決定事項 25。4 GB で 150、2 GB で 60）。
+      EDGE_TENANT_CAPACITY: ${EDGE_TENANT_CAPACITY:-150}
       EDGE_RECONCILE_INTERVAL: ${EDGE_RECONCILE_INTERVAL:-1m}
       EDGE_LOG_LEVEL: ${EDGE_LOG_LEVEL:-info}
       # 画面の利用者は Cloudflare Access の JWT で識別する（設計概要 §13.1）。compose では開発用の設定は使えない

@@ -1,0 +1,29 @@
+# 管理モード（MVP セットで aka-provisioner から使う）のときに重ねる設定（設計概要 §24.11 の EA15）。
+#
+# - 管理API（9447）をトンネルのアドレス（EDGE_BIND_ADDR）に公開する（aka-provisioner から mTLS で受ける）。
+# - 管理クライアントのピンのファイル secrets/admin-clients を渡す（1 行に 識別名=フィンガープリント。SIGHUP で読み直す）。
+#   radsec-edge は UID 10084 で動くので、この UID で読めるようにする。
+# - 監査ログの日ごとのファイルをホストの EDGE_HOST_DIR/audit に書く（監視用の PC が取りに行く）。UID 10084 で書けるようにする。書けなければ起動しない。
+#
+# .env の COMPOSE_FILE=compose.yaml:compose.managed.yaml にすると、素の docker compose でも重なる（運用ガイド 10 章）。
+services:
+  radsec-edge:
+    environment:
+      EDGE_MODE: managed
+      EDGE_TLS_HOSTS: ${EDGE_TLS_HOSTS:?.env に EDGE_TLS_HOSTS（aka-provisioner がつなぐトンネルのアドレス）を設定してください}
+      EDGE_CRL_BASE_URL: ${EDGE_CRL_BASE_URL:?.env に EDGE_CRL_BASE_URL（radsec-ca の配布の口）を設定してください}
+      EDGE_AUDIT_DIR: /audit
+    secrets:
+      - admin-clients
+    ports:
+      - "${EDGE_BIND_ADDR:?.env に EDGE_BIND_ADDR（トンネルのアドレス）を設定してください}:9447:9447"
+    volumes:
+      - type: bind
+        source: ${EDGE_HOST_DIR:-/var/lib/radsec-edge}/audit
+        target: /audit
+        bind:
+          create_host_path: false
+
+secrets:
+  admin-clients:
+    file: ./secrets/admin-clients

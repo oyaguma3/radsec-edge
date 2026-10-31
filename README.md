@@ -9,22 +9,23 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 ```
 
 - 1 つのテナントを複数のエッジに置けます（`primary` / `secondary` / `tertiary`）。
-- 単独モード（エッジの画面だけで運用する）と、管理モード（[eapaka-ossbss-sample](https://github.com/oyaguma3/eapaka-ossbss-sample) から [eapaka-node-provisioner](https://github.com/oyaguma3/eapaka-node-provisioner) を通して運用する）を持ちます。
+- 単独モード（エッジの画面だけで運用する）と、管理モード（[aka-ossbss](https://github.com/oyaguma3/aka-ossbss) から [aka-provisioner](https://github.com/oyaguma3/aka-provisioner) を通して運用する）を持ちます。
 - AP とエッジの証明書は、独立した CA（[radsec-ca](https://github.com/oyaguma3/radsec-ca)）が発行します。
 
 ## 状態
 
-開発中です。単独モード（エッジの画面だけで運用する）を作り、CA（[radsec-ca](https://github.com/oyaguma3/radsec-ca)）と本PoC をつないだ通しの確かめ（E2E）まで済ませました。管理モード（OSS/BSS と provisioner から運用する）はこれからです。
+開発中です。単独モードは、CA（[radsec-ca](https://github.com/oyaguma3/radsec-ca)）と本PoC をつないだ通しの確かめ（E2E）まで済ませました。管理モードはエッジの側（管理API、管理モードの画面、配備、Fluent Bit）まで作り、中央（aka-provisioner・aka-ossbss）とつなぐ作業を MVP セット（[aka-mvpset](https://github.com/oyaguma3/aka-mvpset)）の段階 4 で進めています。
 
-- 設計概要: [docs/design-overview.md](docs/design-overview.md)（段階は §20、段階 1 は §21、段階 3 は §22）
-- 運用ガイド（単独モード）: [docs/operations.md](docs/operations.md)
+- 設計概要: [docs/design-overview.md](docs/design-overview.md)（段階は §20、段階 1 は §21、段階 3 は §22、MVP セットの変更は §24）
+- 運用ガイド: [docs/operations.md](docs/operations.md)（管理モードは 10 章）
+- 管理API: [docs/openapi/edge-api.yaml](docs/openapi/edge-api.yaml)
 - 段階 0 の実機の検証（radsecproxy の振る舞いの確認）の道具と手順: [verify/v0/](verify/v0/)
 
 ## 部品
 
 | 部品 | 役目 |
 |---|---|
-| `radsec-edge` | テナントと AP の望む状態（SQLite）、設定の生成と反映、整合ループ、CRL の取得、運用者向けの画面（8447。Cloudflare Access の JWT で利用者を確かめる） |
+| `radsec-edge` | テナントと AP の望む状態（SQLite）、設定の生成と反映、整合ループ、CRL の取得、運用者向けの画面（8447。Cloudflare Access の JWT で利用者を確かめる）、管理API（9447、mTLS。管理モードだけ） |
 | `radsec-edge-agent` | Docker を操作する唯一の部品。`radsec-edge` から unix ソケットで決まった操作だけを受け、テナントの radsecproxy のコンテナを固定のひな形から作る |
 | radsecproxy（テナントごと） | `images/radsecproxy` のイメージ（radsecproxy 1.11.4 に PartialChain のパッチを当ててソースからビルドしたもの）。ポート 20000〜21999 の 1 つで AP の RadSec を受ける |
 
@@ -54,9 +55,14 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 
 画面でテナントを作り、クライアントCA の証明書・CRL・サーバー証明書・ヘルスチェック用の証明書を取り込み（サーバー証明書とヘルスチェック用の証明書は、画面で出した CSR を CA で署名します）、AP を登録して反映します。
 
+## 導入（管理モード）
+
+`compose.managed.yaml`（と、ログを Fluent Bit に送るときは `compose.fluent-bit.yaml`）を重ねます。手順は[運用ガイド 10 章](docs/operations.md)を見てください。
+
 ## 開発
 
-- Go 1.27.3 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.2-1-deb13u1 images/radsecproxy`）。
+- Go 1.27.3 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.4-pc1 images/radsecproxy`）。
+- `scripts/check-guide.sh` は、管理モードの手順（導入、ピンの入れ替え、宣言から反映、Fluent Bit、監査ログ、バックアップ）を compose で流して確かめます（CI のジョブと同じ）。
 - `scripts/e2e.sh` は、本PoC・radsec-ca・エッジを 1 台に導入して、eapaka_test と AP の役（radsecproxy）で単独モードの通しを確かめます（Docker Desktop では動きません。運用ガイド 8 章）。GitHub Actions では「E2E」のワークフローを手で起動します。
 - 画面の CSS は `sh scripts/build-css.sh` で作ります（Tailwind CSS のスタンドアロン CLI と daisyUI を、版を固定して取得します）。
 
