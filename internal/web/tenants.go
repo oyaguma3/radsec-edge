@@ -32,8 +32,9 @@ type tenantsData struct {
 	overview
 	Form  tenantForm
 	Error string
-	// Capacity と Free はポートの範囲の大きさと空き。
-	Capacity, Free int
+	// Capacity は 1 台のテナントの数の上限。Managed は管理モードか（作成のフォームを出さない）。
+	Capacity int
+	Managed  bool
 }
 
 func (h *Handler) tenantList(w http.ResponseWriter, r *http.Request) {
@@ -54,9 +55,8 @@ func (h *Handler) renderTenants(w http.ResponseWriter, r *http.Request, status i
 		h.renderError(w, r, http.StatusServiceUnavailable, "データベースを読めません。")
 		return
 	}
-	capacity := config.PortMax - config.PortMin + 1
 	h.renderPart(w, r, status, "tenants", "tenants-section", "テナント",
-		tenantsData{overview: o, Form: f, Error: errMsg, Capacity: capacity, Free: capacity - len(o.Rows)})
+		tenantsData{overview: o, Form: f, Error: errMsg, Capacity: h.Edge.Capacity, Managed: h.managed()})
 }
 
 // readForm はフォームを読む（大きさの上限つき）。
@@ -185,6 +185,26 @@ type tenantData struct {
 	APName string
 	// ProbeProblem はヘルスチェック用の証明書の問題（失効など。なければ空。設計概要 §11.3）。
 	ProbeProblem string
+	// Managed は管理モードか（変更の操作を出さず、中央の宣言を読むだけで見せる。§24.11 の EA13）。Brought は持ち込みの CA、BroughtCRLs はその CRL、
+	// Shared は共通のブロックの接続（どれも管理モードだけ）。
+	Managed     bool
+	Brought     []broughtRow
+	BroughtCRLs []broughtCRL
+	Shared      []db.SharedSeen
+}
+
+// broughtRow は持ち込みの CA の 1 行。
+type broughtRow struct {
+	ID, Subject        string
+	NotAfter           time.Time
+	SelfSigned, HasCRL bool
+	Expired, Soon      bool
+}
+
+// broughtCRL は持ち込みの CA の CRL の 1 行。
+type broughtCRL struct {
+	crlState
+	CAID string
 }
 
 // loadTenant は詳細の画面の値を集める。
@@ -204,6 +224,9 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 	now := h.Now()
 	for _, a := range aps {
 		row := apRow{AP: a, SAN: names.SANURI(h.Edge.URNPrefix, t.Slug, a.Name)}
+		if a.Kind == db.KindGroup {
+			row.SAN = names.GroupSANURI(h.Edge.URNPrefix, t.Slug, a.Name)
+		}
 		if !a.CertNotAfter.IsZero() {
 			row.Expired = !now.Before(a.CertNotAfter)
 			row.Soon = !row.Expired && a.CertNotAfter.Sub(now) < 30*24*time.Hour
@@ -244,6 +267,12 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 		return tenantData{}, err
 	}
 	d.ClientCA, d.ServerCert, d.ProbeCert = h.certInfo(t.ClientCAPEM), h.certInfo(t.ServerCertPEM), h.certInfo(t.ProbeCertPEM)
+	if h.managed() {
+		d.Managed = true
+		if err := h.loadManaged(ctx, &d, started); err != nil {
+			return tenantData{}, err
+		}
+	}
 	for _, k := range []struct {
 		kind keystore.Kind
 		dst  *bool
@@ -255,6 +284,32 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 		*k.dst = p != nil
 	}
 	return d, nil
+}
+
+// loadManaged は管理モードの画面だけに出す値を集める（§24.11 の EA13）。
+func (h *Handler) loadManaged(ctx context.Context, d *tenantData, started time.Time) error {
+	brought, err := h.DB.BroughtCAs(ctx, d.Tenant.ID)
+	if err != nil {
+		return err
+	}
+	now := h.Now()
+	for _, b := range brought {
+		c, err := pki.ParseCert([]byte(b.CertPEM))
+		if err != nil {
+			return err
+		}
+		ci := certInfoOf(c, now)
+		d.Brought = append(d.Brought, broughtRow{ID: b.CAID, Subject: ci.Subject, NotAfter: ci.NotAfter, SelfSigned: pki.IsSelfSigned(c), HasCRL: b.HasCRL, Expired: ci.Expired, Soon: ci.Soon})
+		if b.HasCRL {
+			crl, err := h.DB.CRLOf(ctx, d.Tenant.ID, b.CAID)
+			if err != nil {
+				return err
+			}
+			d.BroughtCRLs = append(d.BroughtCRLs, broughtCRL{crlState: h.crlState(crl), CAID: b.CAID})
+		}
+	}
+	d.Shared, err = h.Edge.SharedSeen(ctx, d.Tenant.ID, started)
+	return err
 }
 
 func (h *Handler) tenant(w http.ResponseWriter, r *http.Request) {

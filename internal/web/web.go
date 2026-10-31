@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/auth"
+	"github.com/oyaguma3/radsec-edge/internal/config"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge"
 )
@@ -80,22 +81,22 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /{$}", h.home)
 
 	mux.HandleFunc("GET /tenants", h.tenantList)
-	mux.HandleFunc("POST /tenants", h.tenantCreate)
+	mux.HandleFunc("POST /tenants", h.standaloneOnly(h.tenantCreate))
 	mux.HandleFunc("GET /tenants/{id}", h.tenant)
-	mux.HandleFunc("POST /tenants/{id}/update", h.tenantUpdate)
-	mux.HandleFunc("POST /tenants/{id}/delete", h.tenantDelete)
+	mux.HandleFunc("POST /tenants/{id}/update", h.standaloneOnly(h.tenantUpdate))
+	mux.HandleFunc("POST /tenants/{id}/delete", h.standaloneOnly(h.tenantDelete))
 	mux.HandleFunc("POST /tenants/{id}/apply", h.tenantApply)
 	mux.HandleFunc("POST /tenants/{id}/restart", h.tenantRestart)
 	mux.HandleFunc("POST /tenants/{id}/stop", h.tenantStop)
 	mux.HandleFunc("POST /tenants/{id}/start", h.tenantStart)
 	mux.HandleFunc("GET /tenants/{id}/logs", h.tenantLogs)
-	mux.HandleFunc("POST /tenants/{id}/client-ca", h.clientCAImport)
-	mux.HandleFunc("POST /tenants/{id}/csr/{kind}", h.csrCreate)
-	mux.HandleFunc("POST /tenants/{id}/cert/{kind}", h.certImport)
-	mux.HandleFunc("POST /tenants/{id}/crl", h.crlUpload)
+	mux.HandleFunc("POST /tenants/{id}/client-ca", h.standaloneOnly(h.clientCAImport))
+	mux.HandleFunc("POST /tenants/{id}/csr/{kind}", h.standaloneOnly(h.csrCreate))
+	mux.HandleFunc("POST /tenants/{id}/cert/{kind}", h.standaloneOnly(h.certImport))
+	mux.HandleFunc("POST /tenants/{id}/crl", h.standaloneOnly(h.crlUpload))
 	mux.HandleFunc("POST /tenants/{id}/crl/refresh", h.crlRefresh)
-	mux.HandleFunc("POST /tenants/{id}/aps", h.apPut)
-	mux.HandleFunc("POST /tenants/{id}/aps/{name}/delete", h.apDelete)
+	mux.HandleFunc("POST /tenants/{id}/aps", h.standaloneOnly(h.apPut))
+	mux.HandleFunc("POST /tenants/{id}/aps/{name}/delete", h.standaloneOnly(h.apDelete))
 
 	mux.HandleFunc("GET /audit", h.audit)
 	mux.HandleFunc("/", h.notFound)
@@ -106,6 +107,21 @@ func (h *Handler) Routes() http.Handler {
 		h.renderError(w, r, http.StatusForbidden, "この操作は受け付けられません。画面を開き直してから操作してください。")
 	}))
 	return h.accessLog(securityHeaders(cop.Handler(h.authenticate(mux))))
+}
+
+// managed は管理モードか。
+func (h *Handler) managed() bool { return h.Mode == config.ModeManaged }
+
+// standaloneOnly は、テナント・AP・証明書・CRL の変更の操作を、管理モードでは断る（設計概要 §23.2 の 3、§24.11 の EA13）。
+// 管理モードの望む状態は中央（OSS/BSS）から届く。反映のやり直し・再起動・停止と起動・CRL の取り直し・ログは運用の操作なので使える。
+func (h *Handler) standaloneOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.managed() {
+			h.renderError(w, r, http.StatusForbidden, "管理モードでは、この変更は中央（OSS/BSS）から行います。")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // healthz は DB を使えれば 200 を返す（compose の healthcheck に使う。認証の対象外）。

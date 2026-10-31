@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/agent"
-	"github.com/oyaguma3/radsec-edge/internal/config"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge"
 )
@@ -114,7 +113,7 @@ type homeData struct {
 	Agent      agent.Status
 	AgentError string
 	Reconcile  edge.ReconcileState
-	// Tenants はテナントの数、Capacity はポートの範囲から決まる上限。
+	// Tenants はテナントの数、Capacity は 1 台のテナントの数の上限（EDGE_TENANT_CAPACITY）。
 	Tenants, Capacity int
 	// Pending は未反映の変更のあるテナント、CRLProblems は CRL に警告のあるテナント、Down はコンテナが動いていないテナント、
 	// ProbeProblems はヘルスチェック用の証明書に問題のあるテナント。
@@ -130,7 +129,7 @@ func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := homeData{Mode: h.Mode, Agent: o.Agent, AgentError: o.AgentError, Reconcile: h.Edge.LastReconcile(), Tenants: len(o.Rows),
-		Capacity: config.PortMax - config.PortMin + 1, CRLWarn: h.CRLWarn}
+		Capacity: h.Edge.Capacity, CRLWarn: h.CRLWarn}
 	for _, t := range o.Rows {
 		if t.Pending() {
 			d.Pending = append(d.Pending, t)

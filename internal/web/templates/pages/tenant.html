@@ -26,6 +26,9 @@
           <tr><th>ポート</th><td>{{.Tenant.Port}}{{if and .Tenant.AppliedPort (ne .Tenant.AppliedPort .Tenant.Port)}}（反映済みは {{.Tenant.AppliedPort}}）{{end}}</td></tr>
           <tr><th>望む状態の版</th><td>{{.Tenant.DesiredVersion}}</td></tr>
           <tr><th>反映済みの版</th><td>{{if .Tenant.AppliedVersion}}{{.Tenant.AppliedVersion}}（{{datetime .Tenant.AppliedAt}}、設定のハッシュ <code>{{short 16 .Tenant.AppliedHash}}</code>）{{else}}まだ反映していません{{end}}</td></tr>
+          {{- if .Managed}}
+          <tr><th>中央の版（revision）</th><td>受け取った {{.Tenant.Revision}}、反映済み {{.Tenant.AppliedRevision}}</td></tr>
+          {{- end}}
         </tbody>
       </table>
       <div class="card-actions">
@@ -52,7 +55,7 @@
       {{- if .PlanError}}<p class="text-error">変更を求められません: {{.PlanError}}</p>
       {{- else if .Plan.Missing}}
       <p>反映に要るものがそろっていません: {{range $i, $m := .Plan.Missing}}{{if $i}}、{{end}}<strong>{{$m}}</strong>{{end}}。</p>
-      <p class="text-sm text-base-content/60">下の「証明書」と「CRL」で取り込んでください。ヘルスチェックを省いた反映はしません。</p>
+      <p class="text-sm text-base-content/60">{{if .Managed}}証明書は中央（OSS/BSS）から届きます。CRL は反映のときに取りに行きます。{{else}}下の「証明書」と「CRL」で取り込んでください。{{end}}ヘルスチェックを省いた反映はしません。</p>
       {{- else if .Plan.Error}}<p class="text-error whitespace-pre-wrap">{{.Plan.Error}}</p>
       {{- else}}
         {{- if .Plan.Same}}<p>反映済みの版と同じです（反映すると、コンテナの状態を確かめてヘルスチェックだけを行います）。</p>
@@ -81,11 +84,23 @@
   <div class="card bg-base-100 shadow mb-6">
     <div class="card-body">
       <h2 class="card-title">設定</h2>
+      {{- if .Managed}}
+      <table class="table table-sm">
+        <tbody>
+          <tr><th class="w-48">ポート</th><td>{{.Tenant.Port}}</td></tr>
+          <tr><th>上流（認証）</th><td><code>{{.Tenant.AuthUpstream}}</code></td></tr>
+          <tr><th>上流（課金）</th><td><code>{{.Tenant.AcctUpstream}}</code></td></tr>
+          <tr><th>送信元の範囲</th><td>{{range $i, $c := .Tenant.SourceCIDRs}}{{if $i}}、{{end}}<code>{{$c}}</code>{{else}}制限なし{{end}}</td></tr>
+          <tr><th>共通のブロックの照合</th><td>{{if .Tenant.SharedMatchAttr}}<code>{{.Tenant.SharedMatchAttr}}</code> <code class="break-all">{{.Tenant.SharedMatchPattern}}</code>{{else}}なし{{end}}</td></tr>
+        </tbody>
+      </table>
+      <p class="text-sm text-base-content/60">管理モードでは、設定は中央（OSS/BSS）から届きます。ここでは変えられません。</p>
+      {{- else}}
       <form hx-post="/tenants/{{.Tenant.ID}}/update" hx-target="#tenant" hx-swap="outerHTML" autocomplete="off" class="grid gap-2 md:grid-cols-2">
         <fieldset class="fieldset">
           <legend class="fieldset-legend">ポート</legend>
           <input name="port" value="{{.Form.Port}}" required inputmode="numeric" class="input w-full">
-          <p class="label">20830〜20999（AP の設定に入るので、ふつうは変えません）</p>
+          <p class="label">20000〜21999（AP の設定に入るので、ふつうは変えません）</p>
         </fieldset>
         <fieldset class="fieldset">
           <legend class="fieldset-legend">CRL の取得先</legend>
@@ -102,6 +117,7 @@
         </fieldset>
         <div><button type="submit" class="btn">変更する</button></div>
       </form>
+      {{- end}}
       <div class="mt-2">
         <p class="font-semibold">DNS に登録する名前</p>
         <p class="text-sm text-base-content/60">AP には primary を主、secondary（と tertiary）を予備の RadSec サーバーとして、ポート {{.Tenant.Port}} とともに設定します。
@@ -115,27 +131,54 @@
   <div class="card bg-base-100 shadow mb-6">
     <div class="card-body">
       <h2 class="card-title">証明書</h2>
-      <p class="text-sm text-base-content/60">鍵はエッジで作り、外に出しません。CSR を CA（radsec-ca）の画面で署名して、できた証明書を取り込みます。</p>
+      <p class="text-sm text-base-content/60">鍵はエッジで作り、外に出しません。{{if .Managed}}証明書は中央（OSS/BSS）が CA（radsec-ca）に署名させて届けます。{{else}}CSR を CA（radsec-ca）の画面で署名して、できた証明書を取り込みます。{{end}}</p>
 
       <h3 class="font-semibold mt-2">クライアントCA（テナントの AP の証明書を発行する CA）</h3>
       {{template "cert-info" .ClientCA}}
+      {{- if not .Managed}}
       <form hx-post="/tenants/{{.Tenant.ID}}/client-ca" hx-target="#tenant" hx-swap="outerHTML" class="flex flex-col gap-2">
         <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN CERTIFICATE-----" required></textarea>
         <div><button class="btn btn-sm">取り込む</button></div>
       </form>
+      {{- end}}
+      {{- if .Managed}}
+      <h3 class="font-semibold mt-4">持ち込みの CA（{{len .Brought}}）</h3>
+      {{- if .Brought}}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead><tr><th>ID</th><th>Subject</th><th>期限</th><th>形</th><th>CRL</th></tr></thead>
+          <tbody>
+            {{- range .Brought}}
+            <tr>
+              <td><code class="text-xs">{{.ID}}</code></td>
+              <td class="text-sm"><code>{{.Subject}}</code></td>
+              <td class="text-sm whitespace-nowrap">{{datetime .NotAfter}}{{if .Expired}} <span class="badge badge-error badge-sm">期限切れ</span>{{else if .Soon}} <span class="badge badge-warning badge-sm">30 日を切りました</span>{{end}}</td>
+              <td class="text-sm">{{if .SelfSigned}}自己署名{{else}}自己署名でない（PartialChain）{{end}}</td>
+              <td class="text-sm">{{if .HasCRL}}あり{{else}}<span class="badge badge-warning badge-sm">なし（テナント全体が CRLCheck off）</span>{{end}}</td>
+            </tr>
+            {{- end}}
+          </tbody>
+        </table>
+      </div>
+      {{- else}}<p class="text-sm text-base-content/60">ありません。</p>{{end}}
+      {{- end}}
 
       <h3 class="font-semibold mt-4">サーバー証明書（AP に見せる証明書。SAN は 3 つのスロットの名前）</h3>
       {{template "cert-info" .ServerCert}}
       {{- if .ServerPending}}<p class="text-sm"><span class="badge badge-info badge-sm">CSR を出した鍵が証明書を待っています</span></p>{{end}}
+      {{- if not .Managed}}
       {{template "csr-and-import" (dict "ID" .Tenant.ID "Kind" "server" "CSR" .CSR "CSRKind" .CSRKind
         "Help" (printf "CA のプロファイル tenant-server で署名します（テナント %s）。" .Tenant.Slug))}}
+      {{- end}}
 
       <h3 class="font-semibold mt-4">ヘルスチェック用の証明書（SAN <code>{{.ProbeSAN}}</code>）</h3>
       {{template "cert-info" .ProbeCert}}
       {{- with .ProbeProblem}}<p class="text-sm text-warning">{{.}}</p>{{end}}
       {{- if .ProbePending}}<p class="text-sm"><span class="badge badge-info badge-sm">CSR を出した鍵が証明書を待っています</span></p>{{end}}
+      {{- if not .Managed}}
       {{template "csr-and-import" (dict "ID" .Tenant.ID "Kind" "probe" "CSR" .CSR "CSRKind" .CSRKind
         "Help" (printf "CA のプロファイル probe-client で署名します（テナント %s）。" .Tenant.Slug))}}
+      {{- end}}
     </div>
   </div>
 
@@ -156,36 +199,62 @@
       <div class="card-actions">
         {{- if .CRLURL}}<form hx-post="/tenants/{{.Tenant.ID}}/crl/refresh" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><button class="btn btn-sm">今すぐ取りに行く</button></form>{{end}}
       </div>
+      {{- if .Managed}}
+      {{- if .BroughtCRLs}}
+      <h3 class="font-semibold mt-2">持ち込みの CA の CRL</h3>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead><tr><th>CA</th><th>状態</th><th>番号</th><th>nextUpdate</th><th>最後の取得</th></tr></thead>
+          <tbody>
+            {{- range .BroughtCRLs}}
+            <tr>
+              <td><code class="text-xs">{{.CAID}}</code></td>
+              <td>{{template "crl-badge" .}}</td>
+              <td class="text-sm">{{if .Missing}}-{{else}}{{.Number}}{{end}}</td>
+              <td class="text-sm whitespace-nowrap">{{datetime .NextUpdate}}</td>
+              <td class="text-sm">成功 {{datetime .LastSuccessAt}}{{with .LastError}}<div class="text-error break-all">{{.}}</div>{{end}}</td>
+            </tr>
+            {{- end}}
+          </tbody>
+        </table>
+      </div>
+      {{- end}}
+      {{- else}}
       <form hx-post="/tenants/{{.Tenant.ID}}/crl" hx-target="#tenant" hx-swap="outerHTML" class="flex flex-col gap-2">
         <textarea name="pem" rows="3" class="textarea w-full font-mono text-xs" placeholder="-----BEGIN X509 CRL-----" required></textarea>
         <div><button class="btn btn-sm">貼り付けた CRL を取り込む</button></div>
       </form>
+      {{- end}}
     </div>
   </div>
 
   {{/* ---- AP ---- */}}
   <div class="card bg-base-100 shadow mb-6">
     <div class="card-body">
-      <h2 class="card-title">AP（{{len .APs}}）</h2>
+      <h2 class="card-title">{{if .Managed}}AP とグループ{{else}}AP{{end}}（{{len .APs}}）</h2>
       <div class="overflow-x-auto">
         <table class="table table-sm">
-          <thead><tr><th>名前</th><th>NAS-Identifier</th><th>SAN（URI）</th><th>証明書</th><th>最後の接続</th><th></th></tr></thead>
+          <thead><tr><th>名前</th>{{if .Managed}}<th>種類</th>{{end}}<th>NAS-Identifier</th><th>SAN（URI）</th><th>証明書</th><th>最後の接続</th>{{if not .Managed}}<th></th>{{end}}</tr></thead>
           <tbody>
             {{- $id := .Tenant.ID}}
+            {{- $managed := .Managed}}
             {{- range .APs}}
             <tr>
               <td>{{.Name}}</td>
+              {{- if $managed}}<td class="text-sm">{{if eq .Kind "group"}}グループ（{{.Purpose}}）{{else}}AP{{end}}</td>{{end}}
               <td><code>{{.NASID}}</code></td>
               <td><code class="text-xs">{{.SAN}}</code></td>
               <td class="text-sm">{{if .CertSerial}}<code class="text-xs">{{short 16 .CertSerial}}</code> {{datetime .CertNotAfter}} まで
                 {{- if .Expired}} <span class="badge badge-error badge-sm">期限切れ</span>{{else if .Soon}} <span class="badge badge-warning badge-sm">期限が近い</span>{{end}}{{else}}-{{end}}</td>
               <td class="text-sm">{{template "seen" .Seen}}</td>
+              {{- if not $managed}}
               <td>
                 <form id="ap-delete-{{.Name}}" hx-post="/tenants/{{$id}}/aps/{{.Name}}/delete" hx-target="#tenant" hx-swap="outerHTML"></form>
                 <button type="button" class="btn btn-xs btn-error btn-outline" command="show-modal" commandfor="dialog-ap-{{.Name}}">削除</button>
                 {{template "confirm" (dict "ID" (printf "dialog-ap-%s" .Name) "Title" "AP の削除" "Form" (printf "ap-delete-%s" .Name) "Label" "削除する" "Class" "btn-error"
                   "Message" (printf "AP %s を削除します。次の反映で設定から消えます。すぐにつながらなくするには、CA で証明書を失効させてください。よろしいですか？" .Name))}}
               </td>
+              {{- end}}
             </tr>
             {{- else}}
             <tr><td colspan="6" class="text-base-content/60">AP はありません。</td></tr>
@@ -193,6 +262,21 @@
           </tbody>
         </table>
       </div>
+      {{- if .Managed}}
+      {{- if .Shared}}
+      <h3 class="font-semibold mt-4">共通のブロック（持ち込みの CA の AP）の接続</h3>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead><tr><th>送信元の IP</th><th>接続の数</th><th>最後の接続</th><th>最後の切断</th></tr></thead>
+          <tbody>
+            {{- range .Shared}}
+            <tr><td><code>{{.IP}}</code></td><td>{{.Connections}}</td><td class="text-sm whitespace-nowrap">{{datetime .LastUp}}</td><td class="text-sm whitespace-nowrap">{{datetime .LastDown}}</td></tr>
+            {{- end}}
+          </tbody>
+        </table>
+      </div>
+      {{- end}}
+      {{- else}}
       <form hx-post="/tenants/{{.Tenant.ID}}/aps" hx-target="#tenant" hx-swap="outerHTML" autocomplete="off" class="grid gap-2 mt-2">
         <fieldset class="fieldset">
           <legend class="fieldset-legend">AP の名前</legend>
@@ -206,6 +290,7 @@
         </fieldset>
         <div><button class="btn btn-sm">登録する</button></div>
       </form>
+      {{- end}}
     </div>
   </div>
 
@@ -244,10 +329,12 @@
     </div>
   </div>
 
+  {{- if not .Managed}}
   <form id="tenant-delete" hx-post="/tenants/{{.Tenant.ID}}/delete" hx-target="#tenant" hx-swap="outerHTML"></form>
   <button type="button" class="btn btn-error btn-outline" command="show-modal" commandfor="dialog-delete">このテナントを削除</button>
   {{template "confirm" (dict "ID" "dialog-delete" "Title" "テナントの削除" "Form" "tenant-delete" "Label" "削除する" "Class" "btn-error"
     "Message" (printf "テナント %s を削除します。コンテナ・設定・鍵・AP の登録も消えます（反映の履歴と監査ログは残ります）。よろしいですか？" .Tenant.Slug))}}
+  {{- end}}
 </div>
 {{- end}}
 

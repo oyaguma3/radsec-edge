@@ -29,6 +29,7 @@ import (
 
 type testEnv struct {
 	srv      *httptest.Server
+	svc      *edge.Service
 	db       *db.DB
 	agent    *edgetest.FakeAgent
 	ca       *pkitest.CA
@@ -36,6 +37,11 @@ type testEnv struct {
 }
 
 func newTestEnv(t *testing.T, ident auth.Identifier) *testEnv {
+	t.Helper()
+	return newTestEnvMode(t, ident, "standalone")
+}
+
+func newTestEnvMode(t *testing.T, ident auth.Identifier, mode string) *testEnv {
 	t.Helper()
 	d, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "edge.db"))
 	if err != nil {
@@ -49,8 +55,8 @@ func newTestEnv(t *testing.T, ident auth.Identifier) *testEnv {
 	fa := edgetest.NewFakeAgent()
 	probe := &edgetest.FakeProbe{}
 	svc := edge.New(edge.Options{Log: log, DB: d, Agent: fa, Store: rsconf.Store{Root: t.TempDir()}, Keys: keystore.Store{Dir: t.TempDir()},
-		URNPrefix: "example", DNSDomain: "radsec.test", Secret: "upsecret-123", Probe: probe.Check, ProbeTimeout: time.Second})
-	h, err := New(Options{Log: log, Version: "test", Mode: "standalone", DB: d, Edge: svc, Identifier: ident,
+		URNPrefix: "example", DNSDomain: "radsec.test", Secret: "upsecret-123", Probe: probe.Check, ProbeTimeout: time.Second, Capacity: 150})
+	h, err := New(Options{Log: log, Version: "test", Mode: mode, DB: d, Edge: svc, Identifier: ident,
 		AuthUpstream: netip.MustParseAddrPort("10.0.0.10:1812"), AcctUpstream: netip.MustParseAddrPort("10.0.0.10:1813"),
 		CRLWarn: 72 * time.Hour})
 	if err != nil {
@@ -58,7 +64,7 @@ func newTestEnv(t *testing.T, ident auth.Identifier) *testEnv {
 	}
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
-	return &testEnv{srv: srv, db: d, agent: fa, ca: pkitest.NewCA(t, "tenant-a client CA"), serverCA: pkitest.NewCA(t, "server CA")}
+	return &testEnv{srv: srv, svc: svc, db: d, agent: fa, ca: pkitest.NewCA(t, "tenant-a client CA"), serverCA: pkitest.NewCA(t, "server CA")}
 }
 
 // client はリダイレクトを追わない（303 を確かめる）。
@@ -255,4 +261,52 @@ func TestCrossOrigin(t *testing.T) {
 	if s != 404 {
 		t.Errorf("unknown page: %d", s)
 	}
+}
+
+// 管理モードの画面は変更の操作を出さず、サーバーでも断る。運用の操作は使える（設計概要 §23.2 の 3、§24.11 の EA13）。
+func TestManagedReadOnly(t *testing.T) {
+	e := newTestEnvMode(t, auth.Dev("op@example.com"), "managed")
+	ctx := t.Context()
+	vendor := pkitest.NewCA(t, "vendor CA")
+	_, err := e.svc.Declare(ctx, edge.Actor{Operator: "central", Source: db.SourceAPI}, edge.Declaration{ID: "42", Slug: "tenant-a", Revision: 9, Port: 20042,
+		Auth: netip.MustParseAddrPort("10.0.0.10:1812"), Acct: netip.MustParseAddrPort("10.0.0.10:1813"), IssuedCAID: "tenant.tenant-a", IssuedCAPEM: e.ca.PEM,
+		Trust: edge.TrustInput{Brought: []edge.BroughtInput{{CAID: "brought.tenant-a.vendor", CertPEM: vendor.PEM, HasCRL: true}},
+			SourceCIDRs: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}},
+		APs: []edge.APDecl{{Name: "ap-001", Kind: db.KindAP}, {Name: "hq", Kind: db.KindGroup, Purpose: "unifi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, body := e.get(t, "/")
+	must(t, "home", s, body, 200, "150 テナント")
+	s, body = e.get(t, "/tenants")
+	must(t, "tenants", s, body, 200, "中央（OSS/BSS）から届きます")
+	if strings.Contains(body, `hx-post="/tenants"`) {
+		t.Error("the create form is shown")
+	}
+	if err := e.db.ApplySeen(ctx, "42", []db.SeenEvent{{Shared: true, Kind: db.SeenUp, At: time.Now(), IP: "198.51.100.7"}}, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	s, body = e.get(t, "/tenants/42")
+	must(t, "tenant", s, body, 200, "管理モード")
+	for _, want := range []string{"受け取った 9", "192.0.2.0/24", "brought.tenant-a.vendor", "グループ（unifi）", "urn:example:grp:tenant-a:hq", "urn:example:nas:tenant-a:ap-001",
+		`hx-post="/tenants/42/restart"`, `hx-post="/tenants/42/stop"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the tenant page does not contain %q", want)
+		}
+	}
+	for _, not := range []string{`/tenants/42/update"`, `/tenants/42/delete"`, `/tenants/42/client-ca"`, `/tenants/42/csr/`, `/tenants/42/cert/`, `/tenants/42/crl"`, `/tenants/42/aps"`, `/aps/ap-001/delete"`} {
+		if strings.Contains(body, not) {
+			t.Errorf("the tenant page contains %q", not)
+		}
+	}
+	for _, path := range []string{"/tenants", "/tenants/42/update", "/tenants/42/delete", "/tenants/42/client-ca", "/tenants/42/csr/server", "/tenants/42/cert/server", "/tenants/42/crl", "/tenants/42/aps", "/tenants/42/aps/ap-001/delete"} {
+		s, body, _ := e.post(t, path, url.Values{"pem": {"x"}, "name": {"x"}, "slug": {"x"}})
+		must(t, path, s, body, 403, "中央")
+	}
+	// 運用の操作は使える（停止と起動）。
+	s, body, _ = e.post(t, "/tenants/42/stop", nil)
+	must(t, "stop", s, body, 200, "止")
+	s, body, _ = e.post(t, "/tenants/42/start", nil)
+	must(t, "start", s, body, 200, "起動しました")
 }

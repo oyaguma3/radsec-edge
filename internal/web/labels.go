@@ -30,6 +30,8 @@ func actionLabel(s string) string {
 		return "SIGHUP"
 	case "stop":
 		return "停止"
+	case "rollback":
+		return "前の版に戻す"
 	case "", "ensure":
 		return "-"
 	}
@@ -44,6 +46,8 @@ func resultLabel(s string) string {
 		return "失敗（前の版のまま）"
 	case db.ResultRolledBack:
 		return "失敗（前の版に戻した）"
+	case db.ResultInterrupted:
+		return "途中で止まった（前の版に戻した）"
 	}
 	return s
 }
@@ -69,22 +73,27 @@ func stateLabel(s string) string {
 }
 
 var auditLabels = map[string]string{
-	"tenant.create":           "テナントの作成",
-	"tenant.update":           "テナントの変更",
-	"tenant.delete":           "テナントの削除",
-	"tenant.apply":            "反映",
-	"tenant.start":            "起動",
-	"tenant.stop":             "停止",
-	"tenant.restart":          "再起動",
-	"client_ca.import":        "クライアントCA の取り込み",
-	"server.csr":              "サーバー証明書の CSR",
-	"probe.csr":               "ヘルスチェック用の証明書の CSR",
-	"server_cert.import":      "サーバー証明書の取り込み",
-	"probe_cert.import":       "ヘルスチェック用の証明書の取り込み",
-	"crl.install":             "CRL の更新",
-	"ap.put":                  "AP の登録",
-	"ap.delete":               "AP の削除",
-	"container.remove_orphan": "テナントのないコンテナの削除",
+	"tenant.create":            "テナントの作成",
+	"tenant.update":            "テナントの変更",
+	"tenant.declare":           "テナントの宣言",
+	"tenant.trust":             "受け口の変更",
+	"tenant.apply_interrupted": "途中で止まった反映の戻し",
+	"group.put":                "グループの登録",
+	"server-cert.replace":      "管理API のサーバー証明書の作り直し",
+	"tenant.delete":            "テナントの削除",
+	"tenant.apply":             "反映",
+	"tenant.start":             "起動",
+	"tenant.stop":              "停止",
+	"tenant.restart":           "再起動",
+	"client_ca.import":         "クライアントCA の取り込み",
+	"server.csr":               "サーバー証明書の CSR",
+	"probe.csr":                "ヘルスチェック用の証明書の CSR",
+	"server_cert.import":       "サーバー証明書の取り込み",
+	"probe_cert.import":        "ヘルスチェック用の証明書の取り込み",
+	"crl.install":              "CRL の更新",
+	"ap.put":                   "AP の登録",
+	"ap.delete":                "AP の削除",
+	"container.remove_orphan":  "テナントのないコンテナの削除",
 }
 
 func auditLabel(s string) string {
