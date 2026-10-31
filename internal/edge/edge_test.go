@@ -7,8 +7,10 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -30,7 +32,7 @@ func TestApplyNeedsEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tn.Port != 20830 || tn.ID != "tenant-a" {
+	if tn.Port != 20000 || tn.ID != "tenant-a" {
 		t.Errorf("tenant = %+v", tn)
 	}
 	missing, _ := e.svc.Missing(ctx, tn)
@@ -67,7 +69,7 @@ func TestApplyFlow(t *testing.T) {
 		t.Errorf("probe addr = %s", got)
 	}
 	tn, _ = e.db.Tenant(ctx, "tenant-a")
-	if tn.Pending() || tn.AppliedPort != 20830 || tn.AppliedHash != rec.Hash {
+	if tn.Pending() || tn.AppliedPort != 20000 || tn.AppliedHash != rec.Hash {
 		t.Errorf("tenant after apply: pending=%v port=%d hash=%s", tn.Pending(), tn.AppliedPort, tn.AppliedHash)
 	}
 	if p, _ := e.svc.Plan(ctx, "tenant-a"); !p.Same || len(p.Hunks) != 0 || p.Action != rsconf.ActionNone {
@@ -102,8 +104,8 @@ func TestApplyFlow(t *testing.T) {
 		t.Errorf("tenant after crl: pending=%v desired=%d hash changed=%v", after.Pending(), after.DesiredVersion, after.AppliedHash != tn.AppliedHash)
 	}
 	_, cur, _ := e.svc.Store.Current("tenant-a")
-	if _, crl, _ := cur.Trust(); crl.Number.Int64() != 2 {
-		t.Errorf("crl in the applied generation = %v", crl.Number)
+	if entries, _ := cur.Trust(); entries[0].CRL.Number.Int64() != 2 {
+		t.Errorf("crl in the applied generation = %v", entries[0].CRL.Number)
 	}
 	applies, _ := e.db.Applies(ctx, "tenant-a", 10)
 	if applies[0].Trigger != db.TriggerCRL || applies[0].Result != db.ResultOK {
@@ -235,8 +237,8 @@ func TestReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 	eq(t, "calls", e.agent.TakeCalls(), []string{"ensure tenant-a", "ensure tenant-b"})
-	if p := e.agent.Containers["tenant-b"].Port; p != 20831 {
-		t.Errorf("tenant-b port = %d, want the applied port 20831", p)
+	if p := e.agent.Containers["tenant-b"].Port; p != 20001 {
+		t.Errorf("tenant-b port = %d, want the applied port 20001", p)
 	}
 	// 停止したテナントのコンテナは止める（SetEnabled はすぐに効かせる）。
 	if err := e.svc.SetEnabled(ctx, e.user, "tenant-a", false); err != nil {
@@ -420,5 +422,236 @@ func TestCertificates(t *testing.T) {
 	}
 	if err := s.DeleteTenant(ctx, e.user, "none"); !errors.Is(err, db.ErrNotFound) {
 		t.Errorf("DeleteTenant(none) = %v", err)
+	}
+}
+
+// brought は持ち込みの CA の宣言を作る。
+func brought(slug, name string, ca *pkitest.CA, hasCRL bool) BroughtInput {
+	return BroughtInput{CAID: "brought." + slug + "." + name, CertPEM: ca.PEM, HasCRL: hasCRL}
+}
+
+func TestSetTrust(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	vendor := pkitest.NewCA(t, "vendor org CA")
+	bad := map[string]TrustInput{
+		"wrong slug":           {Brought: []BroughtInput{brought("tenant-b", "v", vendor, true)}},
+		"bad id":               {Brought: []BroughtInput{{CAID: "tenant.tenant-a", CertPEM: vendor.PEM, HasCRL: true}}},
+		"bad cert":             {Brought: []BroughtInput{{CAID: "brought.tenant-a.v", CertPEM: []byte("x"), HasCRL: true}}},
+		"same subject":         {Brought: []BroughtInput{brought("tenant-a", "v", pkitest.NewCA(t, "tenant-a client CA"), true)}},
+		"same subject between": {Brought: []BroughtInput{brought("tenant-a", "a", vendor, true), brought("tenant-a", "b", pkitest.NewCA(t, "vendor org CA"), true)}},
+		"no match":             {Brought: []BroughtInput{brought("tenant-a", "v", vendor, false)}},
+		"bad match":            {Brought: []BroughtInput{brought("tenant-a", "v", vendor, true)}, SharedMatch: rsconf.Match{Attr: "CN", Pattern: "a"}},
+		"many cidrs":           {SourceCIDRs: make([]netip.Prefix, rsconf.MaxSourceCIDRs+1)},
+		"invalid cidr":         {SourceCIDRs: []netip.Prefix{{}}},
+	}
+	for name, in := range bad {
+		if err := e.svc.SetTrust(ctx, e.user, "tenant-a", in); !IsInput(err) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if list, _ := e.db.BroughtCAs(ctx, "tenant-a"); len(list) != 0 {
+		t.Fatalf("left: %+v", list)
+	}
+	// CRL がそろうまで反映できない。
+	if err := e.svc.SetTrust(ctx, e.user, "tenant-a", TrustInput{Brought: []BroughtInput{brought("tenant-a", "v", vendor, true)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err == nil || !strings.Contains(err.Error(), "brought.tenant-a.v の CRL") {
+		t.Fatalf("Apply without the CRL: %v", err)
+	}
+	// 別の CA の CRL は断る。
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.v", e.ca.CRL(t, pkitest.CRL{Number: 1})); !IsInput(err) {
+		t.Errorf("crl of another CA: %v", err)
+	}
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.none", vendor.CRL(t, pkitest.CRL{Number: 1})); !IsInput(err) {
+		t.Errorf("unknown CA: %v", err)
+	}
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.v", vendor.CRL(t, pkitest.CRL{Number: 1})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	_, b, _ := e.svc.Store.Current("tenant-a")
+	conf := string(b[rsconf.FileConf])
+	for _, want := range []string{"client shared {", "addVendorAttribute 32473:1:'tenant-a", "CRLCheck on"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("conf does not contain %q:\n%s", want, conf)
+		}
+	}
+}
+
+func TestPutGroup(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	if _, err := e.svc.PutGroup(ctx, e.user, "tenant-a", "probe", "box", nil); !IsInput(err) {
+		t.Errorf("probe: %v", err)
+	}
+	if _, err := e.svc.PutGroup(ctx, e.user, "tenant-a", "g", "fax", nil); !IsInput(err) {
+		t.Errorf("purpose: %v", err)
+	}
+	_, key := pkitest.NewKeyPair(t)
+	csr, _ := pki.NewCSR(key, "x")
+	// AP の SAN の証明書はグループに使えない。
+	_, wrong := e.ca.SignCSR(t, pkitest.Leaf{CN: "tenant-a-g", URI: names.SANURI("example", "tenant-a", "g")}, csr)
+	if _, err := e.svc.PutGroup(ctx, e.user, "tenant-a", "g", "unifi", wrong); !IsInput(err) {
+		t.Errorf("wrong SAN: %v", err)
+	}
+	c, cert := e.ca.SignCSR(t, pkitest.Leaf{CN: "tenant-a-g", URI: names.GroupSANURI("example", "tenant-a", "g")}, csr)
+	got, err := e.svc.PutGroup(ctx, e.user, "tenant-a", "g", "unifi", cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CertSerial != pki.SerialHex(c) || got.Kind != db.KindGroup || got.NASID != "tenant-a-g" {
+		t.Errorf("group = %+v", got)
+	}
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "g", nil); !errors.Is(err, db.ErrConflict) && !IsInput(err) {
+		t.Errorf("AP named like a group: %v", err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	_, b, _ := e.svc.Store.Current("tenant-a")
+	if !strings.Contains(string(b[rsconf.FileConf]), "client grp-g {") {
+		t.Errorf("no group block:\n%s", b[rsconf.FileConf])
+	}
+}
+
+// 送信元の範囲があるテナントでは、ヘルスチェックのブロックはテナントのネットワークのサブネットだけを許す。
+func TestSourceCIDRs(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.SetTrust(ctx, e.user, "tenant-a", TrustInput{SourceCIDRs: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}}); err != nil {
+		t.Fatal(err)
+	}
+	// サブネットが分からなければ反映しない。
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err == nil || !strings.Contains(err.Error(), "サブネット") {
+		t.Fatalf("no subnet: %v", err)
+	}
+	e.agent.NetworkSubnets = []string{"172.31.83.0/24"}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	_, b, _ := e.svc.Store.Current("tenant-a")
+	conf := string(b[rsconf.FileConf])
+	ap, probe, _ := strings.Cut(conf[strings.Index(conf, "client tenant-a-ap-001"):], "client tenant-a-probe")
+	if !strings.Contains(ap, "host 203.0.113.0/24") || strings.Contains(ap, "0.0.0.0/0") {
+		t.Errorf("AP block:\n%s", ap)
+	}
+	if !strings.Contains(probe, "host 172.31.83.0/24") || strings.Contains(probe, "203.0.113") {
+		t.Errorf("probe block:\n%s", probe)
+	}
+}
+
+// CRL が切れた CA があるときの動き（§24.5）。
+func TestExpiredCRLs(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	now := time.Now()
+	e.svc.Now = func() time.Time { return now }
+	e.readyTenant(t, "tenant-a")
+	vendor := pkitest.NewCA(t, "vendor org CA")
+	if err := e.svc.SetTrust(ctx, e.user, "tenant-a", TrustInput{Brought: []BroughtInput{brought("tenant-a", "v", vendor, true)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.v", vendor.CRL(t, pkitest.CRL{Number: 1, NextUpdate: now.Add(time.Hour)})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent.TakeCalls()
+	// 持ち込みの CA の CRL が切れても、発行した CA の新しい CRL は置いて SIGHUP する（失効の反映を優先する）。
+	now = now.Add(2 * time.Hour)
+	if err := e.svc.InstallCRL(ctx, e.user, "tenant-a", e.ca.CRL(t, pkitest.CRL{Number: 2})); err != nil {
+		t.Fatal(err)
+	}
+	if calls := e.agent.TakeCalls(); !slices.Contains(calls, "sighup tenant-a") {
+		t.Errorf("no SIGHUP for the issued CRL: %v", calls)
+	}
+	_, b, _ := e.svc.Store.Current("tenant-a")
+	entries, _ := b.Trust()
+	if entries[0].CRL.Number.Int64() != 2 || entries[1].CRL.Number.Int64() != 1 {
+		t.Errorf("bundle: %v %v", entries[0].CRL.Number, entries[1].CRL.Number)
+	}
+	// 反映も止めない（こちらの AP の追加など）。
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Errorf("Apply with an expired brought CRL: %v", err)
+	}
+	// 持ち込みの CA の CRL は切れたものを置けない。
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.v", vendor.CRL(t, pkitest.CRL{Number: 2, ThisUpdate: now.Add(-48 * time.Hour), NextUpdate: now.Add(-time.Hour)})); !IsInput(err) {
+		t.Errorf("expired brought CRL: %v", err)
+	}
+	// 発行した CA の CRL が切れていれば、持ち込みの CA の新しい CRL は DB に置くが、読み込ませない（こちらの AP が切れるため）。
+	now = now.Add(30 * 24 * time.Hour)
+	e.agent.TakeCalls()
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "tenant-a", "brought.tenant-a.v", vendor.CRL(t, pkitest.CRL{Number: 3, NextUpdate: now.Add(24 * time.Hour)})); err != nil {
+		t.Fatal(err)
+	}
+	if calls := e.agent.TakeCalls(); slices.Contains(calls, "sighup tenant-a") {
+		t.Errorf("SIGHUP with an expired issued CRL: %v", calls)
+	}
+	if c, _ := e.db.CRLOf(ctx, "tenant-a", "brought.tenant-a.v"); c.Number != "3" {
+		t.Errorf("CRL is not stored: %+v", c.Number)
+	}
+	// 発行した CA の CRL が切れていれば反映は断る。
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err == nil || !strings.Contains(err.Error(), "期限") {
+		t.Errorf("Apply with an expired issued CRL: %v", err)
+	}
+	// 発行した CA の新しい CRL が届いて、次の取得の後に持ち込みの CA の CRL も入る。
+	if err := e.svc.InstallCRL(ctx, e.user, "tenant-a", e.ca.CRL(t, pkitest.CRL{Number: 3, ThisUpdate: now.Add(-time.Minute), NextUpdate: now.Add(7 * 24 * time.Hour)})); err != nil {
+		t.Fatal(err)
+	}
+	if calls := e.agent.TakeCalls(); !slices.Contains(calls, "sighup tenant-a") {
+		t.Errorf("no SIGHUP after renewal: %v", calls)
+	}
+}
+
+// CRL は CA ごとに取りに行き、1 つの CA で失敗しても、ほかの CA は続ける（§24.5）。
+func TestRefreshPerCA(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	vendor := pkitest.NewCA(t, "vendor org CA")
+	none := pkitest.NewCA(t, "no crl")
+	bodies := map[string][]byte{}
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		b, ok := bodies[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(b)
+	}))
+	defer srv.Close()
+	e.svc.CRLBaseURL = srv.URL
+	e.readyTenant(t, "tenant-a")
+	if err := e.svc.SetTrust(ctx, e.user, "tenant-a", TrustInput{Brought: []BroughtInput{brought("tenant-a", "v", vendor, true), brought("tenant-a", "n", none, false)},
+		SharedMatch: rsconf.Match{Attr: "CN", Pattern: "^[a-f0-9]{12}$"}}); err != nil {
+		t.Fatal(err)
+	}
+	// 発行した CA の口が止まっていても、持ち込みの CA の CRL は取る。CRL のない CA には取りに行かない。
+	bodies["/crl/brought.tenant-a.v.pem"] = vendor.CRL(t, pkitest.CRL{Number: 4})
+	err := e.svc.RefreshCRL(ctx, e.user, "tenant-a")
+	if err == nil {
+		t.Error("the failure of the issued CA is not reported")
+	}
+	eq(t, "paths", hits, []string{"/crl/tenant.tenant-a.pem", "/crl/brought.tenant-a.v.pem"})
+	if c, _ := e.db.CRLOf(ctx, "tenant-a", "brought.tenant-a.v"); c.Number != "4" {
+		t.Errorf("brought CRL = %+v", c)
+	}
+	if c, _ := e.db.CRL(ctx, "tenant-a"); c.LastError == "" {
+		t.Error("the failure is not recorded")
 	}
 }

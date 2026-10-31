@@ -53,6 +53,9 @@ func CheckAP(name string) error {
 	return nil
 }
 
+// CheckGroup はグループの名前を検証する（AP の名前と同じ規則。予約した probe は断る。§24.6）。
+func CheckGroup(name string) error { return CheckAP(name) }
+
 // CheckURNPrefix は SAN の URI の接頭辞（urn:<接頭辞>:nas:...）を検証する。
 func CheckURNPrefix(p string) error {
 	if !slugPattern.MatchString(p) {
@@ -85,6 +88,11 @@ func NASIdentifier(tenant, ap string) string { return tenant + "-" + ap }
 // SANURI は AP の証明書の SAN の URI（urn:<接頭辞>:nas:<テナント>:<AP>）。
 func SANURI(prefix, tenant, ap string) string {
 	return "urn:" + prefix + ":nas:" + tenant + ":" + ap
+}
+
+// GroupSANURI はグループの証明書の SAN の URI（urn:<接頭辞>:grp:<テナント>:<グループ>。§24.6）。
+func GroupSANURI(prefix, tenant, group string) string {
+	return "urn:" + prefix + ":grp:" + tenant + ":" + group
 }
 
 // SlotNames はテナントのスロットの DNS の名前（<スロット>.<テナント>.<ドメイン>）を Slots の順に返す。

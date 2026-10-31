@@ -20,6 +20,8 @@ type FakeAgent struct {
 	// LogsText はテナントごとに LogsSince が返すログ、Since は LogsSince に渡された時刻の記録。
 	LogsText map[string]string
 	Since    []time.Time
+	// NetworkSubnets はテナントのネットワークのサブネット。
+	NetworkSubnets []string
 	// ValidateOK は Validate の結果、FailEnsure は Ensure の誤り。
 	ValidateOK bool
 	FailEnsure error
@@ -46,7 +48,7 @@ func (f *FakeAgent) TakeCalls() []string {
 func (f *FakeAgent) Status(context.Context) (agent.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st := agent.Status{DockerOK: true, ImagePresent: true, NetworkPresent: true}
+	st := agent.Status{DockerOK: true, ImagePresent: true, NetworkPresent: true, NetworkSubnets: f.NetworkSubnets}
 	for _, c := range f.Containers {
 		st.Containers = append(st.Containers, *c)
 	}

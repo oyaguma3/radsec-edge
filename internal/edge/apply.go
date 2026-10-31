@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 // keepGenerations は残す版のディレクトリの数（今の版と直前の版を含む。§10.2）。
 const keepGenerations = 3
 
-// Missing は、反映に足りないもの（クライアントCA の証明書・CRL・サーバー証明書・ヘルスチェック用の証明書）を返す（§11.3）。
+// Missing は、反映に足りないもの（クライアントCA の証明書・CRL・持ち込みの CA の CRL・サーバー証明書・ヘルスチェック用の証明書）を返す（§11.3）。
 // 空なら反映できる（中身の誤りは生成のときに確かめる）。
 func (s *Service) Missing(ctx context.Context, t db.Tenant) ([]string, error) {
 	var out []string
@@ -33,6 +34,22 @@ func (s *Service) Missing(ctx context.Context, t db.Tenant) ([]string, error) {
 	}
 	if crl.PEM == "" {
 		out = append(out, "CRL")
+	}
+	brought, err := s.DB.BroughtCAs(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range brought {
+		if !b.HasCRL {
+			continue
+		}
+		c, err := s.DB.CRLOf(ctx, t.ID, b.CAID)
+		if err != nil {
+			return nil, err
+		}
+		if c.PEM == "" {
+			out = append(out, "持ち込みの CA "+b.CAID+" の CRL")
+		}
 	}
 	for _, k := range []struct {
 		kind  keystore.Kind
@@ -76,10 +93,43 @@ func (s *Service) render(ctx context.Context, t db.Tenant) (rsconf.Bundle, error
 	if err != nil {
 		return nil, err
 	}
-	in := rsconf.Input{Slug: t.Slug, URNPrefix: s.URNPrefix, Auth: t.AuthUpstream, Acct: t.AcctUpstream, Secret: s.Secret,
-		ClientCAPEM: []byte(t.ClientCAPEM), CRLPEM: []byte(crl.PEM), ServerCertPEM: []byte(t.ServerCertPEM), ServerKeyPEM: key, Now: s.Now()}
+	in := rsconf.Input{Slug: t.Slug, TenantID: t.ID, URNPrefix: s.URNPrefix, Stamp: s.Stamp, Auth: t.AuthUpstream, Acct: t.AcctUpstream, Secret: s.Secret,
+		ClientCAPEM: []byte(t.ClientCAPEM), CRLPEM: []byte(crl.PEM), ServerCertPEM: []byte(t.ServerCertPEM), ServerKeyPEM: key, Now: s.Now(),
+		SourceCIDRs: t.SourceCIDRs, SharedMatch: rsconf.Match{Attr: t.SharedMatchAttr, Pattern: t.SharedMatchPattern}}
 	for _, a := range aps {
-		in.APs = append(in.APs, a.Name)
+		if a.Kind == db.KindGroup {
+			in.Groups = append(in.Groups, a.Name)
+		} else {
+			in.APs = append(in.APs, a.Name)
+		}
+	}
+	brought, err := s.DB.BroughtCAs(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range brought {
+		c, err := s.DB.CRLOf(ctx, t.ID, b.CAID)
+		if err != nil {
+			return nil, err
+		}
+		// 持ち込みの CA の CRL が切れていても反映は止めない（その CA の AP だけが拒否される。§24.5）。警告だけを出す。
+		if c.PEM != "" && !c.NextUpdate.IsZero() && !s.Now().Before(c.NextUpdate) {
+			s.Log.Warn("the CRL of a brought CA has expired; only the APs of that CA are rejected", "tenant", t.ID, "ca", b.CAID, "next_update", c.NextUpdate)
+		}
+		in.Brought = append(in.Brought, rsconf.BroughtCA{ID: b.CAID, CertPEM: []byte(b.CertPEM), CRLPEM: []byte(c.PEM), HasCRL: b.HasCRL})
+	}
+	if len(t.SourceCIDRs) > 0 {
+		st, err := s.Agent.Status(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("agent: %w", err)
+		}
+		for _, n := range st.NetworkSubnets {
+			p, err := netip.ParsePrefix(n)
+			if err != nil {
+				return nil, fmt.Errorf("network subnet %q: %w", n, err)
+			}
+			in.ProbeCIDRs = append(in.ProbeCIDRs, p)
+		}
 	}
 	b, err := rsconf.Render(in)
 	if err != nil {

@@ -67,8 +67,8 @@ func TestCRLRevokingProbe(t *testing.T) {
 		t.Error("Status-Server was sent with a revoked probe certificate")
 	}
 	_, cur, _ := e.svc.Store.Current("tenant-a")
-	if _, crl, _ := cur.Trust(); crl.Number.Int64() != 2 {
-		t.Errorf("the CRL was not pushed: #%v", crl.Number)
+	if entries, _ := cur.Trust(); entries[0].CRL.Number.Int64() != 2 {
+		t.Errorf("the CRL was not pushed: #%v", entries[0].CRL.Number)
 	}
 	applies, _ := e.db.Applies(ctx, "tenant-a", 1)
 	if applies[0].Trigger != db.TriggerCRL || applies[0].Result != db.ResultOK {

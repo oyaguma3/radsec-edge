@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/x509"
 	"math/big"
 	"strings"
@@ -126,18 +127,92 @@ func TestCheckCRL(t *testing.T) {
 		return c
 	}
 	good := parse(ca.CRL(t, pkitest.CRL{Number: 5, Revoked: []*big.Int{big.NewInt(7)}}))
-	info, err := CheckCRL(good, ca.Cert, big.NewInt(5), now)
+	info, err := CheckCRL(good, ca.Cert, Previous{Number: big.NewInt(5)}, now)
 	if err != nil || info.Number.Int64() != 5 || info.Revoked != 1 {
 		t.Fatalf("CheckCRL = %+v, %v", info, err)
 	}
-	if _, err := CheckCRL(good, other.Cert, nil, now); err == nil {
+	if _, err := CheckCRL(good, other.Cert, Previous{}, now); err == nil {
 		t.Error("other CA accepted")
 	}
-	if _, err := CheckCRL(good, ca.Cert, big.NewInt(6), now); err == nil || !strings.Contains(err.Error(), "小さい") {
+	if _, err := CheckCRL(good, ca.Cert, Previous{Number: big.NewInt(6)}, now); err == nil || !strings.Contains(err.Error(), "小さい") {
 		t.Errorf("older number: %v", err)
 	}
 	expired := parse(ca.CRL(t, pkitest.CRL{Number: 6, ThisUpdate: now.Add(-48 * time.Hour), NextUpdate: now.Add(-time.Hour)}))
-	if _, err := CheckCRL(expired, ca.Cert, nil, now); err == nil || !strings.Contains(err.Error(), "期限") {
+	if _, err := CheckCRL(expired, ca.Cert, Previous{}, now); err == nil || !strings.Contains(err.Error(), "期限") {
 		t.Errorf("expired: %v", err)
+	}
+}
+
+// 番号のない CRL（業者の CRL にありうる）は受け、thisUpdate の後退を断る（設計概要 §24.5）。
+func TestCheckCRLWithoutNumber(t *testing.T) {
+	ca := pkitest.NewCA(t, "vendor")
+	now := time.Now()
+	crl, err := ParseCRL(ca.CRL(t, pkitest.CRL{Number: 1, ThisUpdate: now.Add(-time.Hour)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	crl.Number = nil // 署名は RawTBS で確かめるので、読んだ値だけを番号なしにする
+	info, err := CheckCRL(crl, ca.Cert, Previous{}, now)
+	if err != nil || info.Number != nil {
+		t.Fatalf("no number: %+v, %v", info, err)
+	}
+	if _, err := CheckCRL(crl, ca.Cert, Previous{Number: big.NewInt(9), ThisUpdate: now.Add(-2 * time.Hour)}, now); err != nil {
+		t.Errorf("newer thisUpdate: %v", err)
+	}
+	if _, err := CheckCRL(crl, ca.Cert, Previous{ThisUpdate: now.Add(-time.Minute)}, now); err == nil || !strings.Contains(err.Error(), "古い") {
+		t.Errorf("older thisUpdate: %v", err)
+	}
+	// 今の CRL に番号がなく、新しい CRL に番号があるときも thisUpdate で比べる。
+	numbered, _ := ParseCRL(ca.CRL(t, pkitest.CRL{Number: 2, ThisUpdate: now.Add(-3 * time.Hour)}))
+	if _, err := CheckCRL(numbered, ca.Cert, Previous{ThisUpdate: now.Add(-time.Hour)}, now); err == nil {
+		t.Error("older numbered CRL accepted")
+	}
+}
+
+func TestCheckBroughtCA(t *testing.T) {
+	now := time.Now()
+	root := pkitest.NewCA(t, "root")
+	mid := root.NewIntermediate(t, "org CA")
+	if IsSelfSigned(mid.Cert) || !IsSelfSigned(root.Cert) {
+		t.Error("IsSelfSigned")
+	}
+	if err := CheckBroughtCA(mid.Cert, true, now); err != nil {
+		t.Errorf("intermediate: %v", err)
+	}
+	if err := CheckBroughtCA(mid.Cert, true, now.AddDate(20, 0, 0)); err == nil {
+		t.Error("expired accepted")
+	}
+	if err := CheckBroughtCA(mid.Cert, true, time.Time{}); err != nil {
+		t.Errorf("no time: %v", err)
+	}
+	noCRLSign := *mid.Cert
+	noCRLSign.KeyUsage = x509.KeyUsageCertSign
+	if err := CheckBroughtCA(&noCRLSign, true, now); err == nil || !strings.Contains(err.Error(), "cRLSign") {
+		t.Errorf("no cRLSign: %v", err)
+	}
+	if err := CheckBroughtCA(&noCRLSign, false, now); err != nil {
+		t.Errorf("no cRLSign without a CRL: %v", err)
+	}
+	notCA := *mid.Cert
+	notCA.IsCA = false
+	if err := CheckBroughtCA(&notCA, false, now); err == nil {
+		t.Error("not a CA accepted")
+	}
+}
+
+// radsec-ca の上限（DER で 8 MiB）の CRL を受けられる大きさにする。証明書は 1 MiB のまま。
+func TestSizeLimits(t *testing.T) {
+	big1 := bytes.Repeat([]byte("a"), maxPEMBytes+1)
+	if _, err := ParseCert(big1); err == nil || !strings.Contains(err.Error(), "大きすぎ") {
+		t.Errorf("large cert: %v", err)
+	}
+	if _, err := ParseCRL(big1); err == nil || strings.Contains(err.Error(), "大きすぎ") {
+		t.Errorf("1 MiB CRL hit the limit: %v", err)
+	}
+	if _, err := ParseCRL(bytes.Repeat([]byte("a"), MaxCRLBytes+1)); err == nil || !strings.Contains(err.Error(), "大きすぎ") {
+		t.Errorf("large CRL: %v", err)
+	}
+	if MaxCRLBytes < 8<<20*4/3+1<<20 {
+		t.Errorf("MaxCRLBytes %d is too small for an 8 MiB DER CRL in PEM", MaxCRLBytes)
 	}
 }

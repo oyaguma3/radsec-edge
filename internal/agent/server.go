@@ -158,6 +158,12 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "inspect network", err)
 		return
 	}
+	if st.NetworkPresent {
+		if st.NetworkSubnets, err = s.docker.NetworkSubnets(ctx, s.network); err != nil {
+			s.fail(w, r, "inspect network", err)
+			return
+		}
+	}
 	cs, err := s.docker.List(ctx, LabelTenant)
 	if err != nil {
 		s.fail(w, r, "list containers", err)

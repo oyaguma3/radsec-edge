@@ -61,6 +61,34 @@ func NewCA(t testing.TB, cn string) *CA {
 	return &CA{Cert: c, Key: key, PEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
 }
 
+// NewIntermediate は、ca が署名した自己署名でない CA を作る（Meraki の形）。
+func (ca *CA) NewIntermediate(t testing.TB, cn string) *CA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial(t),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.AddDate(5, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, &key.PublicKey, ca.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &CA{Cert: c, Key: key, PEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
+}
+
 // Leaf は発行する証明書の中身。
 type Leaf struct {
 	CN     string

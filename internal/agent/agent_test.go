@@ -114,8 +114,7 @@ func newFixture(t *testing.T, tenantsDir, slug string) *fixture {
 	key, _ := pki.NewKey()
 	csr, _ := pki.NewCSR(key, "x")
 	_, cert := serverCA.SignCSR(t, pkitest.Leaf{DNS: names.SlotNames(slug, "radsec.test"), Server: true}, csr)
-	return &fixture{ca: ca, store: rsconf.Store{Root: tenantsDir}, in: rsconf.Input{
-		Slug: slug, URNPrefix: "example", APs: []string{"ap-001"},
+	return &fixture{ca: ca, store: rsconf.Store{Root: tenantsDir}, in: rsconf.Input{Slug: slug, TenantID: slug, Stamp: rsconf.Stamp{VendorID: 32473, VendorType: 1}, URNPrefix: "example", APs: []string{"ap-001"},
 		// 届かない上流でよい（radsecproxy は起動のときに上流に届かなくても終了しない）。
 		Auth: netip.MustParseAddrPort("192.0.2.10:1812"), Acct: netip.MustParseAddrPort("192.0.2.10:1813"),
 		Secret: "upsecret-123", ClientCAPEM: ca.PEM, CRLPEM: ca.CRL(t, pkitest.CRL{Number: 1}),

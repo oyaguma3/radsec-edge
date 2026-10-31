@@ -50,6 +50,7 @@ func dockerEnv(t *testing.T) *env {
 		exec.Command("docker", "network", "rm", network).Run()
 	})
 	e := newEnv(t)
+	e.network = network
 	tenantsDir := t.TempDir()
 	os.Chmod(tenantsDir, 0o755)
 	// 試験ではファイルは試験を動かす利用者のものなので、radsecproxy（10083）が読めるようにする。

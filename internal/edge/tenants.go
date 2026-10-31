@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/oyaguma3/radsec-edge/internal/agent"
@@ -13,6 +14,7 @@ import (
 	"github.com/oyaguma3/radsec-edge/internal/keystore"
 	"github.com/oyaguma3/radsec-edge/internal/names"
 	"github.com/oyaguma3/radsec-edge/internal/pki"
+	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 )
 
 // TenantInput はテナントを作る・変えるときの値。
@@ -312,6 +314,130 @@ func (s *Service) PutAP(ctx context.Context, a Actor, id, name string, certPEMDa
 	}
 	s.audit(ctx, a, "ap.put", id+"/"+name, map[string]any{"nas_id": ap.NASID, "cert_serial": ap.CertSerial})
 	return ap, nil
+}
+
+// グループの用途（表示だけ。§24.6）。
+var groupPurposes = []string{"box", "unifi", "extreme", "aruba", "mist", "other"}
+
+// PutGroup はグループを登録する（AP のグループで共有する証明書。Box を含む。§24.3）。certPEM があれば、テナントのクライアントCA が
+// 発行したグループの証明書であることを確かめ、シリアル番号と期限を残す。名前は AP と重ならない。
+func (s *Service) PutGroup(ctx context.Context, a Actor, id, name, purpose string, certPEMData []byte) (db.AP, error) {
+	if err := names.CheckGroup(name); err != nil {
+		return db.AP{}, invalid("グループの名前は、%v", err)
+	}
+	if !slices.Contains(groupPurposes, purpose) {
+		return db.AP{}, invalid("グループの用途は %s のどれかにしてください", strings.Join(groupPurposes, "・"))
+	}
+	t, err := s.DB.Tenant(ctx, id)
+	if err != nil {
+		return db.AP{}, err
+	}
+	g := db.AP{TenantID: id, Name: name, Kind: db.KindGroup, Purpose: purpose}
+	if strings.TrimSpace(string(certPEMData)) != "" {
+		c, err := pki.ParseCert(certPEMData)
+		if err != nil {
+			return db.AP{}, invalid("グループの証明書: %v", err)
+		}
+		if t.ClientCAPEM == "" {
+			return db.AP{}, invalid("先にクライアントCA の証明書を取り込んでください")
+		}
+		ca, err := pki.ParseCert([]byte(t.ClientCAPEM))
+		if err != nil {
+			return db.AP{}, err
+		}
+		if err := pki.CheckClientCert(c, ca, names.GroupSANURI(s.URNPrefix, t.Slug, name), s.Now()); err != nil {
+			return db.AP{}, invalid("グループの証明書: %v", err)
+		}
+		g.CertSerial, g.CertNotAfter = pki.SerialHex(c), c.NotAfter
+	}
+	g, err = s.DB.PutAP(ctx, g)
+	if err != nil {
+		return db.AP{}, conflict(err, "名前か NAS-Identifier が、ほかの AP やグループと重なっています")
+	}
+	s.audit(ctx, a, "group.put", id+"/"+name, map[string]any{"nas_id": g.NASID, "purpose": purpose, "cert_serial": g.CertSerial})
+	return g, nil
+}
+
+// BroughtInput は持ち込みの CA の宣言（§24.6）。自己署名かは証明書からエッジが判定するので、受け取らない。
+type BroughtInput struct {
+	CAID    string
+	CertPEM []byte
+	HasCRL  bool
+}
+
+// TrustInput はテナントの受け口の宣言（§24.6）。持ち込みの CA の一覧はまるごと置き換える。
+type TrustInput struct {
+	Brought     []BroughtInput
+	SourceCIDRs []netip.Prefix
+	SharedMatch rsconf.Match
+}
+
+// SetTrust は、テナントの持ち込みの CA の一覧、送信元の範囲、共通のブロックの照合の形を置き換える（§24.3、§24.6）。次の反映で効く。
+// 一覧から外した CA の CRL は消す。CA の証明書を取り込むときに期限を確かめ、同じ Subject の CA は断る（束に並べると、片方の CA の正当な AP が
+// 拒否されるため。aka-mvpset の verify/r11）。
+func (s *Service) SetTrust(ctx context.Context, a Actor, id string, in TrustInput) error {
+	defer s.lock(id)()
+	t, err := s.DB.Tenant(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(in.SourceCIDRs) > rsconf.MaxSourceCIDRs {
+		return invalid("送信元の範囲は %d 個までにしてください", rsconf.MaxSourceCIDRs)
+	}
+	for _, p := range in.SourceCIDRs {
+		if !p.IsValid() {
+			return invalid("送信元の範囲が正しくありません")
+		}
+	}
+	if in.SharedMatch != (rsconf.Match{}) {
+		if err := rsconf.CheckMatch(in.SharedMatch); err != nil {
+			return invalid("%v", err)
+		}
+	}
+	subjects := map[string]string{}
+	if t.ClientCAPEM != "" {
+		ca, err := pki.ParseCert([]byte(t.ClientCAPEM))
+		if err != nil {
+			return err
+		}
+		subjects[string(ca.RawSubject)] = "クライアントCA"
+	}
+	prefix := "brought." + t.Slug + "."
+	var cas []db.BroughtCA
+	needMatch := false
+	var details []map[string]any
+	for _, b := range in.Brought {
+		name, ok := strings.CutPrefix(b.CAID, prefix)
+		if !ok || !names.ValidSlug(name) {
+			return invalid("持ち込みの CA の ID は %s<名前> にしてください（%s）", prefix, b.CAID)
+		}
+		c, err := pki.ParseCert(b.CertPEM)
+		if err != nil {
+			return invalid("持ち込みの CA %s の証明書: %v", b.CAID, err)
+		}
+		if err := pki.CheckBroughtCA(c, b.HasCRL, s.Now()); err != nil {
+			return invalid("持ち込みの CA %s: %v", b.CAID, err)
+		}
+		if other, dup := subjects[string(c.RawSubject)]; dup {
+			return invalid("持ち込みの CA %s の Subject が %s と同じです（同じ Subject の CA は束に並べられません）", b.CAID, other)
+		}
+		subjects[string(c.RawSubject)] = b.CAID
+		needMatch = needMatch || !b.HasCRL
+		cas = append(cas, db.BroughtCA{TenantID: id, CAID: b.CAID, CertPEM: certPEM(c.Raw), HasCRL: b.HasCRL})
+		details = append(details, map[string]any{"ca": b.CAID, "subject": c.Subject.String(), "serial": pki.SerialHex(c), "has_crl": b.HasCRL, "self_signed": pki.IsSelfSigned(c)})
+	}
+	if needMatch && in.SharedMatch == (rsconf.Match{}) {
+		return invalid("CRL のない持ち込みの CA があるときは、共通のブロックの照合の形が要ります")
+	}
+	if err := s.DB.SetTrust(ctx, id, cas, in.SourceCIDRs, in.SharedMatch.Attr, in.SharedMatch.Pattern); err != nil {
+		return err
+	}
+	var cidrs []string
+	for _, p := range in.SourceCIDRs {
+		cidrs = append(cidrs, p.String())
+	}
+	s.audit(ctx, a, "tenant.trust", id, map[string]any{"brought": details, "source_cidrs": cidrs, "shared_match_attr": in.SharedMatch.Attr, "shared_match_pattern": in.SharedMatch.Pattern})
+	return nil
 }
 
 // DeleteAP は AP を消す（次の反映で client ブロックが消える。すぐに効かせるには、CA で証明書を失効させる。§11.1）。

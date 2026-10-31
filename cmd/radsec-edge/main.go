@@ -107,11 +107,12 @@ func serve(ctx context.Context) error {
 		Log: log, DB: d, Agent: agent.NewClient(cfg.AgentSocket),
 		Store: rsconf.Store{Root: cfg.TenantsDir}, Keys: keystore.Store{Dir: filepath.Join(cfg.DataDir, "keys")},
 		URNPrefix: cfg.URNPrefix, DNSDomain: cfg.DNSDomain, Secret: cfg.Upstream.Secret, CRLBaseURL: cfg.CRLBaseURL,
-		ProbeTimeout: cfg.ProbeTimeout,
+		ProbeTimeout: cfg.ProbeTimeout, Stamp: rsconf.Stamp{VendorID: cfg.StampVendorID, VendorType: cfg.StampVendorType},
 	})
 	log.Info("edge", "tenants_dir", cfg.TenantsDir, "agent_socket", cfg.AgentSocket, "urn_prefix", cfg.URNPrefix,
 		"dns_domain", cfg.DNSDomain, "crl_base_url", cfg.CRLBaseURL, "reconcile_interval", cfg.ReconcileInterval.String(),
-		"crl_interval", cfg.CRLInterval.String())
+		"crl_interval", cfg.CRLInterval.String(),
+		"stamp_vendor_id", cfg.StampVendorID, "stamp_vendor_type", cfg.StampVendorType)
 	go svc.Run(ctx, cfg.ReconcileInterval, cfg.CRLInterval)
 
 	ident, err := newIdentifier(ctx, cfg, log)

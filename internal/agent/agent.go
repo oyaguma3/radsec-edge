@@ -3,7 +3,7 @@
 //
 // agent は unix ソケットで決まった操作だけを受け付け、テナントの radsecproxy のコンテナを固定のひな形（§10.2）から作る。
 // 要求からは、イメージ・マウント・権限を指定させない（radsec-edge が乗っ取られても、勝手なコンテナは作れない）。
-// 要求で受け取るのは、テナントの ID と slug（§8.1 の規則）、ポート（20830〜20999）、版の名前（16 進 16 桁）、ログの行数だけ。
+// 要求で受け取るのは、テナントの ID と slug（§8.1 の規則）、ポート（20000〜21999）、版の名前（16 進 16 桁）、ログの行数だけ。
 package agent
 
 import (
@@ -39,8 +39,8 @@ const (
 	// confPath は radsecproxy の設定（MountTarget/current/radsecproxy.conf）。
 	confPath = "/conf/current/radsecproxy.conf"
 	// ポートの範囲。
-	PortMin = 20830
-	PortMax = 20999
+	PortMin = 20000
+	PortMax = 21999
 	// stopTimeout は停止の猶予（init を使うので、radsecproxy は SIGTERM ですぐ止まる。§18.1 の V6）。
 	stopTimeout = 10 * time.Second
 	// validateTimeout は構文検査の上限。
@@ -69,10 +69,12 @@ type Container struct {
 
 // Status は agent と Docker の状態。
 type Status struct {
-	Version        string      `json:"version"`
-	DockerOK       bool        `json:"docker_ok,omitzero"`
-	DockerError    string      `json:"docker_error,omitempty"`
-	Image          string      `json:"image"`
+	Version     string `json:"version"`
+	DockerOK    bool   `json:"docker_ok,omitzero"`
+	DockerError string `json:"docker_error,omitempty"`
+	Image       string `json:"image"`
+	// NetworkSubnets はテナントのネットワークのサブネット（ヘルスチェックの送信元。送信元の範囲を持つテナントで使う。§24.3）。
+	NetworkSubnets []string    `json:"network_subnets,omitempty"`
 	ImagePresent   bool        `json:"image_present,omitzero"`
 	Network        string      `json:"network"`
 	NetworkPresent bool        `json:"network_present,omitzero"`

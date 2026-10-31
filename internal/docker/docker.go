@@ -264,7 +264,7 @@ func demux(r io.Reader) (string, error) {
 	}
 }
 
-// ImageExists はイメージがあるか。ref（例 radsec-edge/radsecproxy:1.11.2-1-deb13u1）は / を含むのでエスケープしない
+// ImageExists はイメージがあるか。ref（例 radsec-edge/radsecproxy:1.11.4-pc1）は / を含むのでエスケープしない
 // （呼び出し側が決まった値だけを渡す）。
 func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 	err := c.do(ctx, http.MethodGet, "/images/"+ref+"/json", nil, nil, nil)
@@ -272,6 +272,27 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// NetworkSubnets はネットワークのサブネット（CIDR）を返す。
+func (c *Client) NetworkSubnets(ctx context.Context, name string) ([]string, error) {
+	var in struct {
+		IPAM struct {
+			Config []struct {
+				Subnet string `json:"Subnet"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/networks/"+url.PathEscape(name), nil, nil, &in); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, x := range in.IPAM.Config {
+		if x.Subnet != "" {
+			out = append(out, x.Subnet)
+		}
+	}
+	return out, nil
 }
 
 // NetworkExists はネットワークがあるか。

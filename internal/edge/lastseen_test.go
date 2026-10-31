@@ -92,3 +92,31 @@ func TestRefreshLastSeen(t *testing.T) {
 		t.Error("logs of a stopped container were read")
 	}
 }
+
+// グループはブロックの名前（grp-<グループ>）と CN（<slug>-<グループ>）で引く。共通のブロックは送信元の IP ごとの出来事にする（§24.3）。
+func TestParseSeenGroupAndShared(t *testing.T) {
+	logs := `2027-01-15T08:00:01.000000000Z Fri Jan 15 08:00:01 2027: tlsservernew: TLS connection from 192.0.2.7, client grp-unifi, subject CN=tenant-a-unifi, TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 up
+2027-01-15T08:00:02.000000000Z Fri Jan 15 08:00:02 2027: verify error: num=23:certificate revoked:depth=0:CN=tenant-a-unifi
+2027-01-15T08:00:03.000000000Z Fri Jan 15 08:00:03 2027: tlsservernew: TLS connection from 198.51.100.9, client shared, subject CN=aabbccddeeff, TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 up
+2027-01-15T08:00:04.000000000Z Fri Jan 15 08:00:04 2027: tlsserverrd: connection from 198.51.100.9, client shared lost
+2027-01-15T08:00:05.000000000Z Fri Jan 15 08:00:05 2027: tlsserverrd: connection from 192.0.2.7, client grp-unifi lost
+2027-01-15T08:00:06.000000000Z Fri Jan 15 08:00:06 2027: verify error: num=23:certificate revoked:depth=0:CN=aabbccddeeff
+`
+	events, _ := parseSeen(logs, map[string]string{"tenant-a-unifi": "unifi", "grp-unifi": "unifi"})
+	want := []db.SeenEvent{
+		{AP: "unifi", Kind: db.SeenUp, IP: "192.0.2.7"},
+		{AP: "unifi", Kind: db.SeenReject},
+		{Shared: true, Kind: db.SeenUp, IP: "198.51.100.9"},
+		{Shared: true, Kind: db.SeenDown, IP: "198.51.100.9"},
+		{AP: "unifi", Kind: db.SeenDown},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("events = %+v", events)
+	}
+	for i, w := range want {
+		e := events[i]
+		if e.AP != w.AP || e.Shared != w.Shared || e.Kind != w.Kind || e.IP != w.IP {
+			t.Errorf("event %d = %+v, want %+v", i, e, w)
+		}
+	}
+}

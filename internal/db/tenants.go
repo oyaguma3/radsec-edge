@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/names"
@@ -19,9 +20,13 @@ type Tenant struct {
 	Port int
 	// AuthUpstream と AcctUpstream は上流の認証と課金（IP アドレスとポート）。
 	AuthUpstream, AcctUpstream netip.AddrPort
-	// CRLURL は CRL の取得先（空なら EDGE_CRL_BASE_URL から決める）。
+	// CRLURL は発行した CA の CRL の取得先（空なら EDGE_CRL_BASE_URL から決める）。
 	CRLURL string
-	// ClientCAPEM はテナントのクライアントCA の証明書、ServerCertPEM はテナントのサーバー証明書、
+	// SourceCIDRs は許す送信元のアドレスの範囲（空なら制限なし。§24.3）。
+	SourceCIDRs []netip.Prefix
+	// SharedMatchAttr と SharedMatchPattern は共通のブロックの照合の形（空なら条件なし。§24.3）。
+	SharedMatchAttr, SharedMatchPattern string
+	// ClientCAPEM はテナントのクライアントCA（発行した CA）の証明書、ServerCertPEM はテナントのサーバー証明書、
 	// ProbeCertPEM はヘルスチェック用の証明書（どれも PEM。まだなければ空）。
 	ClientCAPEM, ServerCertPEM, ProbeCertPEM string
 	// Enabled は運用の状態（停止・起動）。望む状態の版には入れない（SetEnabled）。
@@ -37,18 +42,23 @@ type Tenant struct {
 func (t Tenant) Pending() bool { return t.AppliedVersion < t.DesiredVersion }
 
 const tenantColumns = `id, slug, port, auth_upstream, acct_upstream, crl_url, client_ca_pem, server_cert_pem, probe_cert_pem,
-	enabled, desired_version, applied_version, applied_hash, applied_port, applied_at, created_at, updated_at`
+	enabled, desired_version, applied_version, applied_hash, applied_port, applied_at, created_at, updated_at,
+	source_cidrs, shared_match_attr, shared_match_pattern`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanTenant(s scanner) (Tenant, error) {
 	var t Tenant
-	var auth, acct string
+	var auth, acct, cidrs string
 	var applied, created, updated int64
 	err := s.Scan(&t.ID, &t.Slug, &t.Port, &auth, &acct, &t.CRLURL, &t.ClientCAPEM, &t.ServerCertPEM, &t.ProbeCertPEM,
-		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &t.AppliedPort, &applied, &created, &updated)
+		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &t.AppliedPort, &applied, &created, &updated,
+		&cidrs, &t.SharedMatchAttr, &t.SharedMatchPattern)
 	if err != nil {
 		return Tenant{}, err
+	}
+	if t.SourceCIDRs, err = parseCIDRs(cidrs); err != nil {
+		return Tenant{}, fmt.Errorf("tenant %s: source_cidrs: %w", t.ID, err)
 	}
 	if t.AuthUpstream, err = netip.ParseAddrPort(auth); err != nil {
 		return Tenant{}, fmt.Errorf("tenant %s: auth_upstream: %w", t.ID, err)
@@ -58,6 +68,31 @@ func scanTenant(s scanner) (Tenant, error) {
 	}
 	t.AppliedAt, t.CreatedAt, t.UpdatedAt = fromMillis(applied), fromMillis(created), fromMillis(updated)
 	return t, nil
+}
+
+// parseCIDRs はカンマ区切りの範囲を読む。
+func parseCIDRs(s string) ([]netip.Prefix, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for v := range strings.SplitSeq(s, ",") {
+		p, err := netip.ParsePrefix(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// joinCIDRs は範囲をカンマ区切りにする。
+func joinCIDRs(ps []netip.Prefix) string {
+	var out []string
+	for _, p := range ps {
+		out = append(out, p.String())
+	}
+	return strings.Join(out, ",")
 }
 
 // Tenants はすべてのテナントを slug の順に返す。
@@ -113,8 +148,8 @@ func (s TenantSpec) check() error {
 	if !names.ValidSlug(s.ID) {
 		return fmt.Errorf("id: %w", names.ErrSlug)
 	}
-	if s.Port < 20830 || s.Port > 20999 {
-		return errors.New("port: must be between 20830 and 20999")
+	if s.Port < 20000 || s.Port > 21999 {
+		return errors.New("port: must be between 20000 and 21999")
 	}
 	if !s.AuthUpstream.IsValid() || !s.AcctUpstream.IsValid() {
 		return errors.New("upstream: must be an IP address and port")
@@ -152,7 +187,7 @@ func (d *DB) CreateTenant(ctx context.Context, s TenantSpec) (Tenant, error) {
 }
 
 // UpdateTenant は、テナントを読んで fn で変え、望む状態の版を 1 増やして書き戻す。fn が変えてよいのは
-// ポート、上流、CRL の取得先、証明書だけ（ID・slug・有効・無効は変えない）。fn がエラーを返したら何もしない。
+// ポート、上流、CRL の取得先、証明書、送信元の範囲、共通のブロックの照合の形だけ（ID・slug・有効・無効は変えない）。fn がエラーを返したら何もしない。
 func (d *DB) UpdateTenant(ctx context.Context, id string, fn func(*Tenant) error) (Tenant, error) {
 	var out Tenant
 	err := d.tx(ctx, func(tx *sql.Tx) error {
@@ -168,10 +203,10 @@ func (d *DB) UpdateTenant(ctx context.Context, id string, fn func(*Tenant) error
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE tenants SET port = ?, auth_upstream = ?, acct_upstream = ?, crl_url = ?,
-			client_ca_pem = ?, server_cert_pem = ?, probe_cert_pem = ?,
+			client_ca_pem = ?, server_cert_pem = ?, probe_cert_pem = ?, source_cidrs = ?, shared_match_attr = ?, shared_match_pattern = ?,
 			desired_version = desired_version + 1, updated_at = ? WHERE id = ?`,
 			t.Port, t.AuthUpstream.String(), t.AcctUpstream.String(), t.CRLURL, t.ClientCAPEM, t.ServerCertPEM, t.ProbeCertPEM,
-			millis(d.now()), id)
+			joinCIDRs(t.SourceCIDRs), t.SharedMatchAttr, t.SharedMatchPattern, millis(d.now()), id)
 		if isUnique(err) {
 			return fmt.Errorf("%w: the port is already used", ErrConflict)
 		}

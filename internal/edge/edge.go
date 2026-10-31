@@ -39,6 +39,12 @@ type Agent interface {
 // ProbeFunc はヘルスチェックの 1 回の試み（probe.Check と同じ形）。
 type ProbeFunc func(ctx context.Context, addr string, cert tls.Certificate, serverCert *x509.Certificate) error
 
+// 刻印の既定（RFC 5612 の文書用の Vendor-Id。実運用では IANA から取得した PEN。§24.2）。
+const (
+	DefaultStampVendorID   = 32473
+	DefaultStampVendorType = 1
+)
+
 // Options は Service の設定。
 type Options struct {
 	Log   *slog.Logger
@@ -51,6 +57,8 @@ type Options struct {
 	URNPrefix, DNSDomain string
 	// Secret は上流との共有シークレット（EDGE_UPSTREAM_SECRET）。
 	Secret string
+	// Stamp はテナントの刻印の VSA（EDGE_STAMP_VENDOR_ID、EDGE_STAMP_VENDOR_TYPE。ゼロ値なら 32473 と 1。§24.2）。
+	Stamp rsconf.Stamp
 	// CRLBaseURL は CRL の配布の口（EDGE_CRL_BASE_URL。空ならテナントごとの取得先だけ）。
 	CRLBaseURL string
 	// HTTPClient は CRL の取得に使う。nil なら上限 30 秒のクライアント。
@@ -96,6 +104,9 @@ func New(o Options) *Service {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.Stamp == (rsconf.Stamp{}) {
+		o.Stamp = rsconf.Stamp{VendorID: DefaultStampVendorID, VendorType: DefaultStampVendorType}
 	}
 	return &Service{Options: o}
 }

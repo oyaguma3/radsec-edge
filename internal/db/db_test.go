@@ -3,7 +3,9 @@ package db
 import (
 	"errors"
 	"net/netip"
+	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -37,7 +39,7 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("second Migrate = %v, %v", applied, err)
 	}
 	v, err := d.SchemaVersion(t.Context())
-	if err != nil || v != 2 {
+	if err != nil || v != 3 {
 		t.Fatalf("SchemaVersion = %d, %v", v, err)
 	}
 	// 新しい版で移行した DB は、古い版では使わない。
@@ -73,12 +75,12 @@ func TestTenants(t *testing.T) {
 		t.Errorf("duplicate port: %v", err)
 	}
 	// 規則に合わない名前とポートは断る。
-	for _, s := range []TenantSpec{spec("Bad", 20832), spec("ok", 20000), {ID: "ok", Slug: "ok", Port: 20832}} {
+	for _, s := range []TenantSpec{spec("Bad", 20832), spec("ok", 19999), {ID: "ok", Slug: "ok", Port: 20832}} {
 		if _, err := d.CreateTenant(ctx, s); err == nil {
 			t.Errorf("CreateTenant(%+v) = nil", s)
 		}
 	}
-	p, err := d.FreePort(ctx, 20830, 20999)
+	p, err := d.FreePort(ctx, 20830, 21999)
 	if err != nil || p != 20831 {
 		t.Errorf("FreePort = %d, %v", p, err)
 	}
@@ -247,7 +249,7 @@ func TestSeen(t *testing.T) {
 		{AP: "ap-2", Kind: SeenReject, At: t0},
 		{AP: "ap-1", Kind: SeenDown, At: t0.Add(time.Minute)},
 		{AP: "ap-1", Kind: SeenUp, At: t0.Add(2 * time.Minute), IP: "192.0.2.2"},
-	}, cursor)
+	}, cursor, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,5 +262,211 @@ func TestSeen(t *testing.T) {
 	}
 	if c, _ := d.LogCursor(ctx, "a"); !c.Equal(cursor) {
 		t.Errorf("LogCursor = %v", c)
+	}
+}
+
+// 共通のブロックの接続は送信元の IP ごとに数え、コンテナを起動し直したら数え直し、テナントごとに上限まで残す。
+func TestSharedSeen(t *testing.T) {
+	d := open(t)
+	ctx := t.Context()
+	if _, err := d.CreateTenant(ctx, spec("a", 20830)); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.UnixMilli(1_800_000_000_000)
+	err := d.ApplySeen(ctx, "a", []SeenEvent{
+		{Shared: true, Kind: SeenUp, At: t0, IP: "192.0.2.1"},
+		{Shared: true, Kind: SeenUp, At: t0.Add(time.Second), IP: "192.0.2.1"},
+		{Shared: true, Kind: SeenUp, At: t0.Add(2 * time.Second), IP: "192.0.2.2"},
+		{Shared: true, Kind: SeenDown, At: t0.Add(3 * time.Second), IP: "192.0.2.1"},
+		{Shared: true, Kind: SeenDown, At: t0.Add(4 * time.Second), IP: "192.0.2.2"},
+		{Shared: true, Kind: SeenDown, At: t0.Add(5 * time.Second), IP: "192.0.2.2"}, // 数は 0 より下がらない
+	}, t0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.SharedSeens(ctx, "a")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("SharedSeens = %+v, %v", got, err)
+	}
+	if got[0].IP != "192.0.2.2" || got[0].Connections != 0 || got[1].IP != "192.0.2.1" || got[1].Connections != 1 || !got[1].LastDown.Equal(t0.Add(3*time.Second)) {
+		t.Errorf("seen = %+v", got)
+	}
+	// 共通のブロックの出来事は、AP の行に入らない。
+	if s, _ := d.Seen(ctx, "a"); len(s) != 0 {
+		t.Errorf("ap_seen = %+v", s)
+	}
+	// コンテナを起動し直した後は数え直す。
+	if err := d.ApplySeen(ctx, "a", []SeenEvent{{Shared: true, Kind: SeenUp, At: t0.Add(time.Hour), IP: "192.0.2.2"}}, t0, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = d.SharedSeens(ctx, "a")
+	if got[0].IP != "192.0.2.2" || got[0].Connections != 1 || got[1].Connections != 0 {
+		t.Errorf("after restart = %+v", got)
+	}
+	// 上限まで残す（新しいものを残す）。
+	var ev []SeenEvent
+	for i := range keepSharedSeen + 5 {
+		ev = append(ev, SeenEvent{Shared: true, Kind: SeenUp, At: t0.Add(time.Duration(i+10) * time.Hour), IP: "10.0." + strconv.Itoa(i/256) + "." + strconv.Itoa(i%256)})
+	}
+	if err := d.ApplySeen(ctx, "a", ev, t0, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = d.SharedSeens(ctx, "a")
+	if len(got) != keepSharedSeen || got[0].IP != ev[len(ev)-1].IP {
+		t.Errorf("kept %d, first %s", len(got), got[0].IP)
+	}
+}
+
+func TestSetTrust(t *testing.T) {
+	d := open(t)
+	ctx := t.Context()
+	tn, err := d.CreateTenant(ctx, spec("a", 20830))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cidrs := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("2001:db8::/32")}
+	cas := []BroughtCA{{CAID: "brought.a.x", CertPEM: "x", HasCRL: true}, {CAID: "brought.a.y", CertPEM: "y"}}
+	if err := d.SetTrust(ctx, "a", cas, cidrs, "CN", "^a$"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Tenant(ctx, "a")
+	if got.DesiredVersion != tn.DesiredVersion+1 || len(got.SourceCIDRs) != 2 || got.SourceCIDRs[1] != cidrs[1] || got.SharedMatchAttr != "CN" || got.SharedMatchPattern != "^a$" {
+		t.Errorf("tenant = %+v", got)
+	}
+	list, _ := d.BroughtCAs(ctx, "a")
+	if len(list) != 2 || list[0].CAID != "brought.a.x" || !list[0].HasCRL || list[1].HasCRL {
+		t.Errorf("cas = %+v", list)
+	}
+	for _, id := range []string{"", "brought.a.x", "brought.a.y"} {
+		if err := d.PutCRL(ctx, CRL{TenantID: "a", CAID: id, PEM: "p" + id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// CRL は CA ごとに持つ。一覧から外した CA と、証明書を替えた CA の CRL は消える。発行した CA の CRL は残る。
+	if c, _ := d.CRLOf(ctx, "a", "brought.a.x"); c.PEM != "pbrought.a.x" {
+		t.Errorf("crl = %+v", c)
+	}
+	if err := d.SetTrust(ctx, "a", []BroughtCA{{CAID: "brought.a.x", CertPEM: "x2", HasCRL: true}}, nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]string{"": "p", "brought.a.x": "", "brought.a.y": ""} {
+		if c, _ := d.CRLOf(ctx, "a", id); c.PEM != want {
+			t.Errorf("crl %q = %q", id, c.PEM)
+		}
+	}
+	got, _ = d.Tenant(ctx, "a")
+	if len(got.SourceCIDRs) != 0 {
+		t.Errorf("cidrs = %v", got.SourceCIDRs)
+	}
+	if err := d.SetTrust(ctx, "none", nil, nil, "", ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("no tenant: %v", err)
+	}
+	// テナントを消すと一緒に消える。
+	if err := d.DeleteTenant(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := d.BroughtCAs(ctx, "a"); len(list) != 0 {
+		t.Errorf("after delete: %+v", list)
+	}
+}
+
+func TestGroupKind(t *testing.T) {
+	d := open(t)
+	ctx := t.Context()
+	if _, err := d.CreateTenant(ctx, spec("a", 20830)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PutAP(ctx, AP{TenantID: "a", Name: "ap-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PutAP(ctx, AP{TenantID: "a", Name: "g-1", Kind: KindGroup, Purpose: "unifi"}); err != nil {
+		t.Fatal(err)
+	}
+	// 種類をまたいで同じ名前は断る。
+	if _, err := d.PutAP(ctx, AP{TenantID: "a", Name: "ap-1", Kind: KindGroup, Purpose: "box"}); !errors.Is(err, ErrConflict) {
+		t.Errorf("group named like an AP: %v", err)
+	}
+	if _, err := d.PutAP(ctx, AP{TenantID: "a", Name: "g-1"}); !errors.Is(err, ErrConflict) {
+		t.Errorf("AP named like a group: %v", err)
+	}
+	if _, err := d.PutAP(ctx, AP{TenantID: "a", Name: "g-1", Kind: KindGroup, Purpose: "box"}); err != nil {
+		t.Errorf("update group: %v", err)
+	}
+	aps, _ := d.APs(ctx, "a")
+	if len(aps) != 2 || aps[0].Kind != KindAP || aps[1].Kind != KindGroup || aps[1].Purpose != "box" || aps[1].NASID != "a-g-1" {
+		t.Errorf("aps = %+v", aps)
+	}
+}
+
+// 段階 3 までの DB（移行 0002 まで）に行を入れてから 0003 を適用し、行が残り、新しい範囲と外部キーが効くことを確かめる。
+func TestMigrate0003KeepsRows(t *testing.T) {
+	ctx := t.Context()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.sql.ExecContext(ctx, `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL) STRICT`); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"0001_init.sql", "0002_ap_seen.sql"} {
+		b, err := os.ReadFile("migrations/" + f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.sql.ExecContext(ctx, string(b)); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+	}
+	for _, s := range []string{
+		`INSERT INTO schema_migrations VALUES (1, 'init', 1), (2, 'ap_seen', 1)`,
+		`INSERT INTO tenants (id, slug, port, auth_upstream, acct_upstream, client_ca_pem, desired_version, applied_version, created_at, updated_at)
+			VALUES ('t', 't', 20830, '10.0.0.1:1812', '10.0.0.1:1813', 'ca', 3, 2, 1, 1)`,
+		`INSERT INTO aps (tenant_id, name, nas_id, cert_serial, created_at, updated_at) VALUES ('t', 'ap-1', 't-ap-1', 'ab', 1, 1)`,
+		`INSERT INTO crls (tenant_id, pem, number, source) VALUES ('t', 'crl', '7', 'fetch')`,
+		`INSERT INTO ap_seen (tenant_id, ap, connected, last_ip) VALUES ('t', 'ap-1', 1, '192.0.2.1')`,
+		`INSERT INTO log_cursors (tenant_id, since) VALUES ('t', '2027-01-15T08:00:00Z')`,
+	} {
+		if _, err := d.sql.ExecContext(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applied, err := d.Migrate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) == 0 || applied[0] != 3 {
+		t.Fatalf("applied %v", applied)
+	}
+	tn, err := d.Tenant(ctx, "t")
+	if err != nil || tn.Port != 20830 || tn.ClientCAPEM != "ca" || tn.DesiredVersion != 3 || tn.AppliedVersion != 2 || len(tn.SourceCIDRs) != 0 {
+		t.Errorf("tenant = %+v, %v", tn, err)
+	}
+	aps, _ := d.APs(ctx, "t")
+	if len(aps) != 1 || aps[0].Kind != KindAP || aps[0].CertSerial != "ab" {
+		t.Errorf("aps = %+v", aps)
+	}
+	if c, _ := d.CRL(ctx, "t"); c.PEM != "crl" || c.Number != "7" || c.CAID != "" {
+		t.Errorf("crl = %+v", c)
+	}
+	if s, _ := d.Seen(ctx, "t"); !s["ap-1"].Connected {
+		t.Errorf("seen = %+v", s)
+	}
+	if c, _ := d.LogCursor(ctx, "t"); c.IsZero() {
+		t.Error("cursor lost")
+	}
+	// 新しいポートの範囲を受け、外は断る。
+	if _, err := d.CreateTenant(ctx, spec("u", 21999)); err != nil {
+		t.Errorf("port 21999: %v", err)
+	}
+	if _, err := d.sql.ExecContext(ctx, `INSERT INTO tenants (id, slug, port, auth_upstream, acct_upstream, created_at, updated_at) VALUES ('v', 'v', 19999, 'x', 'x', 1, 1)`); err == nil {
+		t.Error("port 19999 accepted by the CHECK")
+	}
+	// 外部キーが効いている（親を消すと子が消える）。
+	if err := d.DeleteTenant(ctx, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if aps, _ := d.APs(ctx, "t"); len(aps) != 0 {
+		t.Errorf("aps left: %+v", aps)
 	}
 }

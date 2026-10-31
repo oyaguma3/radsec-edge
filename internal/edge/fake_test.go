@@ -26,6 +26,8 @@ type env struct {
 	ca       *pkitest.CA
 	serverCA *pkitest.CA
 	user     Actor
+	// network はテナントのネットワーク（dockerEnv のときだけ）。
+	network string
 }
 
 func newEnv(t *testing.T) *env {

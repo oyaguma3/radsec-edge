@@ -19,10 +19,12 @@ const (
 
 // SeenEvent は radsecproxy のログから読んだ、AP の接続の出来事。
 type SeenEvent struct {
-	AP   string
-	Kind SeenKind
-	At   time.Time
-	// IP は接続元（接続の確立のときだけ）。
+	// AP は AP かグループの名前。Shared なら共通のブロック（IP ごとに記録する）で、AP は空。
+	AP     string
+	Shared bool
+	Kind   SeenKind
+	At     time.Time
+	// IP は接続元（AP とグループは接続の確立のときだけ、共通のブロックは確立と切断のとき）。
 	IP string
 }
 
@@ -50,9 +52,21 @@ func (d *DB) LogCursor(ctx context.Context, tenantID string) (time.Time, error) 
 }
 
 // ApplySeen は出来事を時刻の順に当てて AP の接続の状態を書き換え、ログを読んだ位置を since にする（1 つのトランザクション）。
-func (d *DB) ApplySeen(ctx context.Context, tenantID string, events []SeenEvent, since time.Time) error {
+// restarted なら（コンテナを起動し直した後は切断の行が出ないので）共通のブロックの接続の数を数え直す。
+func (d *DB) ApplySeen(ctx context.Context, tenantID string, events []SeenEvent, since time.Time, restarted bool) error {
 	return d.tx(ctx, func(tx *sql.Tx) error {
+		if restarted {
+			if _, err := tx.ExecContext(ctx, "UPDATE shared_seen SET connections = 0 WHERE tenant_id = ?", tenantID); err != nil {
+				return err
+			}
+		}
 		for _, e := range events {
+			if e.Shared {
+				if err := applySharedSeen(ctx, tx, tenantID, e); err != nil {
+					return err
+				}
+				continue
+			}
 			if _, err := tx.ExecContext(ctx, "INSERT INTO ap_seen (tenant_id, ap) VALUES (?, ?) ON CONFLICT DO NOTHING", tenantID, e.AP); err != nil {
 				return err
 			}
@@ -69,10 +83,63 @@ func (d *DB) ApplySeen(ctx context.Context, tenantID string, events []SeenEvent,
 				return err
 			}
 		}
+		// テナントごとに新しい順に上限まで残す（IP は増え続けうるので）。
+		if _, err := tx.ExecContext(ctx, `DELETE FROM shared_seen WHERE tenant_id = ?1 AND ip NOT IN (
+			SELECT ip FROM shared_seen WHERE tenant_id = ?1 ORDER BY last_up DESC, ip LIMIT ?2)`, tenantID, keepSharedSeen); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, "INSERT INTO log_cursors (tenant_id, since) VALUES (?, ?) ON CONFLICT (tenant_id) DO UPDATE SET since = excluded.since",
 			tenantID, since.UTC().Format(time.RFC3339Nano))
 		return err
 	})
+}
+
+// keepSharedSeen は共通のブロックの接続の記録を残す数（テナントごと。§24.3）。
+const keepSharedSeen = 1000
+
+// applySharedSeen は共通のブロックの出来事を送信元の IP の行に当てる。
+func applySharedSeen(ctx context.Context, tx *sql.Tx, tenantID string, e SeenEvent) error {
+	if e.Kind == SeenReject || e.IP == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO shared_seen (tenant_id, ip) VALUES (?, ?) ON CONFLICT DO NOTHING", tenantID, e.IP); err != nil {
+		return err
+	}
+	var err error
+	if e.Kind == SeenUp {
+		_, err = tx.ExecContext(ctx, "UPDATE shared_seen SET connections = connections + 1, last_up = ? WHERE tenant_id = ? AND ip = ?", millis(e.At), tenantID, e.IP)
+	} else {
+		_, err = tx.ExecContext(ctx, "UPDATE shared_seen SET connections = max(connections - 1, 0), last_down = ? WHERE tenant_id = ? AND ip = ?", millis(e.At), tenantID, e.IP)
+	}
+	return err
+}
+
+// SharedSeen は共通のブロックの送信元の IP ごとの接続の状態。
+type SharedSeen struct {
+	IP string
+	// Connections は今の接続の数（コンテナの再起動の前の接続は、LastUp が起動より前なので数えない）。
+	Connections      int
+	LastUp, LastDown time.Time
+}
+
+// SharedSeens はテナントの共通のブロックの接続の状態を、最後の接続の新しい順に返す。
+func (d *DB) SharedSeens(ctx context.Context, tenantID string) ([]SharedSeen, error) {
+	rows, err := d.sql.QueryContext(ctx, "SELECT ip, connections, last_up, last_down FROM shared_seen WHERE tenant_id = ? ORDER BY last_up DESC, ip", tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list shared seen: %w", err)
+	}
+	defer rows.Close()
+	var out []SharedSeen
+	for rows.Next() {
+		var s SharedSeen
+		var up, down int64
+		if err := rows.Scan(&s.IP, &s.Connections, &up, &down); err != nil {
+			return nil, err
+		}
+		s.LastUp, s.LastDown = fromMillis(up), fromMillis(down)
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 // Seen はテナントの AP の接続の状態を、AP の名前から引けるように返す。

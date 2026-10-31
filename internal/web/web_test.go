@@ -168,7 +168,7 @@ func TestTenantFlow(t *testing.T) {
 	must(t, "ap delete", s, body, 200, "AP ap-001 を削除しました")
 
 	// 設定の変更（ポートの重なりなど）。
-	s, body, _ = e.post(t, "/tenants/tenant-a/update", url.Values{"port": {"20000"}, "auth": {"10.0.0.10:1812"}, "acct": {"10.0.0.10:1813"}})
+	s, body, _ = e.post(t, "/tenants/tenant-a/update", url.Values{"port": {"19999"}, "auth": {"10.0.0.10:1812"}, "acct": {"10.0.0.10:1813"}})
 	must(t, "bad port", s, body, 422, "ポートは")
 	s, body, _ = e.post(t, "/tenants/tenant-a/update", url.Values{"port": {"20840"}, "auth": {"10.0.0.11:1812"}, "acct": {"10.0.0.11:1813"}})
 	must(t, "update", s, body, 200, "テナントの設定を変えました")

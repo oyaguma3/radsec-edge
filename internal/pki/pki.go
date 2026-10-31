@@ -23,8 +23,12 @@ import (
 	"github.com/oyaguma3/radsec-edge/internal/names"
 )
 
-// maxPEMBytes は貼り付けや取得で受け付ける PEM の大きさの上限。
-const maxPEMBytes = 1 << 20
+// maxPEMBytes は証明書や鍵の PEM の大きさの上限。MaxCRLBytes は CRL（PEM）の上限で、radsec-ca が受け付ける上限（DER で
+// 8 MiB。PEM で約 11 MiB）の CRL を受けられる大きさにする（§24.5）。
+const (
+	maxPEMBytes = 1 << 20
+	MaxCRLBytes = 12 << 20
+)
 
 // PEM のブロックの種類。
 const (
@@ -35,8 +39,10 @@ const (
 )
 
 // blocks は PEM の中のブロックを順に返す。PEM でない文字が混じっていたら（前後の空白を除いて）エラーにする。
-func blocks(data []byte) ([]*pem.Block, error) {
-	if len(data) > maxPEMBytes {
+func blocks(data []byte) ([]*pem.Block, error) { return blocksMax(data, maxPEMBytes) }
+
+func blocksMax(data []byte, limit int) ([]*pem.Block, error) {
+	if len(data) > limit {
 		return nil, errors.New("PEM が大きすぎます")
 	}
 	var out []*pem.Block
@@ -73,7 +79,7 @@ func ParseCert(data []byte) (*x509.Certificate, error) {
 
 // ParseCRL は PEM の CRL を 1 つだけ読む。
 func ParseCRL(data []byte) (*x509.RevocationList, error) {
-	bs, err := blocks(data)
+	bs, err := blocksMax(data, MaxCRLBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +184,29 @@ func CheckClientCA(ca *x509.Certificate, now time.Time) error {
 	return checkValidity(ca, now)
 }
 
+// IsSelfSigned は証明書が自己署名か（自己署名でない持ち込みの CA には PartialChain が要る。§24.5）。
+func IsSelfSigned(c *x509.Certificate) bool {
+	return bytes.Equal(c.RawIssuer, c.RawSubject) && c.CheckSignatureFrom(c) == nil
+}
+
+// CheckBroughtCA は、持ち込みの CA の証明書として使えるか（自己署名でなくてよい。§24.3）。CRL を配る CA は cRLSign も求める
+// （ないと CRL の署名を確かめられない）。期限は now で確かめる（now がゼロなら確かめない）。
+func CheckBroughtCA(ca *x509.Certificate, hasCRL bool, now time.Time) error {
+	if !ca.IsCA || !ca.BasicConstraintsValid {
+		return errors.New("CA の証明書ではありません（BasicConstraints の CA がありません）")
+	}
+	if ca.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("CA の証明書に keyCertSign がありません")
+	}
+	if hasCRL && ca.KeyUsage&x509.KeyUsageCRLSign == 0 {
+		return errors.New("CA の証明書に cRLSign がないので、CRL を確かめられません")
+	}
+	if now.IsZero() {
+		return nil
+	}
+	return checkValidity(ca, now)
+}
+
 // hasEKU は証明書に用途 u があるか。
 func hasEKU(c *x509.Certificate, u x509.ExtKeyUsage) bool { return slices.Contains(c.ExtKeyUsage, u) }
 
@@ -222,31 +251,50 @@ func CheckClientCert(c, ca *x509.Certificate, uri string, now time.Time) error {
 	return checkValidity(c, now)
 }
 
-// CRLInfo は検証を通った CRL の値。
+// CRLInfo は検証を通った CRL の値。Number は番号のない CRL なら nil。
 type CRLInfo struct {
 	Number                 *big.Int
 	ThisUpdate, NextUpdate time.Time
 	Revoked                int
 }
 
-// CheckCRL は、CRL がテナントのクライアントCA の署名で、nextUpdate が now より後で、番号が prev より小さくないことを確かめる
-// （設計概要 §9.5、§11.2）。prev が nil なら番号は比べない。期限の切れた CRL を置いて SIGHUP すると全接続が切れるため、
-// 期限の切れた CRL は必ず断る。
-func CheckCRL(crl *x509.RevocationList, ca *x509.Certificate, prev *big.Int, now time.Time) (CRLInfo, error) {
-	if err := crl.CheckSignatureFrom(ca); err != nil {
-		return CRLInfo{}, errors.New("CRL がテナントのクライアントCA の署名ではありません")
+// Previous は今の CRL の番号と時刻（古い CRL に戻さないために比べる）。ゼロ値なら比べない。
+type Previous struct {
+	Number     *big.Int
+	ThisUpdate time.Time
+}
+
+// CheckCRLSignature は、CRL が CA の署名で、nextUpdate があることだけを確かめる（束を作るときの、持ち込みの CA の切れた CRL。§24.5）。
+func CheckCRLSignature(crl *x509.RevocationList, ca *x509.Certificate) error {
+	if !bytes.Equal(crl.RawIssuer, ca.RawSubject) {
+		return errors.New("CRL の発行者が CA と違います")
 	}
-	if crl.Number == nil {
-		return CRLInfo{}, errors.New("CRL に番号（cRLNumber）がありません")
+	if err := crl.CheckSignatureFrom(ca); err != nil {
+		return errors.New("CRL が CA の署名ではありません")
 	}
 	if crl.NextUpdate.IsZero() {
-		return CRLInfo{}, errors.New("CRL に nextUpdate がありません")
+		return errors.New("CRL に nextUpdate がありません")
+	}
+	return nil
+}
+
+// CheckCRL は、CRL が CA の署名で、nextUpdate が now より後で、今の CRL より古くないことを確かめる（設計概要 §9.5、§11.2）。
+// 番号がどちらにもあれば番号で比べ、なければ thisUpdate で比べる（業者の CRL には番号のないものがありうる。§24.5）。
+// 期限の切れた CRL を置いて SIGHUP するとその CA の接続が切れるため、期限の切れた CRL は必ず断る。
+func CheckCRL(crl *x509.RevocationList, ca *x509.Certificate, prev Previous, now time.Time) (CRLInfo, error) {
+	if err := CheckCRLSignature(crl, ca); err != nil {
+		return CRLInfo{}, err
 	}
 	if !now.Before(crl.NextUpdate) {
 		return CRLInfo{}, fmt.Errorf("CRL の期限（nextUpdate %s）が切れています", crl.NextUpdate.Format(time.RFC3339))
 	}
-	if prev != nil && crl.Number.Cmp(prev) < 0 {
-		return CRLInfo{}, fmt.Errorf("CRL の番号 %s が、今の CRL の番号 %s より小さいです（古い CRL には戻しません）", crl.Number, prev)
+	switch {
+	case prev.Number != nil && crl.Number != nil:
+		if crl.Number.Cmp(prev.Number) < 0 {
+			return CRLInfo{}, fmt.Errorf("CRL の番号 %s が、今の CRL の番号 %s より小さいです（古い CRL には戻しません）", crl.Number, prev.Number)
+		}
+	case !prev.ThisUpdate.IsZero() && crl.ThisUpdate.Before(prev.ThisUpdate):
+		return CRLInfo{}, fmt.Errorf("CRL の thisUpdate %s が、今の CRL より古いです（古い CRL には戻しません）", crl.ThisUpdate.Format(time.RFC3339))
 	}
 	return CRLInfo{Number: crl.Number, ThisUpdate: crl.ThisUpdate, NextUpdate: crl.NextUpdate, Revoked: len(crl.RevokedCertificateEntries)}, nil
 }

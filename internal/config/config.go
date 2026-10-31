@@ -28,8 +28,14 @@ const (
 
 // ポートの範囲（設計概要 §4、§8.1）。テナントに 1 つずつ割り当てる。
 const (
-	PortMin = 20830
-	PortMax = 20999
+	PortMin = 20000
+	PortMax = 21999
+)
+
+// テナントの刻印の既定（RFC 5612 の文書用の Vendor-Id。実運用では IANA から取得した PEN。設計概要 §24.2）。
+const (
+	defaultStampVendorID   = 32473
+	defaultStampVendorType = 1
 )
 
 // Config は radsec-edge の設定。
@@ -53,6 +59,8 @@ type Config struct {
 	URNPrefix string
 	DNSDomain string
 
+	// StampVendorID と StampVendorType はテナントの刻印の VSA（設計概要 §24.2）。上流の設定と食い違うとすべて拒否になるので、起動のときにログに出す。
+	StampVendorID, StampVendorType int
 	// Upstream は新しいテナントの上流の既定と、エッジで 1 つの共有シークレット（設計概要 §12.3）。
 	Upstream Upstream
 
@@ -125,6 +133,7 @@ func Load() (Config, error) {
 		errs = append(errs, fmt.Errorf("EDGE_DNS_DOMAIN: %w", err))
 	}
 	errs = append(errs, c.loadUpstream()...)
+	errs = append(errs, c.loadStamp()...)
 	if c.CRLBaseURL != "" {
 		if u, err := url.Parse(c.CRLBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" {
 			errs = append(errs, errors.New("EDGE_CRL_BASE_URL: must be an http(s) URL such as http://10.0.0.1:8449"))
@@ -157,6 +166,30 @@ func Load() (Config, error) {
 	}
 	errs = append(errs, c.loadAuth()...)
 	return c, errors.Join(errs...)
+}
+
+// loadStamp はテナントの刻印の VSA を読む。
+func (c *Config) loadStamp() []error {
+	var errs []error
+	for _, d := range []struct {
+		env      string
+		dst      *int
+		def, max int
+	}{
+		{"EDGE_STAMP_VENDOR_ID", &c.StampVendorID, defaultStampVendorID, 16777215},
+		{"EDGE_STAMP_VENDOR_TYPE", &c.StampVendorType, defaultStampVendorType, 255},
+	} {
+		*d.dst = d.def
+		if v := os.Getenv(d.env); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > d.max {
+				errs = append(errs, fmt.Errorf("%s: must be an integer between 1 and %d", d.env, d.max))
+				continue
+			}
+			*d.dst = n
+		}
+	}
+	return errs
 }
 
 func (c *Config) loadUpstream() []error {
