@@ -54,7 +54,11 @@ func (s *Service) RefreshCRL(ctx context.Context, a Actor, id string) error {
 }
 
 func (s *Service) refreshTenantCRLs(ctx context.Context, a Actor, id string, skipNoURL bool) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
@@ -147,7 +151,11 @@ func (s *Service) fetch(ctx context.Context, url string, cur db.CRL) (body []byt
 
 // InstallCRL は、画面から貼り付けた CRL を取り込む（取得と同じ検証をして、反映済みの版に入れる。§9.5）。
 func (s *Service) InstallCRL(ctx context.Context, a Actor, id string, pemData []byte) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
@@ -164,7 +172,11 @@ func (s *Service) InstallCRL(ctx context.Context, a Actor, id string, pemData []
 
 // InstallBroughtCRL は持ち込みの CA の CRL を取り込む（取得と同じ検証をして、反映済みの版に入れる）。
 func (s *Service) InstallBroughtCRL(ctx context.Context, a Actor, id, caID string, pemData []byte) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
@@ -274,7 +286,7 @@ func (s *Service) pushCRL(ctx context.Context, t db.Tenant, crlPEM []byte) error
 		s.Log.Warn("the CRL of the issued CA has expired; the new CRL is not pushed until it is renewed", "tenant", t.ID)
 		return nil
 	}
-	rec := db.Apply{TenantID: t.ID, Version: t.AppliedVersion, Hash: b.Hash(), Trigger: db.TriggerCRL, Action: "sighup",
+	rec := db.Apply{TenantID: t.ID, Version: t.AppliedVersion, Revision: t.AppliedRevision, Hash: b.Hash(), Trigger: db.TriggerCRL, Action: "sighup",
 		Operator: System.Operator, Started: s.Now()}
 	gen, err := s.Store.Stage(t.Slug, b)
 	if err == nil {
@@ -314,7 +326,7 @@ func (s *Service) pushCRL(ctx context.Context, t db.Tenant, crlPEM []byte) error
 	} else {
 		rec.Action = "none"
 	}
-	if err := s.DB.MarkApplied(ctx, t.ID, t.AppliedVersion, b.Hash(), port); err != nil {
+	if err := s.DB.MarkApplied(ctx, t.ID, t.AppliedVersion, t.AppliedRevision, b.Hash(), port); err != nil {
 		return err
 	}
 	if err := s.Store.Prune(t.Slug, keepGenerations); err != nil {

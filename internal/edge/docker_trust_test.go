@@ -21,6 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oyaguma3/radsec-edge/internal/agent"
+	"github.com/oyaguma3/radsec-edge/internal/db"
+	"github.com/oyaguma3/radsec-edge/internal/keystore"
 	"github.com/oyaguma3/radsec-edge/internal/names"
 	"github.com/oyaguma3/radsec-edge/internal/pki"
 	"github.com/oyaguma3/radsec-edge/internal/pki/pkitest"
@@ -437,4 +440,90 @@ func TestDockerTrust(t *testing.T) {
 	}
 	apply("ap removed")
 	te.rejected("own AP after its block is removed", ap)
+}
+
+// 管理モードの宣言（数字の ID）を本物の radsecproxy で確かめる（設計概要 §24.11）。刻印の値はテナントの ID で、slug ではない（aka-radius は数字だけを読む）。
+func TestDockerDeclare(t *testing.T) {
+	e := dockerEnv(t)
+	ctx := t.Context()
+	name, ip := startUpstream(t, e)
+	te := &trustEnv{env: e, t: t, port: 21991, upstream: name}
+	vendor := pkitest.NewCA(t, "vendor org CA")
+	d := Declaration{ID: "42", Slug: "tenant-a", Revision: 5, Port: te.port, Auth: netip.AddrPortFrom(ip, 1812), Acct: netip.AddrPortFrom(ip, 1813),
+		IssuedCAID: "tenant.tenant-a", IssuedCAPEM: e.ca.PEM,
+		Trust: TrustInput{Brought: []BroughtInput{brought("tenant-a", "vendor", vendor, true)}},
+		APs:   []APDecl{{Name: "ap-001", Kind: db.KindAP}, {Name: "unifi", Kind: db.KindGroup, Purpose: "unifi"}}}
+	if _, err := e.svc.Declare(ctx, e.user, d); err != nil {
+		t.Fatal(err)
+	}
+	// CRL は配布の口から取る代わりに直接置き、サーバー証明書とヘルスチェック用の証明書を出す（API の流れは internal/api の試験）。
+	if err := e.svc.InstallCRL(ctx, e.user, "42", e.ca.CRL(t, pkitest.CRL{Number: 1})); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.InstallBroughtCRL(ctx, e.user, "42", "brought.tenant-a.vendor", vendor.CRL(t, pkitest.CRL{Number: 1})); err != nil {
+		t.Fatal(err)
+	}
+	csr, err := e.svc.CSR(ctx, e.user, "42", keystore.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cert := e.serverCA.SignCSR(t, pkitest.Leaf{DNS: names.SlotNames("tenant-a", "radsec.test"), Server: true}, csr)
+	if err := e.svc.ImportCert(ctx, e.user, "42", keystore.Server, cert); err != nil {
+		t.Fatal(err)
+	}
+	if csr, err = e.svc.CSR(ctx, e.user, "42", keystore.Probe); err != nil {
+		t.Fatal(err)
+	}
+	_, cert = e.ca.SignCSR(t, pkitest.Leaf{URI: names.SANURI("example", "tenant-a", "probe")}, csr)
+	if err := e.svc.ImportCert(ctx, e.user, "42", keystore.Probe, cert); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := e.svc.Apply(ctx, e.user, "42"); err != nil {
+		logs, _ := e.svc.Agent.Logs(ctx, "42", 60)
+		t.Fatalf("Apply = %+v, %v\n%s", rec, err, logs)
+	}
+	tn, _ := e.db.Tenant(ctx, "42")
+	if tn.AppliedRevision != 5 || tn.Pending() {
+		t.Errorf("after apply: %+v", tn)
+	}
+	c, ok := mustContainer(t, e, "42")
+	if !ok || c.Slug != "tenant-a" || c.Name != agent.ContainerName("tenant-a") {
+		t.Errorf("container = %+v", c)
+	}
+
+	retry := func(kc keyCert, user, nas string) {
+		t.Helper()
+		var err error
+		for range 3 {
+			if err = te.roundTrip(kc, user, nas); err == nil {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+		logs, _ := e.svc.Agent.Logs(ctx, "42", 60)
+		t.Fatalf("%s: %v\n%s", user, err, logs)
+	}
+	for _, tc := range []struct {
+		kc              keyCert
+		user, nas, want string
+	}{
+		{issueTo(t, e.ca, pkitest.Leaf{CN: "tenant-a-ap-001", URI: names.SANURI("example", "tenant-a", "ap-001")}), "d-ap", "spoofed", "tenant-a-ap-001"},
+		{issueTo(t, e.ca, pkitest.Leaf{CN: "tenant-a-unifi", URI: names.GroupSANURI("example", "tenant-a", "unifi")}), "d-group", "real-ap", "real-ap"},
+		{issueTo(t, vendor, pkitest.Leaf{CN: "aabbccddeeff"}), "d-vendor", "meraki-1", "meraki-1"},
+	} {
+		retry(tc.kc, tc.user, tc.nas)
+		nas, stamps, _ := te.seenAtUpstream(tc.user)
+		if nas != tc.want || stamps != "42" {
+			t.Errorf("%s: nas=%s stamps=%s, want nas=%s stamps=42", tc.user, nas, stamps, tc.want)
+		}
+	}
+}
+
+func mustContainer(t *testing.T, e *env, id string) (agent.Container, bool) {
+	t.Helper()
+	st, err := e.svc.Agent.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Container(id)
 }

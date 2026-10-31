@@ -28,29 +28,11 @@ func (s *Service) Missing(ctx context.Context, t db.Tenant) ([]string, error) {
 	if t.ClientCAPEM == "" {
 		out = append(out, "クライアントCA の証明書")
 	}
-	crl, err := s.DB.CRL(ctx, t.ID)
+	crls, err := s.missingCRLs(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	if crl.PEM == "" {
-		out = append(out, "CRL")
-	}
-	brought, err := s.DB.BroughtCAs(ctx, t.ID)
-	if err != nil {
-		return nil, err
-	}
-	for _, b := range brought {
-		if !b.HasCRL {
-			continue
-		}
-		c, err := s.DB.CRLOf(ctx, t.ID, b.CAID)
-		if err != nil {
-			return nil, err
-		}
-		if c.PEM == "" {
-			out = append(out, "持ち込みの CA "+b.CAID+" の CRL")
-		}
-	}
+	out = append(out, crls...)
 	for _, k := range []struct {
 		kind  keystore.Kind
 		cert  string
@@ -211,15 +193,22 @@ func (s *Service) record(ctx context.Context, a *db.Apply) {
 // SIGHUP か再起動 → ヘルスチェック → 失敗したら前の版に戻す。結果は反映の記録に残し、返す。
 // 反映できなかったとき（前の版のまま、または前の版に戻したとき）は、記録とともにエラーを返す。
 func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, error) {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return db.Apply{}, err
+	}
+	defer unlock()
+	defer s.forgetStatus()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return db.Apply{}, err
 	}
 	if !t.Enabled {
-		return db.Apply{}, invalid("停止しているテナントは反映できません。起動してから反映してください")
+		return db.Apply{}, invalidCause(CauseTenantStopped, "停止しているテナントは反映できません。起動してから反映してください")
 	}
-	rec := db.Apply{TenantID: id, Version: t.DesiredVersion, Trigger: db.TriggerApply, Operator: a.Operator, Started: s.Now()}
+	// 前の反映が途中で止まっていれば、先に前の版へ戻す（§24.11 の EA6）。戻せなかったときは、差がなくても再起動して読み込ませる。
+	forceRestart := s.recoverInterrupted(ctx, a, t)
+	rec := db.Apply{TenantID: id, Version: t.DesiredVersion, Revision: t.Revision, Trigger: db.TriggerApply, Operator: a.Operator, Started: s.Now()}
 	fail := func(result string, err error) (db.Apply, error) {
 		rec.Result, rec.Error = result, err.Error()
 		s.record(ctx, &rec)
@@ -252,7 +241,11 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 			return fail(db.ResultFailed, err)
 		}
 	}
-	rec.Action, err = s.bring(ctx, t, t.Port, b.ActionFrom(old))
+	want := b.ActionFrom(old)
+	if forceRestart {
+		want = rsconf.ActionRestart
+	}
+	rec.Action, err = s.bring(ctx, t, t.Port, want)
 	if err == nil {
 		err = s.probeUntil(ctx, t, t.Port)
 	}
@@ -263,7 +256,7 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 		}
 		return fail(db.ResultRolledBack, err)
 	}
-	if err := s.DB.MarkApplied(ctx, id, t.DesiredVersion, b.Hash(), t.Port); err != nil {
+	if err := s.DB.MarkApplied(ctx, id, t.DesiredVersion, t.Revision, b.Hash(), t.Port); err != nil {
 		return fail(db.ResultFailed, err)
 	}
 	if err := s.Store.Prune(t.Slug, keepGenerations); err != nil {
@@ -291,6 +284,51 @@ func (s *Service) bring(ctx context.Context, t db.Tenant, port int, want rsconf.
 		return "sighup", s.Agent.SIGHUP(ctx, t.ID)
 	}
 	return "none", nil
+}
+
+// recoverInterrupted は、反映の途中でプロセスが止まって current が反映済みの版と違っていれば、反映済みの版に戻す（§24.11 の EA6）。
+// 排他の中で current と反映済みの版が違うのは、途中で止まったときだけである（反映と CRL の更新は排他の中で MarkApplied まで行う）。
+// 戻せなかったら true を返す（呼び出し側が反映するときは、再起動して読み込ませる）。呼び出し側でテナントの排他を取る。
+func (s *Service) recoverInterrupted(ctx context.Context, a Actor, t db.Tenant) bool {
+	gen, _, err := s.Store.Current(t.Slug)
+	if err != nil {
+		s.Log.Error("cannot read the current generation", "tenant", t.ID, "error", err)
+		return true
+	}
+	applied := appliedGen(t)
+	// current がないのは、まだ反映していないか、tenants のディレクトリを失ったとき（次の反映で作り直す）。
+	if gen == "" || gen == applied {
+		return false
+	}
+	rec := db.Apply{TenantID: t.ID, Version: t.AppliedVersion, Revision: t.AppliedRevision, Hash: t.AppliedHash, Trigger: db.TriggerApply, Action: "rollback",
+		Result: db.ResultInterrupted, Operator: a.Operator, Started: s.Now(), Error: "反映の途中で止まっていたので、反映済みの版に戻しました"}
+	if applied != "" {
+		if _, err := s.Store.Read(t.Slug, applied); err != nil {
+			// 古い DB に戻したときなど、反映済みの版のディレクトリがない。戻さずに、次の反映で読み込ませる。
+			s.Log.Warn("the applied generation is gone; the next apply restarts the container", "tenant", t.ID, "generation", applied, "error", err)
+			return true
+		}
+	}
+	if t.Enabled || applied == "" {
+		err = s.rollback(ctx, t, applied)
+	} else {
+		err = s.Store.Activate(t.Slug, applied) // 停止しているテナントは起動しない
+	}
+	if err != nil {
+		rec.Error += "（" + err.Error() + "）"
+	}
+	s.record(ctx, &rec)
+	s.audit(ctx, a, "tenant.apply_interrupted", t.ID, map[string]any{"generation": gen, "applied_generation": applied})
+	now, _, cerr := s.Store.Current(t.Slug)
+	return cerr != nil || (now != "" && now != applied)
+}
+
+// appliedGen は反映済みの版の名前（なければ空）。
+func appliedGen(t db.Tenant) string {
+	if len(t.AppliedHash) < 16 {
+		return ""
+	}
+	return t.AppliedHash[:16]
 }
 
 // rollback は前の版 oldGen に戻して再起動する。前の版がなければ、コンテナを止めて current を外す。
@@ -367,7 +405,7 @@ func (s *Service) probeUntil(ctx context.Context, t db.Tenant, port int) error {
 // 呼び出し側でテナントの排他を取る。
 func (s *Service) syncTenant(ctx context.Context, t db.Tenant, st agent.Status, a Actor) error {
 	c, exists := st.Container(t.ID)
-	rec := db.Apply{TenantID: t.ID, Version: t.AppliedVersion, Hash: t.AppliedHash, Trigger: db.TriggerReconcile, Operator: a.Operator, Started: s.Now()}
+	rec := db.Apply{TenantID: t.ID, Version: t.AppliedVersion, Revision: t.AppliedRevision, Hash: t.AppliedHash, Trigger: db.TriggerReconcile, Operator: a.Operator, Started: s.Now()}
 	if !t.Enabled {
 		if !exists || (!c.Running && !c.Restarting) {
 			return nil
@@ -445,9 +483,14 @@ func (s *Service) reconcile(ctx context.Context) error {
 	var errs []error
 	for _, t := range tenants {
 		ids[t.ID], slugs[t.Slug] = true, true
-		unlock := s.lock(t.ID)
+		unlock, err := s.acquire(ctx, t.ID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", t.ID, err))
+			continue
+		}
 		// 排他を待つ間に変わっているかもしれないので、読み直す。
 		if cur, err := s.DB.Tenant(ctx, t.ID); err == nil {
+			s.recoverInterrupted(ctx, System, cur)
 			if err := s.syncTenant(ctx, cur, st, System); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", t.ID, err))
 			}
@@ -458,7 +501,11 @@ func (s *Service) reconcile(ctx context.Context) error {
 		if ids[c.TenantID] || !names.ValidSlug(c.TenantID) {
 			continue
 		}
-		unlock := s.lock(c.TenantID)
+		unlock, err := s.acquire(ctx, c.TenantID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", c.TenantID, err))
+			continue
+		}
 		if _, err := s.DB.Tenant(ctx, c.TenantID); errors.Is(err, db.ErrNotFound) {
 			if err := s.Agent.Remove(ctx, c.TenantID); err != nil && !errors.Is(err, agent.ErrNotFound) {
 				errs = append(errs, err)

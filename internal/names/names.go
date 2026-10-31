@@ -18,6 +18,12 @@ var slugPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`)
 // labelPattern は DNS のラベルの規則（長さは別に確かめる）。
 var labelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
+// managedIDPattern は管理モードのテナントの ID（OSS/BSS のテナントの番号。刻印の値にもなり、aka-radius は 1 以上の 10 進数だけを読む。§24.11 の EA4）。
+var managedIDPattern = regexp.MustCompile(`^[1-9][0-9]{0,18}$`)
+
+// ValidManagedID は管理モードのテナントの ID の形か。
+func ValidManagedID(s string) bool { return managedIDPattern.MatchString(s) }
+
 // ProbeAP はヘルスチェック用に予約した AP の名前（§11.3）。利用者の AP には使わせない。
 const ProbeAP = "probe"
 

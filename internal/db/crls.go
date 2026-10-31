@@ -112,48 +112,53 @@ func (d *DB) SetTrust(ctx context.Context, id string, cas []BroughtCA, cidrs []n
 		if n, _ := res.RowsAffected(); n == 0 {
 			return ErrNotFound
 		}
-		old := map[string]string{}
-		rows, err := tx.QueryContext(ctx, "SELECT ca_id, cert_pem FROM tenant_brought_cas WHERE tenant_id = ?", id)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var caID, cert string
-			if err := rows.Scan(&caID, &cert); err != nil {
-				rows.Close()
-				return err
-			}
-			old[caID] = cert
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, c := range cas {
-			prev, existed := old[c.CAID]
-			delete(old, c.CAID)
-			if existed && prev != c.CertPEM {
-				if _, err := tx.ExecContext(ctx, "DELETE FROM crls WHERE tenant_id = ? AND ca_id = ?", id, c.CAID); err != nil {
-					return err
-				}
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_brought_cas (tenant_id, ca_id, cert_pem, has_crl, created_at) VALUES (?, ?, ?, ?, ?)
-				ON CONFLICT (tenant_id, ca_id) DO UPDATE SET cert_pem = excluded.cert_pem, has_crl = excluded.has_crl`, id, c.CAID, c.CertPEM, c.HasCRL, now); err != nil {
-				return err
-			}
-		}
-		for caID := range old {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM tenant_brought_cas WHERE tenant_id = ? AND ca_id = ?", id, caID); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, "DELETE FROM crls WHERE tenant_id = ? AND ca_id = ?", id, caID); err != nil {
-				return err
-			}
-		}
-		return nil
+		return replaceBrought(ctx, tx, id, cas, now)
 	})
 	if err != nil {
 		return fmt.Errorf("set trust of %s: %w", id, err)
+	}
+	return nil
+}
+
+// replaceBrought はテナントの持ち込みの CA の一覧を置き換える。一覧から外した CA と、CA の証明書を替えた CA の CRL は消す。
+func replaceBrought(ctx context.Context, tx *sql.Tx, id string, cas []BroughtCA, now int64) error {
+	old := map[string]string{}
+	rows, err := tx.QueryContext(ctx, "SELECT ca_id, cert_pem FROM tenant_brought_cas WHERE tenant_id = ?", id)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var caID, cert string
+		if err := rows.Scan(&caID, &cert); err != nil {
+			rows.Close()
+			return err
+		}
+		old[caID] = cert
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range cas {
+		prev, existed := old[c.CAID]
+		delete(old, c.CAID)
+		if existed && prev != c.CertPEM {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM crls WHERE tenant_id = ? AND ca_id = ?", id, c.CAID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tenant_brought_cas (tenant_id, ca_id, cert_pem, has_crl, created_at) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (tenant_id, ca_id) DO UPDATE SET cert_pem = excluded.cert_pem, has_crl = excluded.has_crl`, id, c.CAID, c.CertPEM, c.HasCRL, now); err != nil {
+			return err
+		}
+	}
+	for caID := range old {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM tenant_brought_cas WHERE tenant_id = ? AND ca_id = ?", id, caID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM crls WHERE tenant_id = ? AND ca_id = ?", id, caID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -29,6 +29,10 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrConflict は一意の制約（slug、ポート、NAS-Identifier など）に反することを表す。
 	ErrConflict = errors.New("conflict")
+	// ErrSlugImmutable はテナントの slug を変えようとしたことを表す（§24.11 の EA4）。
+	ErrSlugImmutable = errors.New("the slug of a tenant cannot be changed")
+	// ErrCapacity はテナントの数が上限に達していることを表す（§24.11 の EA12）。
+	ErrCapacity = errors.New("the edge has reached its tenant capacity")
 )
 
 // DB は SQLite への接続。
@@ -36,6 +40,8 @@ type DB struct {
 	sql *sql.DB
 	// now は現在時刻（テストで差し替える）。
 	now func() time.Time
+	// auditSink は監査ログの写しの書き先（なければ nil）。
+	auditSink AuditSink
 }
 
 // Open は SQLite のファイルを開く（なければ作る）。WAL、外部キー、待ち時間を有効にする。

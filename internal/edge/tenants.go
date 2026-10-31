@@ -68,6 +68,15 @@ func (s *Service) CreateTenant(ctx context.Context, a Actor, in TenantInput) (db
 	if err := checkTenantInput(in); err != nil {
 		return db.Tenant{}, err
 	}
+	if s.Capacity > 0 {
+		n, err := s.DB.CountTenants(ctx)
+		if err != nil {
+			return db.Tenant{}, err
+		}
+		if n >= s.Capacity {
+			return db.Tenant{}, invalidCause(CauseCapacityExceeded, "このエッジに置けるテナントの数（%d）に達しています", s.Capacity)
+		}
+	}
 	if in.Port == 0 {
 		p, err := s.DB.FreePort(ctx, config.PortMin, config.PortMax)
 		if err != nil {
@@ -106,7 +115,12 @@ func (s *Service) UpdateTenant(ctx context.Context, a Actor, id string, in Tenan
 
 // DeleteTenant はテナントを消す（コンテナを消し、設定のディレクトリと鍵も消す）。
 func (s *Service) DeleteTenant(ctx context.Context, a Actor, id string) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	defer s.forgetStatus()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
@@ -125,7 +139,12 @@ func (s *Service) DeleteTenant(ctx context.Context, a Actor, id string) error {
 
 // SetEnabled はテナントを起動・停止する（運用の操作。望む状態の版は変えない）。すぐにコンテナに効かせる。
 func (s *Service) SetEnabled(ctx context.Context, a Actor, id string, enabled bool) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	defer s.forgetStatus()
 	if err := s.DB.SetEnabled(ctx, id, enabled); err != nil {
 		return err
 	}
@@ -147,7 +166,12 @@ func (s *Service) SetEnabled(ctx context.Context, a Actor, id string, enabled bo
 
 // Restart はテナントのコンテナを再起動する（運用の操作）。
 func (s *Service) Restart(ctx context.Context, a Actor, id string) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	defer s.forgetStatus()
 	if err := s.Agent.Restart(ctx, id); err != nil {
 		return err
 	}
@@ -160,7 +184,11 @@ func certPEM(raw []byte) string { return string(pki.EncodeCert(raw)) }
 
 // ImportClientCA はテナントのクライアントCA の証明書を取り込む。CA が変わったら、前の CA の CRL は捨てる。
 func (s *Service) ImportClientCA(ctx context.Context, a Actor, id string, pemData []byte) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	ca, err := pki.ParseCert(pemData)
 	if err != nil {
 		return invalid("クライアントCA の証明書: %v", err)
@@ -190,7 +218,11 @@ func (s *Service) ImportClientCA(ctx context.Context, a Actor, id string, pemDat
 // CSR は、テナントのサーバー証明書かヘルスチェック用の証明書の鍵を作り直し、CSR（PEM）を返す
 // （鍵はエッジの外に出さない。§12.1 の server-csr・probe-csr）。前に出した CSR の鍵は捨てる。
 func (s *Service) CSR(ctx context.Context, a Actor, id string, kind keystore.Kind) ([]byte, error) {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return nil, err
@@ -214,7 +246,11 @@ func (s *Service) CSR(ctx context.Context, a Actor, id string, kind keystore.Kin
 // ImportCert は、署名済みのサーバー証明書かヘルスチェック用の証明書を取り込む。証明書を待っている鍵（CSR を出した鍵）か、
 // 今の鍵（同じ鍵での更新）に合うものだけを受け付ける。
 func (s *Service) ImportCert(ctx context.Context, a Actor, id string, kind keystore.Kind, pemData []byte) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
@@ -376,58 +412,18 @@ type TrustInput struct {
 // 一覧から外した CA の CRL は消す。CA の証明書を取り込むときに期限を確かめ、同じ Subject の CA は断る（束に並べると、片方の CA の正当な AP が
 // 拒否されるため。aka-mvpset の verify/r11）。
 func (s *Service) SetTrust(ctx context.Context, a Actor, id string, in TrustInput) error {
-	defer s.lock(id)()
+	unlock, err := s.acquire(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return err
 	}
-	if len(in.SourceCIDRs) > rsconf.MaxSourceCIDRs {
-		return invalid("送信元の範囲は %d 個までにしてください", rsconf.MaxSourceCIDRs)
-	}
-	for _, p := range in.SourceCIDRs {
-		if !p.IsValid() {
-			return invalid("送信元の範囲が正しくありません")
-		}
-	}
-	if in.SharedMatch != (rsconf.Match{}) {
-		if err := rsconf.CheckMatch(in.SharedMatch); err != nil {
-			return invalid("%v", err)
-		}
-	}
-	subjects := map[string]string{}
-	if t.ClientCAPEM != "" {
-		ca, err := pki.ParseCert([]byte(t.ClientCAPEM))
-		if err != nil {
-			return err
-		}
-		subjects[string(ca.RawSubject)] = "クライアントCA"
-	}
-	prefix := "brought." + t.Slug + "."
-	var cas []db.BroughtCA
-	needMatch := false
-	var details []map[string]any
-	for _, b := range in.Brought {
-		name, ok := strings.CutPrefix(b.CAID, prefix)
-		if !ok || !names.ValidSlug(name) {
-			return invalid("持ち込みの CA の ID は %s<名前> にしてください（%s）", prefix, b.CAID)
-		}
-		c, err := pki.ParseCert(b.CertPEM)
-		if err != nil {
-			return invalid("持ち込みの CA %s の証明書: %v", b.CAID, err)
-		}
-		if err := pki.CheckBroughtCA(c, b.HasCRL, s.Now()); err != nil {
-			return invalid("持ち込みの CA %s: %v", b.CAID, err)
-		}
-		if other, dup := subjects[string(c.RawSubject)]; dup {
-			return invalid("持ち込みの CA %s の Subject が %s と同じです（同じ Subject の CA は束に並べられません）", b.CAID, other)
-		}
-		subjects[string(c.RawSubject)] = b.CAID
-		needMatch = needMatch || !b.HasCRL
-		cas = append(cas, db.BroughtCA{TenantID: id, CAID: b.CAID, CertPEM: certPEM(c.Raw), HasCRL: b.HasCRL})
-		details = append(details, map[string]any{"ca": b.CAID, "subject": c.Subject.String(), "serial": pki.SerialHex(c), "has_crl": b.HasCRL, "self_signed": pki.IsSelfSigned(c)})
-	}
-	if needMatch && in.SharedMatch == (rsconf.Match{}) {
-		return invalid("CRL のない持ち込みの CA があるときは、共通のブロックの照合の形が要ります")
+	cas, details, err := s.checkTrust(id, t.Slug, t.ClientCAPEM, in)
+	if err != nil {
+		return err
 	}
 	if err := s.DB.SetTrust(ctx, id, cas, in.SourceCIDRs, in.SharedMatch.Attr, in.SharedMatch.Pattern); err != nil {
 		return err
@@ -438,6 +434,59 @@ func (s *Service) SetTrust(ctx context.Context, a Actor, id string, in TrustInpu
 	}
 	s.audit(ctx, a, "tenant.trust", id, map[string]any{"brought": details, "source_cidrs": cidrs, "shared_match_attr": in.SharedMatch.Attr, "shared_match_pattern": in.SharedMatch.Pattern})
 	return nil
+}
+
+// checkTrust は受け口の宣言を確かめ、持ち込みの CA の行と、監査ログに残す値を返す。clientCAPEM は発行した CA の証明書（なければ空）。
+func (s *Service) checkTrust(id, slug, clientCAPEM string, in TrustInput) ([]db.BroughtCA, []map[string]any, error) {
+	if len(in.SourceCIDRs) > rsconf.MaxSourceCIDRs {
+		return nil, nil, invalid("送信元の範囲は %d 個までにしてください", rsconf.MaxSourceCIDRs)
+	}
+	for _, p := range in.SourceCIDRs {
+		if !p.IsValid() {
+			return nil, nil, invalid("送信元の範囲が正しくありません")
+		}
+	}
+	if in.SharedMatch != (rsconf.Match{}) {
+		if err := rsconf.CheckMatch(in.SharedMatch); err != nil {
+			return nil, nil, invalid("%v", err)
+		}
+	}
+	subjects := map[string]string{}
+	if clientCAPEM != "" {
+		ca, err := pki.ParseCert([]byte(clientCAPEM))
+		if err != nil {
+			return nil, nil, err
+		}
+		subjects[string(ca.RawSubject)] = "クライアントCA"
+	}
+	prefix := "brought." + slug + "."
+	var cas []db.BroughtCA
+	needMatch := false
+	var details []map[string]any
+	for _, b := range in.Brought {
+		name, ok := strings.CutPrefix(b.CAID, prefix)
+		if !ok || !names.ValidSlug(name) {
+			return nil, nil, invalid("持ち込みの CA の ID は %s<名前> にしてください（%s）", prefix, b.CAID)
+		}
+		c, err := pki.ParseCert(b.CertPEM)
+		if err != nil {
+			return nil, nil, invalid("持ち込みの CA %s の証明書: %v", b.CAID, err)
+		}
+		if err := pki.CheckBroughtCA(c, b.HasCRL, s.Now()); err != nil {
+			return nil, nil, invalid("持ち込みの CA %s: %v", b.CAID, err)
+		}
+		if other, dup := subjects[string(c.RawSubject)]; dup {
+			return nil, nil, invalid("持ち込みの CA %s の Subject が %s と同じです（同じ Subject の CA は束に並べられません）", b.CAID, other)
+		}
+		subjects[string(c.RawSubject)] = b.CAID
+		needMatch = needMatch || !b.HasCRL
+		cas = append(cas, db.BroughtCA{TenantID: id, CAID: b.CAID, CertPEM: certPEM(c.Raw), HasCRL: b.HasCRL})
+		details = append(details, map[string]any{"ca": b.CAID, "subject": c.Subject.String(), "serial": pki.SerialHex(c), "has_crl": b.HasCRL, "self_signed": pki.IsSelfSigned(c)})
+	}
+	if needMatch && in.SharedMatch == (rsconf.Match{}) {
+		return nil, nil, invalid("CRL のない持ち込みの CA があるときは、共通のブロックの照合の形が要ります")
+	}
+	return cas, details, nil
 }
 
 // DeleteAP は AP を消す（次の反映で client ブロックが消える。すぐに効かせるには、CA で証明書を失効させる。§11.1）。

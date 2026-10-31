@@ -1,5 +1,5 @@
 // Package edge はエッジの中心の処理を受け持つ: テナント・AP・証明書の変更、反映（設計概要 §11.1）、
-// 整合ループ（§11.5）、CRL の取得と反映（§9.5）。画面（と段階 4 の管理API）はここを呼ぶ。
+// 整合ループ（§11.5）、CRL の取得と反映（§9.5）。画面と管理API はここを呼ぶ。
 //
 // 同じテナントの反映・CRL の反映・整合・削除は、テナントごとの排他で 1 つずつ行う。
 package edge
@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -69,6 +70,10 @@ type Options struct {
 	Probe ProbeFunc
 	// ProbeTimeout は反映の後のヘルスチェックの上限（その間、つながるまで繰り返す）。
 	ProbeTimeout time.Duration
+	// ApplyTimeout は裏で動かす反映の上限（0 なら 2 分）。
+	ApplyTimeout time.Duration
+	// Capacity は 1 台のテナントの数の上限（EDGE_TENANT_CAPACITY。0 なら確かめない。§24.11 の EA12）。
+	Capacity int
 	// Now は現在時刻（テストで差し替える）。
 	Now func() time.Time
 }
@@ -76,10 +81,22 @@ type Options struct {
 // Service はエッジの中心の処理。
 type Service struct {
 	Options
-	locks sync.Map // テナントの ID → *sync.Mutex
+	locks sync.Map // テナントの ID → chan struct{}（容量 1）
 
 	mu            sync.Mutex
 	lastReconcile ReconcileState
+
+	// bgCtx は裏で動かす反映のコンテキスト（Shutdown で取り消す）。bgWG は裏の反映の終わりを待つ。
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWG     sync.WaitGroup
+	// applying は裏で動いている反映（テナントの ID → 始めた時刻）。mu で守る。
+	applying map[string]time.Time
+
+	// statusCache は agent の状態の写し（EA9）。statusMu で守る。
+	statusMu    sync.Mutex
+	statusCache agent.Status
+	statusAt    time.Time
 }
 
 // ReconcileState は最後の整合ループの結果（画面に出す）。
@@ -91,7 +108,10 @@ type ReconcileState struct {
 // New は Service を作る。
 func New(o Options) *Service {
 	if o.HTTPClient == nil {
-		o.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		// 接続は 5 秒で諦める（CA が応答しないときに、テナントの数だけ長く待たないように。§24.11 の EA8）。
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.DialContext = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+		o.HTTPClient = &http.Client{Timeout: 30 * time.Second, Transport: tr}
 	}
 	if o.ProbeAddr == nil {
 		o.ProbeAddr = func(slug string, _ int) string { return agent.ContainerName(slug) + ":2083" }
@@ -108,21 +128,52 @@ func New(o Options) *Service {
 	if o.Stamp == (rsconf.Stamp{}) {
 		o.Stamp = rsconf.Stamp{VendorID: DefaultStampVendorID, VendorType: DefaultStampVendorType}
 	}
-	return &Service{Options: o}
+	if o.ApplyTimeout == 0 {
+		o.ApplyTimeout = 2 * time.Minute
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Service{Options: o, bgCtx: ctx, bgCancel: cancel, applying: map[string]time.Time{}}
 }
 
-// lock はテナントの排他を取り、解く関数を返す。
-func (s *Service) lock(id string) func() {
-	m, _ := s.locks.LoadOrStore(id, &sync.Mutex{})
-	mu := m.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+// ErrBusy は、テナントの排他を時間内に取れなかったことを表す（反映などが動いている。§24.11 の EA7）。
+var ErrBusy = errors.New("テナントの反映などが動いています。しばらくしてからやり直してください")
+
+type lockWaitKey struct{}
+
+// WithLockWait は、テナントの排他を待つ時間の上限をコンテキストに入れる（管理API の変更の口。§24.11 の EA7）。
+// 入れなければ、コンテキストが終わるまで待つ。
+func WithLockWait(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, lockWaitKey{}, d)
+}
+
+// acquire はテナントの排他を取り、解く関数を返す。取れないまま待つ時間が過ぎるかコンテキストが終わると、ErrBusy を返す。
+func (s *Service) acquire(ctx context.Context, id string) (func(), error) {
+	m, _ := s.locks.LoadOrStore(id, make(chan struct{}, 1))
+	ch := m.(chan struct{})
+	release := func() { <-ch }
+	select {
+	case ch <- struct{}{}:
+		return release, nil
+	default:
+	}
+	if d, ok := ctx.Value(lockWaitKey{}).(time.Duration); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	select {
+	case ch <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, ErrBusy
+	}
 }
 
 // Actor は操作した人（監査ログと反映の記録に残す）。
 type Actor struct {
-	// Operator は画面の利用者のメールアドレス（管理API では X-Operator-Id）。
-	Operator string
+	// Operator は画面の利用者のメールアドレス（管理API では X-Operator-Id）。MgmtClient は管理API の管理クライアントの識別名。
+	Operator   string
+	MgmtClient string
 	// Source は gui / api / system。
 	Source string
 	Remote string
@@ -133,7 +184,7 @@ var System = Actor{Operator: "system", Source: db.SourceSystem}
 
 // audit は監査ログを書く。書けなくても操作は失敗にしない（ログに残す）。
 func (s *Service) audit(ctx context.Context, a Actor, action, target string, detail map[string]any) {
-	err := s.DB.InsertAudit(context.WithoutCancel(ctx), db.AuditEntry{Operator: a.Operator, Source: a.Source, Action: action,
+	err := s.DB.InsertAudit(context.WithoutCancel(ctx), db.AuditEntry{Operator: a.Operator, MgmtClient: a.MgmtClient, Source: a.Source, Action: action,
 		Target: target, Detail: detail, TraceID: trace.From(ctx), Remote: a.Remote})
 	if err != nil {
 		s.Log.Error("cannot write audit log", "action", action, "target", target, "error", err)
@@ -141,12 +192,28 @@ func (s *Service) audit(ctx context.Context, a Actor, action, target string, det
 	s.Log.Info("audit", "operator", a.Operator, "source", a.Source, "action", action, "target", target, "trace_id", trace.From(ctx))
 }
 
-// InputError は利用者の入力の誤り（画面では、そのまま見せる）。
-type InputError struct{ Msg string }
+// 誤りの理由の符号（管理API の ProblemDetails の cause に出す。空なら VALIDATION）。
+const (
+	CauseTenantStopped    = "TENANT_STOPPED"
+	CauseNotReady         = "NOT_READY"
+	CauseCapacityExceeded = "CAPACITY_EXCEEDED"
+	CauseSlugImmutable    = "SLUG_IMMUTABLE"
+	CauseConflict         = "CONFLICT"
+)
+
+// InputError は利用者の入力の誤り（画面では、そのまま見せる）。Cause は管理API に出す理由の符号。
+type InputError struct {
+	Msg   string
+	Cause string
+}
 
 func (e *InputError) Error() string { return e.Msg }
 
 func invalid(format string, args ...any) error { return &InputError{Msg: fmt.Sprintf(format, args...)} }
+
+func invalidCause(cause, format string, args ...any) error {
+	return &InputError{Msg: fmt.Sprintf(format, args...), Cause: cause}
+}
 
 // IsInput は利用者の入力の誤りか。
 func IsInput(err error) bool {

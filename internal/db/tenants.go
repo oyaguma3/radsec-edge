@@ -32,7 +32,9 @@ type Tenant struct {
 	// Enabled は運用の状態（停止・起動）。望む状態の版には入れない（SetEnabled）。
 	Enabled bool
 	// DesiredVersion は望む状態の版、AppliedVersion・AppliedHash・AppliedPort は反映済みの版と設定のハッシュとポート。
-	DesiredVersion, AppliedVersion  int64
+	DesiredVersion, AppliedVersion int64
+	// Revision は中央（OSS/BSS）が付けた望む状態の版、AppliedRevision は反映済みの版（単独モードでは 0。§24.11）。
+	Revision, AppliedRevision       int64
 	AppliedHash                     string
 	AppliedPort                     int
 	AppliedAt, CreatedAt, UpdatedAt time.Time
@@ -43,7 +45,7 @@ func (t Tenant) Pending() bool { return t.AppliedVersion < t.DesiredVersion }
 
 const tenantColumns = `id, slug, port, auth_upstream, acct_upstream, crl_url, client_ca_pem, server_cert_pem, probe_cert_pem,
 	enabled, desired_version, applied_version, applied_hash, applied_port, applied_at, created_at, updated_at,
-	source_cidrs, shared_match_attr, shared_match_pattern`
+	source_cidrs, shared_match_attr, shared_match_pattern, revision, applied_revision`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -53,7 +55,7 @@ func scanTenant(s scanner) (Tenant, error) {
 	var applied, created, updated int64
 	err := s.Scan(&t.ID, &t.Slug, &t.Port, &auth, &acct, &t.CRLURL, &t.ClientCAPEM, &t.ServerCertPEM, &t.ProbeCertPEM,
 		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &t.AppliedPort, &applied, &created, &updated,
-		&cidrs, &t.SharedMatchAttr, &t.SharedMatchPattern)
+		&cidrs, &t.SharedMatchAttr, &t.SharedMatchPattern, &t.Revision, &t.AppliedRevision)
 	if err != nil {
 		return Tenant{}, err
 	}
@@ -246,11 +248,11 @@ func (d *DB) SetEnabled(ctx context.Context, id string, enabled bool) error {
 	return nil
 }
 
-// MarkApplied は版 version を、ハッシュ hash とポート port で反映済みにする（時刻も残す）。反映の間に望む状態が
+// MarkApplied は版 version と中央の版 revision を、ハッシュ hash とポート port で反映済みにする（時刻も残す）。反映の間に望む状態が
 // 進んでいても、反映した版の番号を残すので、次の反映でその先を反映する。
-func (d *DB) MarkApplied(ctx context.Context, id string, version int64, hash string, port int) error {
-	_, err := d.sql.ExecContext(ctx, "UPDATE tenants SET applied_version = ?, applied_hash = ?, applied_port = ?, applied_at = ? WHERE id = ?",
-		version, hash, port, millis(d.now()), id)
+func (d *DB) MarkApplied(ctx context.Context, id string, version, revision int64, hash string, port int) error {
+	_, err := d.sql.ExecContext(ctx, "UPDATE tenants SET applied_version = ?, applied_revision = ?, applied_hash = ?, applied_port = ?, applied_at = ? WHERE id = ?",
+		version, revision, hash, port, millis(d.now()), id)
 	if err != nil {
 		return fmt.Errorf("mark applied %s: %w", id, err)
 	}
@@ -267,6 +269,15 @@ func (d *DB) DeleteTenant(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// CountTenants はテナントの数を返す。
+func (d *DB) CountTenants(ctx context.Context) (int, error) {
+	var n int
+	if err := d.sql.QueryRowContext(ctx, "SELECT count(*) FROM tenants").Scan(&n); err != nil {
+		return 0, fmt.Errorf("count tenants: %w", err)
+	}
+	return n, nil
 }
 
 // FreePort は使われていないポートのうち最も小さいものを返す。空きがなければ ErrConflict。

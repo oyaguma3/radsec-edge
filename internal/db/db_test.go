@@ -39,7 +39,7 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("second Migrate = %v, %v", applied, err)
 	}
 	v, err := d.SchemaVersion(t.Context())
-	if err != nil || v != 3 {
+	if err != nil || v != 4 {
 		t.Fatalf("SchemaVersion = %d, %v", v, err)
 	}
 	// 新しい版で移行した DB は、古い版では使わない。
@@ -96,7 +96,7 @@ func TestTenants(t *testing.T) {
 	if err := d.SetEnabled(ctx, "tenant-a", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.MarkApplied(ctx, "tenant-a", 2, "h", 20830); err != nil {
+	if err := d.MarkApplied(ctx, "tenant-a", 2, 7, "h", 20830); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.Tenant(ctx, "tenant-a")

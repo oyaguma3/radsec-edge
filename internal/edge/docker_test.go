@@ -200,3 +200,47 @@ func checkSeen(t *testing.T, e *env, ok func(SeenState) bool) {
 	logs, _ := e.svc.Agent.Logs(t.Context(), "tenant-a", 50)
 	t.Fatalf("ap-001 seen = %+v\n%s", last, logs)
 }
+
+// TestDockerInterruptedApply は、反映の途中（current を付け替えた直後）でプロセスが落ちたときの直りを確かめる（§24.11 の EA6）。
+// やり直しの反映が「差なし」と判定すると、radsecproxy は古い設定で動いたまま反映済みになり、登録した AP がつながらない。
+func TestDockerInterruptedApply(t *testing.T) {
+	e := dockerEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	tn, err := e.svc.UpdateTenant(ctx, e.user, "tenant-a", TenantInput{Port: 20991, Auth: authUp, Acct: acctUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatalf("Apply = %+v, %v", rec, err)
+	}
+
+	// AP を足して、反映の途中で落ちたのと同じ状態を作る（新しい版を current にしたが、radsecproxy は読み直していない）。
+	_, apKey := pkitest.NewKeyPair(t)
+	csr, _ := pki.NewCSR(apKey, "x")
+	_, apPEM := e.ca.SignCSR(t, pkitest.Leaf{CN: "tenant-a-ap-001", URI: names.SANURI("example", "tenant-a", "ap-001")}, csr)
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", apPEM); err != nil {
+		t.Fatal(err)
+	}
+	tn, _ = e.db.Tenant(ctx, "tenant-a")
+	b, err := e.svc.render(ctx, tn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := e.svc.Store.Stage(tn.Slug, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Store.Activate(tn.Slug, gen); err != nil {
+		t.Fatal(err)
+	}
+
+	// やり直しの反映の後は、登録した AP がつながらなければならない。
+	if rec, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatalf("Apply(again) = %+v, %v", rec, err)
+	}
+	if err := apProbe(t, e, tn.Port, apPEM, apKey); err != nil {
+		logs, _ := e.svc.Agent.Logs(ctx, "tenant-a", 20)
+		t.Fatalf("the AP cannot connect after the interrupted apply was redone: %v\n%s", err, logs)
+	}
+}
