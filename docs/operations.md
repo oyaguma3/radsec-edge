@@ -148,6 +148,16 @@ docker ps -aq --filter label=radsec-edge.tenant | xargs -r docker rm -f   # テ�
 { "userland-proxy": false, "live-restore": true }
 ```
 
+コンテナごとに inotify のインスタンスを 1 つ使うので、`fs.inotify.max_user_instances` を上げる（Debian 13 の既定は 128 で、130 個目あたりのコンテナから dockerd のログに `failed to watch oom events ... too many open files` が出る。aka-mvpset の `verify/edge-long/`）。
+
+```bash
+echo 'fs.inotify.max_user_instances = 1024' | sudo tee /etc/sysctl.d/90-radsec-edge.conf > /dev/null
+```
+
+```bash
+sudo sysctl --system
+```
+
 WireGuard（`wg-quick@wg0`）を Docker より先に上げる。トンネルのアドレスがホストにないと、管理API のポートを公開できずに `radsec-edge` が起動しない。
 
 ### 10.2 導入
