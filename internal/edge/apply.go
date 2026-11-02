@@ -479,10 +479,10 @@ func (s *Service) reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ids, slugs := map[string]bool{}, map[string]bool{}
+	ids := map[string]bool{}
 	var errs []error
 	for _, t := range tenants {
-		ids[t.ID], slugs[t.Slug] = true, true
+		ids[t.ID] = true
 		unlock, err := s.acquire(ctx, t.ID)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", t.ID, err))
@@ -515,15 +515,29 @@ func (s *Service) reconcile(ctx context.Context) error {
 		}
 		unlock()
 	}
+	errs = append(errs, s.removeOrphanDirs(ctx))
+	return errors.Join(errs...)
+}
+
+// removeOrphanDirs は DB にないテナントのディレクトリを消す。テナントの行を作ってからディレクトリを作るので、
+// ディスクの一覧の後に DB の一覧を読めば、ループの途中で宣言したテナントを消さない（管理モードでは ID と slug が違うので、slug で比べる）。
+func (s *Service) removeOrphanDirs(ctx context.Context) error {
 	onDisk, err := s.Store.Slugs()
 	if err != nil {
-		errs = append(errs, err)
+		return err
 	}
+	tenants, err := s.DB.Tenants(ctx)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(tenants))
+	for _, t := range tenants {
+		known[t.Slug] = true
+	}
+	var errs []error
 	for _, slug := range onDisk {
-		if !slugs[slug] {
-			if _, err := s.DB.Tenant(ctx, slug); errors.Is(err, db.ErrNotFound) {
-				errs = append(errs, s.Store.Remove(slug))
-			}
+		if !known[slug] {
+			errs = append(errs, s.Store.Remove(slug))
 		}
 	}
 	return errors.Join(errs...)

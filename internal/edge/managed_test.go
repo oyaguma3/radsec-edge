@@ -5,10 +5,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/oyaguma3/radsec-edge/internal/db"
+	"github.com/oyaguma3/radsec-edge/internal/edge/edgetest"
 	"github.com/oyaguma3/radsec-edge/internal/pki/pkitest"
 )
 
@@ -283,5 +286,60 @@ func TestAgentStatusCache(t *testing.T) {
 	st, _ = e.svc.AgentStatus(ctx)
 	if _, ok := st.Container("y"); !ok {
 		t.Error("forgetStatus did not work")
+	}
+}
+
+// ensureHookAgent は、最初の Ensure の前に 1 回だけ onEnsure を呼ぶ（整合ループの途中に別の要求が来たときを作る）。
+type ensureHookAgent struct {
+	*edgetest.FakeAgent
+	onEnsure func()
+}
+
+func (a *ensureHookAgent) Ensure(ctx context.Context, id, slug string, port int) (string, error) {
+	if f := a.onEnsure; f != nil {
+		a.onEnsure = nil
+		f()
+	}
+	return a.FakeAgent.Ensure(ctx, id, slug, port)
+}
+
+// 整合ループの途中で宣言した新しいテナントのディレクトリを消さない（管理モードでは ID と slug が違う）。
+func TestReconcileKeepsTenantDeclaredDuringPass(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-b")
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	// 止めたコンテナを起動するところで、ループの最初の一覧にないテナントを宣言する。
+	e.agent.Containers["tenant-b"].Running = false
+	dir := filepath.Join(e.svc.Store.Root, "tenant-a")
+	e.svc.Agent = &ensureHookAgent{FakeAgent: e.agent, onEnsure: func() {
+		if _, err := e.svc.Declare(ctx, e.user, e.declaration(1)); err != nil {
+			t.Error(err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "gen"), 0o750); err != nil {
+			t.Error(err)
+		}
+	}}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the directory of the tenant declared during the pass was removed: %v", err)
+	}
+	// 次の周回でも消さず、DB にないディレクトリは消す。
+	gone := filepath.Join(e.svc.Store.Root, "gone")
+	if err := os.MkdirAll(filepath.Join(gone, "gen"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the directory of a declared tenant was removed: %v", err)
+	}
+	if _, err := os.Stat(gone); !os.IsNotExist(err) {
+		t.Error("the directory of a deleted tenant is left")
 	}
 }
