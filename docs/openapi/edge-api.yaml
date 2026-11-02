@@ -13,7 +13,7 @@ info:
       応答は 24 時間覚える（5xx は覚えない）。**`apply`・`crl:refresh`・`restart` は実行のたびに新しい鍵を使う**（同じ鍵だと前の応答を返すだけで何もしない）。
     - 変更の口はテナントの排他を最大 5 秒待ち、取れなければ 503 `TENANT_BUSY` と `Retry-After` を返す（反映などが動いている）。読み出しの口は待たない。
     - 宣言は `PUT /tenants/{tenantId}` 1 本で、AP とグループの一覧を含めてまるごと置き換える。エッジは `revision` を覚えるだけで新旧を判断しない。
-      呼び出し側は「`revision` が違えば PUT、`pending` が true か `appliedRevision` が違えば `apply`」と判断する。
+      呼び出し側は「`revision` が違えば PUT」とし、`apply` は呼び出し側が決めた時に呼ぶ（aka-ossbss は反映を求めた版に届いていないとき）。
     - 要求の本文は 1 MiB まで。時刻は RFC 3339（UTC）。
     - エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。
 servers:
