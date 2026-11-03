@@ -70,7 +70,22 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	defer os.Remove(cfg.Socket)
-	return server.Serve(ctx, ln, server.Options{Addr: cfg.Socket, Handler: srv.Routes(), Log: log})
+	// Docker Engine に届かないままなら終了し、再起動の方針で作り直させる（dockerd がソケットを作り直したとき。agent.WatchDocker）。
+	sctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	go func() {
+		if err := agent.WatchDockerDefault(sctx, log, d.Ping); err != nil {
+			log.Error("exiting", "error", err)
+			stop(err)
+		}
+	}()
+	if err := server.Serve(sctx, ln, server.Options{Addr: cfg.Socket, Handler: srv.Routes(), Log: log}); err != nil {
+		return err
+	}
+	if err := context.Cause(sctx); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
 }
 
 // listen は unix ソケットで待ち受ける。前に残ったソケットは消す。radsec-edge（グループ gid）だけがつなげるよう、

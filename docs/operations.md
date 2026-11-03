@@ -148,6 +148,8 @@ docker ps -aq --filter label=radsec-edge.tenant | xargs -r docker rm -f   # テ�
 { "userland-proxy": false, "live-restore": true }
 ```
 
+`radsec-edge-agent` は `docker.sock` をファイルとしてマウントするので、dockerd がソケットを作り直すと（systemd のソケット起動でない dockerd の再起動など）、古いソケットを見たままになり Docker に届かなくなる。agent は 60 秒続けて届かなければ終了し、再起動の方針で作り直されて新しいソケットをつなぐ（その間の反映は失敗する。テナントのコンテナと AP の接続は続く）。dockerd を再起動した後は、管理API の `/status` の `agent.dockerOk` が `true` に戻ったことを確かめる（aka-mvpset の `verify/edge-long/`）。
+
 コンテナごとに inotify のインスタンスを 1 つ使うので、`fs.inotify.max_user_instances` を上げる（Debian 13 の既定は 128 で、130 個目あたりのコンテナから dockerd のログに `failed to watch oom events ... too many open files` が出る。aka-mvpset の `verify/edge-long/`）。
 
 ```bash
