@@ -160,7 +160,7 @@ echo 'fs.inotify.max_user_instances = 1024' | sudo tee /etc/sysctl.d/90-radsec-e
 sudo sysctl --system
 ```
 
-WireGuard（`wg-quick@wg0`）を Docker より先に上げる。トンネルのアドレスがホストにないと、管理API のポートを公開できずに `radsec-edge` が起動しない。
+サービス用の WireGuard（`wg-quick@wg-svc`。データ面と管理面のそれぞれと直接ピアを張る。設計概要の決定事項 22）を Docker より先に上げる。トンネルのアドレスがホストにないと、管理API のポートを公開できずに `radsec-edge` が起動しない。SSH は運用用の WireGuard（`wg-ops`。監視ノードがハブ）で行う。
 
 ### 10.2 導入
 
