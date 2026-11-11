@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,7 +219,7 @@ func TestStartApplyAndShutdown(t *testing.T) {
 	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil); err != nil {
 		t.Fatal(err)
 	}
-	// ヘルスチェックの途中で止める。Shutdown で取り消され、前の版に戻す。
+	// ヘルスチェックの途中で止める。Shutdown で取り消され、前の版に戻し、途中で止まったとして記録する（中央が自動でやり直す。T5-19）。
 	entered := make(chan struct{}, 1)
 	var calls int
 	e.svc.Probe = func(c context.Context, _ string, _ tls.Certificate, _ *x509.Certificate) error {
@@ -253,9 +254,61 @@ func TestStartApplyAndShutdown(t *testing.T) {
 	if gen, _, _ := e.svc.Store.Current("tenant-a"); gen != good {
 		t.Errorf("current = %q, want %q", gen, good)
 	}
-	if last, _ := e.db.LastApply(ctx, "tenant-a"); last.Result != db.ResultRolledBack {
+	if last, _ := e.db.LastApply(ctx, "tenant-a"); last.Result != db.ResultInterrupted || !strings.Contains(last.Error, "止めるので") {
 		t.Errorf("LastApply = %+v", last)
 	}
+}
+
+// 構文検査の途中で止めると（毎日のバックアップが radsec-edge を止めたときに起きた。§24.13 の T5-19）、前の版のまま終え、
+// 失敗ではなく途中で止まったとして記録する。反映の時間切れは止めるときの取り消しではないので、失敗のまま。
+func TestShutdownDuringValidate(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	good, _, _ := e.svc.Store.Current("tenant-a")
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", nil); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	e.agent.ValidateWait = func(c context.Context) error {
+		entered <- struct{}{}
+		<-c.Done()
+		return c.Err()
+	}
+	if started, err := e.svc.StartApply(ctx, e.user, "tenant-a"); err != nil || !started {
+		t.Fatalf("StartApply = %v, %v", started, err)
+	}
+	<-entered
+	e.svc.Shutdown(5 * time.Second)
+	if gen, _, _ := e.svc.Store.Current("tenant-a"); gen != good {
+		t.Errorf("current = %q, want %q", gen, good)
+	}
+	last, _ := e.db.LastApply(ctx, "tenant-a")
+	if last.Result != db.ResultInterrupted || !strings.Contains(last.Error, "止めるので") || !strings.Contains(last.Error, "構文検査ができません") {
+		t.Errorf("LastApply = %+v", last)
+	}
+
+	// 時間切れ（止めていない）は失敗のまま。
+	e2 := newEnv(t)
+	e2.readyTenant(t, "tenant-a")
+	e2.svc.ApplyTimeout = 50 * time.Millisecond
+	e2.agent.ValidateWait = func(c context.Context) error {
+		<-c.Done()
+		return c.Err()
+	}
+	if started, err := e2.svc.StartApply(ctx, e2.user, "tenant-a"); err != nil || !started {
+		t.Fatalf("StartApply = %v, %v", started, err)
+	}
+	for _, running := e2.svc.ApplyRunning("tenant-a"); running; _, running = e2.svc.ApplyRunning("tenant-a") {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if last, _ := e2.db.LastApply(ctx, "tenant-a"); last.Result != db.ResultFailed {
+		t.Errorf("LastApply(timeout) = %+v", last)
+	}
+	e2.svc.Shutdown(time.Second)
 }
 
 func TestAgentStatusCache(t *testing.T) {

@@ -210,6 +210,10 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 	forceRestart := s.recoverInterrupted(ctx, a, t)
 	rec := db.Apply{TenantID: id, Version: t.DesiredVersion, Revision: t.Revision, Trigger: db.TriggerApply, Operator: a.Operator, Started: s.Now()}
 	fail := func(result string, err error) (db.Apply, error) {
+		if s.stopping(ctx) {
+			// 止めるときの取り消しで、前の版のまま終えたか前の版に戻した（§24.13 の T5-19）。中央は interrupted を自動でやり直す
+			result, err = db.ResultInterrupted, fmt.Errorf("radsec-edge を止めるので反映を取り消しました: %w", err)
+		}
 		rec.Result, rec.Error = result, err.Error()
 		s.record(ctx, &rec)
 		s.audit(ctx, a, "tenant.apply", id, map[string]any{"version": rec.Version, "result": rec.Result})

@@ -47,7 +47,8 @@ func resultLabel(s string) string {
 	case db.ResultRolledBack:
 		return "失敗（前の版に戻した）"
 	case db.ResultInterrupted:
-		return "途中で止まった（前の版に戻した）"
+		// 反映の途中で止まった・止めた。前の版のまま終えたか、前の版に戻した（§24.11 の EA6、§24.13 の T5-19）
+		return "途中で止まった（前の版のまま）"
 	}
 	return s
 }

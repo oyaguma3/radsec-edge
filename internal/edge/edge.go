@@ -135,6 +135,12 @@ func New(o Options) *Service {
 	return &Service{Options: o, bgCtx: ctx, bgCancel: cancel, applying: map[string]time.Time{}}
 }
 
+// stopping は、radsec-edge を止めるので裏の反映が取り消されたか（Shutdown。§24.13 の T5-19）。
+// 止めるときの取り消しで反映できなかったものは、反映の失敗ではなく途中で止まったものとして記録する（中央が自動でやり直す）。
+func (s *Service) stopping(ctx context.Context) bool {
+	return ctx.Err() != nil && s.bgCtx.Err() != nil
+}
+
 // ErrBusy は、テナントの排他を時間内に取れなかったことを表す（反映などが動いている。§24.11 の EA7）。
 var ErrBusy = errors.New("テナントの反映などが動いています。しばらくしてからやり直してください")
 

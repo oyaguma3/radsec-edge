@@ -25,6 +25,8 @@ type FakeAgent struct {
 	// ValidateOK は Validate の結果、FailEnsure は Ensure の誤り。
 	ValidateOK bool
 	FailEnsure error
+	// ValidateWait は Validate の前に呼ぶ（nil でなければ）。誤りを返すと Validate はその誤りを返す（止めるときの取り消しの試験）。
+	ValidateWait func(ctx context.Context) error
 }
 
 // NewFakeAgent は偽物の agent を作る。
@@ -112,10 +114,18 @@ func (f *FakeAgent) LogsSince(_ context.Context, id string, since time.Time) (st
 	f.Since = append(f.Since, since)
 	return f.LogsText[id], nil
 }
-func (f *FakeAgent) Validate(_ context.Context, slug, gen string) (agent.ValidateResult, error) {
+func (f *FakeAgent) Validate(ctx context.Context, slug, gen string) (agent.ValidateResult, error) {
+	f.mu.Lock()
+	f.call("validate " + slug)
+	wait := f.ValidateWait
+	f.mu.Unlock()
+	if wait != nil {
+		if err := wait(ctx); err != nil {
+			return agent.ValidateResult{}, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.call("validate " + slug)
 	if !f.ValidateOK {
 		return agent.ValidateResult{Output: "syntax error"}, nil
 	}

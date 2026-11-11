@@ -222,7 +222,12 @@ func (s *Service) runApply(ctx context.Context, a Actor, t db.Tenant) {
 	}
 	rec, err := s.Apply(ctx, a, t.ID)
 	if err != nil && rec.TenantID == "" && !errors.Is(err, db.ErrNotFound) {
-		failed := db.Apply{TenantID: t.ID, Version: t.DesiredVersion, Revision: t.Revision, Trigger: db.TriggerApply, Result: db.ResultFailed,
+		result := db.ResultFailed
+		if s.stopping(ctx) {
+			// 排他を待つ間などに止めるので取り消された（§24.13 の T5-19）
+			result, err = db.ResultInterrupted, fmt.Errorf("radsec-edge を止めるので反映を取り消しました: %w", err)
+		}
+		failed := db.Apply{TenantID: t.ID, Version: t.DesiredVersion, Revision: t.Revision, Trigger: db.TriggerApply, Result: result,
 			Error: err.Error(), Operator: a.Operator, Started: s.Now()}
 		s.record(ctx, &failed)
 	}
