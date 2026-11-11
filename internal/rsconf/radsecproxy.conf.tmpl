@@ -33,6 +33,8 @@ client {{.Name}} {
 {{- end}}
     tls tenant
     certificateNameCheck off
+{{- /* NAT の内側の AP の接続を保ち、切れた接続に気づく（10 秒流れがなければ確かめ、30 秒応えがなければ切る。aka-mvpset の T5-18） */}}
+    TCPKeepalive on
 {{- if .Match}}
     matchCertificateAttribute {{.Match}}
 {{- end}}
