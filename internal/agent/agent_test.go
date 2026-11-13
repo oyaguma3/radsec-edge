@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,15 @@ func TestSpec(t *testing.T) {
 	}
 	if other := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "", "12", "tenant-a", 20832); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
 		t.Error("spec hash does not change with the port")
+	}
+	// malloc の領域の数を絞る（§24.13 の T5-21）。環境変数もひな形のハッシュに入る（変われば作り直す）。
+	if !slices.Equal(s.Env, []string{"MALLOC_ARENA_MAX=2"}) {
+		t.Errorf("env: %v", s.Env)
+	}
+	noEnv := s
+	noEnv.Env = nil
+	if specHash(noEnv) == s.Labels[LabelSpec] {
+		t.Error("spec hash does not change with the environment")
 	}
 	// 公開するアドレスを指定すると、そのアドレスだけに公開し、ひな形も変わる（作り直す）。
 	bound := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "192.0.2.1", "", "12", "tenant-a", 20831)

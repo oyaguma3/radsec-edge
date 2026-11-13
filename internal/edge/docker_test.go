@@ -99,6 +99,11 @@ func TestDockerApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply = %+v, %v", rec, err)
 	}
+	// ひな形の環境変数が Docker に渡る（malloc の領域の数を絞る。設計概要 §24.13 の T5-21）。
+	if out, err := exec.Command("docker", "inspect", "-f", "{{json .Config.Env}}", agent.ContainerName("tenant-a")).Output(); err != nil ||
+		!strings.Contains(string(out), `"MALLOC_ARENA_MAX=2"`) {
+		t.Errorf("container env = %s, %v", out, err)
+	}
 
 	// AP を登録して反映すると（再起動）、AP の証明書でつながる。
 	_, apKey := pkitest.NewKeyPair(t)

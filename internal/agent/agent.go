@@ -36,6 +36,10 @@ const (
 	ContainerPort = "2083/tcp"
 	// MountTarget はテナントのディレクトリをマウントする場所。
 	MountTarget = "/conf"
+	// mallocArenaMax は radsecproxy の glibc の malloc の領域（arena）の数の上限（§24.13 の T5-21）。
+	// radsecproxy は AP の接続ごとにスレッドを作り、malloc はスレッドごとに領域を足して返さないので、既定のままだと
+	// 同時のスレッドの数に応じて 1 個あたりのメモリーが増える（上限は 8 × コア数）。2 に絞って、AP の数によらず上限を決める。
+	mallocArenaMax = "MALLOC_ARENA_MAX=2"
 	// confPath は radsecproxy の設定（MountTarget/current/radsecproxy.conf）。
 	confPath = "/conf/current/radsecproxy.conf"
 	// ポートの範囲。
@@ -155,6 +159,7 @@ type spec struct {
 	Image        string              `json:"Image"`
 	User         string              `json:"User"`
 	Cmd          []string            `json:"Cmd"`
+	Env          []string            `json:"Env,omitempty"`
 	Labels       map[string]string   `json:"Labels"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
 	HostConfig   hostConfig          `json:"HostConfig"`
@@ -211,6 +216,7 @@ func tenantSpec(tenantsDir, network, publishAddr, fluentd, tenantID, slug string
 		s.HostConfig.LogConfig = fluentdLog(fluentd, tenantID)
 	}
 	s.Cmd = []string{"radsecproxy", "-f", "-c", confPath}
+	s.Env = []string{mallocArenaMax}
 	s.Labels = map[string]string{LabelTenant: tenantID, LabelSlug: slug, LabelPort: strconv.Itoa(port)}
 	s.ExposedPorts = map[string]struct{}{ContainerPort: {}}
 	s.HostConfig.Mounts = []mount{{Type: "bind", Source: path.Join(tenantsDir, slug), Target: MountTarget, ReadOnly: true}}
@@ -248,10 +254,10 @@ func baseSpec(network string) spec {
 	}
 }
 
-// specHash はひな形のハッシュ（ラベル LabelSpec に入れ、ひな形やポートが変わったら作り直す）。
+// specHash はひな形のハッシュ（ラベル LabelSpec に入れ、ひな形やポートが変わったら作り直す）。環境変数も含める。
 func specHash(s spec) string {
 	s.Labels = map[string]string{LabelTenant: s.Labels[LabelTenant], LabelSlug: s.Labels[LabelSlug], LabelPort: s.Labels[LabelPort]}
 	h := sha256.New()
-	fmt.Fprintf(h, "%v|%v|%v|%v|%+v|%+v|%+v", s.Image, s.User, s.Cmd, s.Labels, s.HostConfig.Mounts, s.HostConfig.PortBindings, s.HostConfig)
+	fmt.Fprintf(h, "%v|%v|%v|%v|%v|%+v|%+v|%+v", s.Image, s.User, s.Cmd, s.Env, s.Labels, s.HostConfig.Mounts, s.HostConfig.PortBindings, s.HostConfig)
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
