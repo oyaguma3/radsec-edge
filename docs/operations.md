@@ -38,7 +38,7 @@ stat -c %g /var/run/docker.sock   # EDGE_DOCKER_GID に書く
 | `EDGE_UPSTREAM_SECRET` | 上流との共有シークレット（8〜128 文字の英数字と `._~+/=@-`） |
 | `EDGE_STAMP_VENDOR_ID`・`EDGE_STAMP_VENDOR_TYPE` | テナントの刻印の VSA（既定 32473・1。起動のときにログに出す）。単独モードの刻印の値はテナントの slug。上流が使わなければ無視される |
 | `EDGE_CRL_BASE_URL` | CA の配布の口（例 `http://10.0.0.1:8449`）。空なら、テナントの画面で CRL を貼り付けて取り込む |
-| `EDGE_TENANT_CAPACITY` | 1 台に置くテナントの数の上限（既定 150）。4 GB のエッジで 150、2 GB で 60 が保証値。超える新しいテナントは断る |
+| `EDGE_TENANT_CAPACITY` | 1 台に置くテナントの数の上限（既定 150）。4 GB のエッジで 150、2 GB で 60 が保証値。超える新しいテナントは断る。MVP セットの段階 5 の試験では 4 GB・150 テナント・AP の接続 740 本の定常で使用量が約 2.9 GiB だったので、運用では 140 を超えたら次のエッジを用意する（aka-ossbss の運用ガイド 14.3） |
 | `EDGE_AGENT_PUBLISH_ADDR` | テナントのポートを公開するアドレス。空ならすべてのアドレス。公開のアドレスを 1 つに絞るときに書く |
 | `EDGE_ACCESS_TEAM_DOMAIN`・`EDGE_ACCESS_AUD` | Cloudflare Access のチームのドメインと AUD タグ |
 
