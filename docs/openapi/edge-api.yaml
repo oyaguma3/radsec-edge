@@ -1,9 +1,10 @@
 openapi: 3.1.0
 info:
   title: radsec-edge 管理API
-  version: 1.0.0
+  version: 1.1.0
   description: |
-    radsec-edge（RadSec のエッジ）の管理API（設計概要 §12.1、§24.11）。管理モード（`EDGE_MODE=managed`）だけ待ち受ける。呼び出し側は aka-provisioner だけで、全権として扱う。
+    radsec-edge（RadSec のエッジ）の管理API（設計概要 §12.1、§24.11、§24.14）。1.1.0 で、テナントのコンテナのひな形（`template`・`configCurrent`・
+    `Status.templates`）と、反映の任意の本文（`template`）を足した。管理モード（`EDGE_MODE=managed`）だけ待ち受ける。呼び出し側は aka-provisioner だけで、全権として扱う。
 
     - 認証は mTLS。管理クライアントの証明書の SHA-256 フィンガープリントを、ピンのファイル（`EDGE_ADMIN_CLIENTS_FILE`。`SIGHUP` で読み直す）と
       照合する（CA は使わない）。証明書なし・未登録・有効期間外の接続は TLS のハンドシェイクで断る。サーバー証明書は自己署名
@@ -234,11 +235,26 @@ paths:
       description: |
         最大 2 分かかる（`EDGE_APPLY_TIMEOUT`）。結果は `GET /tenants/{tenantId}` の `apply` と `appliedRevision` で見る。足りない CRL は裏の処理の最初に取りに行く。
         すでに動いていれば、重ねずに `started: false` を返す。
+
+        本文は省ける（記録のひな形のまま反映する）。`template` が `latest` なら今の形（最新のひな形の版と、タグが今指している radsecproxy のイメージ）で、
+        `previous` なら 1 つ前の形でコンテナを作り直す。そのイメージで構文検査し、作り直してヘルスチェックし、通らなければ元の形で作り直す（設計概要 §24.14）。
       operationId: applyTenant
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/OperatorID"
         - $ref: "#/components/parameters/TraceID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                template:
+                  type: string
+                  enum: [latest, previous]
+                  description: コンテナのひな形の扱い（省くと記録のひな形を保つ）
       responses:
         "202":
           description: 受け付けた
@@ -256,8 +272,16 @@ paths:
                   startedAt:
                     type: string
                     format: date-time
+        "400":
+          $ref: "#/components/responses/Problem"
         "404":
           $ref: "#/components/responses/Problem"
+        "409":
+          description: "`NO_PREVIOUS_TEMPLATE`（前の形の記録がない）、`TEMPLATE_UNAVAILABLE`（今の形のイメージがない、前の形のイメージが消えた・作れない版）"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "422":
           description: "`TENANT_STOPPED`（停止している）、`NOT_READY`（証明書が足りない）"
           content:
@@ -422,7 +446,7 @@ components:
           type: string
           description: |
             `VALIDATION`、`TENANT_NOT_FOUND`、`CONTAINER_NOT_FOUND`、`TENANT_BUSY`、`TENANT_STOPPED`、`NOT_READY`、`CAPACITY_EXCEEDED`、`SLUG_IMMUTABLE`、`CONFLICT`、
-            `IDEMPOTENCY_CONFLICT`、`SYSTEM_FAILURE`
+            `NO_PREVIOUS_TEMPLATE`、`TEMPLATE_UNAVAILABLE`、`IDEMPOTENCY_CONFLICT`、`SYSTEM_FAILURE`
         invalidParams:
           type: array
           items:
@@ -579,6 +603,42 @@ components:
           $ref: "#/components/schemas/Container"
         apCount:
           type: integer
+        template:
+          $ref: "#/components/schemas/TemplateState"
+        configCurrent:
+          type: boolean
+          description: |
+            未反映の変更がないのに、今のコードの書き方で描くと反映済みと違えば false（次の反映で今の書き方になる）。分からなければ省く
+            （未反映の変更がある、まだ反映していない、まだ計っていない）
+    TemplateRef:
+      type: object
+      required: [version, image]
+      description: コンテナのひな形（ひな形の版と radsecproxy のイメージの ID）
+      properties:
+        version:
+          type: integer
+        image:
+          type: string
+          description: イメージの ID（sha256:...）
+    TemplateState:
+      type: object
+      description: テナントのコンテナのひな形の状態（設計概要 §24.14）。`current` と `canRollback` は agent に届かないと省く
+      properties:
+        recorded:
+          $ref: "#/components/schemas/TemplateRef"
+        running:
+          $ref: "#/components/schemas/TemplateRef"
+        previous:
+          $ref: "#/components/schemas/TemplateRef"
+        current:
+          type: boolean
+          description: 記録が今の形と同じで、コンテナも記録どおりに動いているか（false なら古い）
+        mismatch:
+          type: boolean
+          description: コンテナが記録と違う形で動いているか（反映が途中で止まった、DB を戻したなど。整合ループは作り直さない）
+        canRollback:
+          type: boolean
+          description: 前の形に戻せるか（前の形の記録があり、そのイメージがホストにあり、その版を作れる）
     ApplyState:
       type: object
       required: [state]
@@ -799,7 +859,7 @@ components:
                 format: date-time
     Status:
       type: object
-      required: [service, version, mode, urnPrefix, dnsDomain, stamp, agent, capacity, reconcile, adminClients, tenants]
+      required: [service, version, mode, urnPrefix, dnsDomain, stamp, agent, capacity, reconcile, templates, adminClients, tenants]
       properties:
         service:
           type: string
@@ -862,6 +922,46 @@ components:
               format: date-time
             error:
               type: string
+        templates:
+          type: object
+          required: [supported, staleTenants, mismatchTenants, configStaleTenants, images]
+          description: 今の形と、古いテナントの数（agent に届かなければ `latest` を省き、数は 0）
+          properties:
+            latest:
+              $ref: "#/components/schemas/TemplateRef"
+            supported:
+              type: array
+              description: このコードが作れるひな形の版（今と 1 つ前まで）
+              items:
+                type: integer
+            staleTenants:
+              type: integer
+              description: ひな形が今の形でないテナントの数
+            mismatchTenants:
+              type: integer
+              description: コンテナが記録と違う形で動いているテナントの数
+            configStaleTenants:
+              type: integer
+              description: 設定の書き方が古いテナントの数
+            images:
+              type: array
+              description: ホストにある radsecproxy のイメージ（`radsec-edge/radsecproxy` のタグの付いたもの。agent が付けた `keep-` のタグを含む）
+              items:
+                type: object
+                required: [id, tags, inUse]
+                properties:
+                  id:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  created:
+                    type: string
+                    format: date-time
+                  inUse:
+                    type: integer
+                    description: このイメージを使っているテナントのコンテナの数
         adminClients:
           type: array
           items:

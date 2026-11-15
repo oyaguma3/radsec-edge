@@ -113,8 +113,22 @@ AP の NAS-Identifier は `<テナント>-<AP>` になり、AP が名乗る値�
 ## 7. バックアップと戻し方
 
 - バックアップの対象は `EDGE_HOST_DIR/data`（SQLite と、サーバー証明書・ヘルスチェック用の証明書の鍵）。`tenants` は SQLite と鍵から作り直せる（反映すると生成する）。
-- `docker compose stop radsec-edge` で止めてから `data` を写す（動かしたままだと、SQLite の WAL の途中を写すことがある）。鍵が入るので、写しの置き場所に気を付ける。
-- 戻すときは、止めてから `data` を置き換え（所有者 10084:10083）、起動して、テナントごとに反映する。
+- 止めずに取る。`radsec-edge backup -out` で DB の写しを作り（SQLite の `VACUUM INTO`。監査ログに残る）、`data` を、動いている DB のファイル（`radsec-edge.db`、`-wal`、`-shm`）を除いて写す。鍵のファイルは名前を変えて置く作りなので、動かしたまま写してよい。止めて写すと、その間に始まった反映が途中で止まり（設計概要 §24.13 の T5-19）、起動のときに全テナントに CRL の読み直しの SIGHUP が出る。鍵が入るので、写しの置き場所に気を付ける。
+
+```bash
+docker compose exec radsec-edge /radsec-edge backup -out /data/backup.db
+```
+
+```bash
+sudo tar -C /var/lib/radsec-edge --exclude='data/radsec-edge.db*' -czf edge-data.tgz data
+```
+
+```bash
+sudo rm /var/lib/radsec-edge/data/backup.db
+```
+
+- 写しの `data/backup.db` が DB の写しになる（tar の中では `data/backup.db`）。aka-mvpset の `deploy/node/backup.sh` は毎日この形で取る。
+- 戻すときは、止めてから `data` を置き換え、`backup.db` を `radsec-edge.db` に名前を変え（所有者 10084:10083）、起動して、テナントごとに反映する。
 - 古いバックアップに戻して、DB の反映済みの版と `tenants` の今の版が違うと、次の整合ループが DB の反映済みの版に戻して再起動する（その版のディレクトリが残っていなければ、次の反映で再起動して読み込ませる）。
 
 ## 8. 試験（E2E）
@@ -148,7 +162,7 @@ docker ps -aq --filter label=radsec-edge.tenant | xargs -r docker rm -f   # テ�
 { "userland-proxy": false, "live-restore": true }
 ```
 
-`radsec-edge-agent` は `docker.sock` をファイルとしてマウントするので、dockerd がソケットを作り直すと（systemd のソケット起動でない dockerd の再起動など）、古いソケットを見たままになり Docker に届かなくなる。agent は 60 秒続けて届かなければ終了し、再起動の方針で作り直されて新しいソケットをつなぐ（その間の反映は失敗する。テナントのコンテナと AP の接続は続く）。dockerd を再起動した後は、管理API の `/status` の `agent.dockerOk` が `true` に戻ったことを確かめる（aka-mvpset の `verify/edge-long/`）。
+`radsec-edge-agent` は `docker.sock` をファイルとしてマウントするので、dockerd がソケットを作り直すと（systemd のソケット起動でない dockerd の再起動など）、古いソケットを見たままになり Docker に届かなくなる。agent は 60 秒続けて届かなければ終了し、再起動の方針で作り直されて新しいソケットをつなぐ（その間の反映は失敗する。テナントのコンテナと AP の接続は続く）。docker-ce・containerd.io のパッケージの更新でも `docker.socket` が作り直されるので、agent が約 1 分で作り直される（aka-mvpset の段階 5 の T5-10。`systemctl restart docker` だけなら `docker.socket` は変わらず、agent は約 1 秒でつなぎ直す）。更新は 1 台ずつ行い、その間は反映を始めない。dockerd を再起動した後は、管理API の `/status` の `agent.dockerOk` が `true` に戻ったことを確かめる（aka-mvpset の `verify/edge-long/`）。
 
 コンテナごとに inotify のインスタンスを 1 つ使うので、`fs.inotify.max_user_instances` を上げる（Debian 13 の既定は 128 で、130 個目あたりのコンテナから dockerd のログに `failed to watch oom events ... too many open files` が出る。aka-mvpset の `verify/edge-long/`）。
 
@@ -212,7 +226,7 @@ docker compose exec -T radsec-edge /radsec-edge server-cert > edge-admin.pem
 
 ### 10.3 ピンの入れ替え（aka-provisioner のクライアント証明書を替えるとき）
 
-新旧の 2 行を**その場で**書き、`SIGHUP` で読み直す（`sed -i` などでファイルを置き換えると、動いているコンテナは古い中身を読み続ける）。aka-provisioner が新しい証明書を使い始めたら古い行を消して、もう一度 `SIGHUP` を送る。読めないときは前のピンのまま続け、ログに `EDGE_ADMIN_CLIENTS_RELOAD_ERR` を出す。
+新旧の 2 行を**その場で**書き、`SIGHUP` で読み直す（`sed -i` などでファイルを置き換えると、動いているコンテナは古い中身を読み続ける）。`docker compose kill -s SIGHUP` を送ったコンテナには Docker が「手で止めた」の印を付けるので、ホストを再起動すると `unless-stopped` でも起き上がらない（aka-mvpset の段階 5 の T5-15）。送った後に `docker compose up -d radsec-edge` を一度流して印を消す（動いているコンテナは作り直されない。aka-mvpset の配置では、起動のときに `aka-compose-up.service` が起こし直す）。aka-provisioner が新しい証明書を使い始めたら古い行を消して、もう一度 `SIGHUP` を送る。読めないときは前のピンのまま続け、ログに `EDGE_ADMIN_CLIENTS_RELOAD_ERR` を出す。
 
 ```bash
 docker compose kill -s SIGHUP radsec-edge
@@ -272,13 +286,15 @@ docker compose kill -s SIGHUP radsec-edge
 | 成功 | 反映した |
 | 失敗（前の版のまま） | 構文検査の誤りなど。radsecproxy は変わっていない |
 | 失敗（前の版に戻した） | ヘルスチェックが通らなかったので前の版に戻した |
-| 途中で止まった（前の版のまま） | 反映の途中で `radsec-edge` が止まった。止めたとき（毎日のバックアップ、更新、再起動）は、取り消したところで前の版のまま終えるか前の版に戻す（誤りの文は「radsec-edge を止めるので反映を取り消しました」。設計概要 §24.13 の T5-19）。止まりきる前に戻せなかったときは、次の整合ループか次の反映で反映済みの版に戻して再起動する（AP の接続がいったん切れる）。望む状態は変わらないので、中央が反映し直す |
+| 途中で止まった（前の版のまま） | 反映の途中で `radsec-edge` が止まった。止めたとき（更新、再起動。毎日のバックアップは段階 6-0 から止めない）は、取り消したところで前の版のまま終えるか前の版に戻す（誤りの文は「radsec-edge を止めるので反映を取り消しました」。設計概要 §24.13 の T5-19）。止まりきる前に戻せなかったときは、次の整合ループか次の反映で反映済みの版に戻して再起動する（AP の接続がいったん切れる）。望む状態は変わらないので、中央が反映し直す |
 
 反映やその他の処理が動いている間の変更の要求は、5 秒待って `503 TENANT_BUSY` を返す（中央が次の周回でやり直す）。
 
-AP からの接続には TCP の生存確認（radsecproxy の `TCPKeepalive on`）をしている。10 秒流れがなければ確かめ、30 秒応えがなければ切れたとみなす。NAT の内側の AP の接続は、しばらく流れがないとルーターが NAT の対応を黙って消すため（設計概要 §24.13）。この設定はテナントの設定のファイルに入り、ファイルは反映のときに作るので、この設定の入った版に上げただけでは今のテナントに入らない。テナントを反映し直すと（中央から、aka-provisioner の `POST /admin/v2/edges/<エッジ>/tenants/<ID>/apply`）、設定が変わるので radsecproxy が再起動し、AP の接続がいったん切れる。
+AP からの接続には TCP の生存確認（radsecproxy の `TCPKeepalive on`）をしている。10 秒流れがなければ確かめ、30 秒応えがなければ切れたとみなす。NAT の内側の AP の接続は、しばらく流れがないとルーターが NAT の対応を黙って消すため（設計概要 §24.13）。
 
-テナントのコンテナは環境変数 `MALLOC_ARENA_MAX=2` で動かす。radsecproxy は AP の接続ごとにスレッドを作り、glibc の malloc がスレッドごとに領域を足して返さないので、既定のままだと AP の多いテナントほどメモリーが増えるため（設計概要 §10.2・§24.13 の T5-21）。この設定はコンテナのひな形に入るので、この設定の入った版に上げると、整合ループ（1 分ごと）が反映を待たずに各テナントのコンテナを 1 つずつ作り直し、そのたびにそのテナントの AP の接続がいったん切れる（AP はもう一方のスロットのエッジにつなぎ直す）。エッジは 1 台ずつ上げ、全テナントのコンテナが作り直されたこと（agent のログに `tenant container recreated` がテナントの数だけ出て、`docker ps --filter label=radsec-edge.tenant` の全部のコンテナが動いている）を確かめてから次のエッジを上げる。
+テナントのコンテナは環境変数 `MALLOC_ARENA_MAX=2` で動かす。radsecproxy は AP の接続ごとにスレッドを作り、glibc の malloc がスレッドごとに領域を足して返さないので、既定のままだと AP の多いテナントほどメモリーが増えるため（設計概要 §10.2・§24.13 の T5-21）。
+
+設定の書き方（上の `TCPKeepalive` のようなテナントの設定のファイルの中身）とコンテナのひな形（上の環境変数や radsecproxy のイメージ）の変わる版に上げたときの扱いは 10.9。
 
 ### 10.7 業者の CA の侵害・失効を知ったとき
 
@@ -292,4 +308,18 @@ AP からの接続には TCP の生存確認（radsecproxy の `TCPKeepalive on`
 
 ### 10.8 バックアップ
 
-7 章と同じ（`EDGE_HOST_DIR/data` を止めて写す。管理API のサーバー証明書の鍵 `data/tls/` と、テナントの鍵 `data/keys/` を含むので、写しの置き場所に気を付ける）。`data` を失っても望む状態は中央から届くが、テナントのサーバー証明書とヘルスチェック用の証明書は鍵ごと作り直しになる（`missing` に出るので、中央が CSR から出し直す）。管理API のサーバー証明書も変わるので、aka-provisioner の登録簿を書き換える（書き換えるまでの間、このエッジへの中継は 503 になり、中央には届かないエッジに見える。手順は aka-ossbss の運用ガイド 14.8）。
+7 章と同じ（`radsec-edge backup -out` で DB の写しを作り、`EDGE_HOST_DIR/data` を止めずに写す。管理API のサーバー証明書の鍵 `data/tls/` と、テナントの鍵 `data/keys/` を含むので、写しの置き場所に気を付ける）。`data` を失っても望む状態は中央から届くが、テナントのサーバー証明書とヘルスチェック用の証明書は鍵ごと作り直しになる（`missing` に出るので、中央が CSR から出し直す）。管理API のサーバー証明書も変わるので、aka-provisioner の登録簿を書き換える（書き換えるまでの間、このエッジへの中継は 503 になり、中央には届かないエッジに見える。手順は aka-ossbss の運用ガイド 14.8）。
+
+### 10.9 ひな形とイメージの更新を段階的に届ける
+
+コンテナのひな形（radsecproxy のイメージ、環境変数など）と設定の書き方が変わる版に上げても、エッジは動いているテナントのコンテナを作り直さない（設計概要 §24.14）。どのテナントが古いかを管理API と画面に出すので、運用担当が選んだテナントだけを反映し直す。
+
+- **ひな形**: テナントごとに、動かすひな形（ひな形の版と radsecproxy のイメージの ID）を記録する。radsecproxy のイメージを読み込み直すと（リリースのたびに作り直すので ID が変わる。aka-mvpset の `deploy/bin/build-images`）、全テナントが「古い」になる。`GET /tenants` の `template.current` が `false`、`GET /status` の `templates.staleTenants` に数が出る。
+- **設定の書き方**: 反映のたびに今のコードの書き方で描く。版に上げた後に反映していないテナントは `configCurrent` が `false`（`templates.configStaleTenants`）になり、次の反映（顧客が AP を足したときも含む）で今の書き方になる。前の書き方に戻す口はない。
+- **反映し直す**: 中央（aka-ossbss のエッジの画面）でテナントを選んで「今の形で反映し直す」と、エッジごとに 1 件ずつ `POST /tenants/{id}/apply` に `{"template":"latest"}` を送り、1 件でも失敗したら残りに送らない（aka-ossbss の運用ガイド 14 章）。エッジは、新しいイメージで構文検査し、コンテナを作り直してヘルスチェックし、通らなければ元の形で作り直して「失敗（前の版に戻した）」にする。作り直すたびに、そのテナントの AP の接続がいったん切れる（AP はもう一方のスロットのエッジにつなぎ直す）。設定の書き方も同じ反映で今になる。
+- **順**: まず試しのテナント（外形監視のテナントなど）を 1 つ反映し直して確かめ、次に少しずつ。エッジは 1 台ずつ上げ、そのエッジの古いテナントを反映し終えてから次のエッジを上げる。
+- **前の形に戻す**: 反映し直した後に問題が分かったら、テナントを選んで「前の形に戻す」（`{"template":"previous"}`）。前のイメージは、使っているコンテナがなくなってもタグ `radsec-edge/radsecproxy:keep-<ID の 12 桁>` が付いて残る（agent が付ける）。`docker image prune -a` などで消すと戻せなくなる（`canRollback` が `false`）。
+- **ひな形の版**: コードは今と 1 つ前のひな形の版を作れる。2 つより前の版のテナントが残っているうちは、次に版の上がる radsec-edge に上げない（上げる前に `templates.staleTenants` が 0 であることを確かめる）。上げてしまったときは、作れない版のテナントのコンテナは動いているかぎり触らず、作り直しが要るときは今の形で作る。
+- 記録と違う形で動いているテナント（`template.mismatch`。反映が途中で止まった、DB を古いバックアップに戻したなど）も、整合ループは作り直さない。今の形か前の形を選んで反映し直す。
+- 残すタグのイメージは、要らなくなったら（そのイメージを使う記録も前の形もない）`docker rmi radsec-edge/radsecproxy:keep-<ID>` で消す。
+
