@@ -52,7 +52,9 @@ jobs:
           EDGE_TEST_DOCKER: "1"
         run: |
           set -o pipefail
-          go test -count=1 -v ./... | tee docker.log
+          # パッケージを 1 つずつ流す（agent と edge の試験はどちらも同じ Docker のテナントのコンテナを扱い、edge の整合ループは
+          # DB にないテナントのコンテナを片付けるので、並べると互いのコンテナを消す）。
+          go test -p 1 -count=1 -v ./... | tee docker.log
           # Docker の試験は EDGE_TEST_DOCKER がないとスキップされ、テスト自体は成功してしまうので、別に確かめる。
           if grep -q -- '--- SKIP' docker.log; then
             echo "スキップされた試験があります"

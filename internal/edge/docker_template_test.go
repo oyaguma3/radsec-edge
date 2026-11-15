@@ -80,7 +80,11 @@ func TestDockerTemplate(t *testing.T) {
 		return c.Ref(), c.ID
 	}
 	_, id0 := running()
-	if err := e.svc.Reconcile(ctx); err != nil {
+	// 整合ループの 1 テナント分（Reconcile は Docker の上のほかの試験のコンテナを片付けてしまうので、このテナントだけ）。
+	if st, err = e.svc.Agent.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.syncTenant(ctx, e.tenant(t, "tenant-a"), st, System); err != nil {
 		t.Fatal(err)
 	}
 	if _, id := running(); id != id0 {
