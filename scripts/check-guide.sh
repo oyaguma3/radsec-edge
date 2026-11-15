@@ -229,10 +229,12 @@ done
 grep -q '"mgmtClient":"provisioner"' <<<"$AUDIT" || fail "監査ログのファイルに管理クライアントがない"
 pass "監査ログのファイル"
 
-# 運用ガイド 7 章: バックアップと戻し（data を写す。tenants は反映で作り直せる）。
-docker compose stop radsec-edge >/dev/null
-docker run --rm -v "$HOSTDIR:/h" busybox:1.37.0 sh -c 'cp -a /h/data /h/data.bak'
-docker compose up -d --wait radsec-edge
+# 運用ガイド 7 章: バックアップと戻し（止めずに DB の写しを作り、動いている DB のファイルを除いて data を写す。tenants は反映で作り直せる）。
+started=$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q radsec-edge)")
+docker compose exec -T radsec-edge /radsec-edge backup -out /data/backup.db >/dev/null 2>&1 || fail "backup -out"
+docker run --rm -v "$HOSTDIR:/h" busybox:1.37.0 sh -c 'cp -a /h/data /h/data.bak && rm -f /h/data.bak/radsec-edge.db* /h/data/backup.db'
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q radsec-edge)")" = "$started" ] || fail "バックアップで radsec-edge が止まった"
+r=$(api new GET /status) && [ "$(code "$r")" = 200 ] || fail "バックアップの後の /status: $r"
 python3 - "$WORK" <<'PY'
 import json, sys
 w = sys.argv[1]
@@ -244,11 +246,11 @@ PY
 r=$(api new PUT /tenants/42 tenant2.json) && [ "$(code "$r")" = 200 ] || fail "2 回目の宣言: $r"
 [ "$(body "$r" | jqv 'len(v["aps"])')" = 3 ] || fail "2 回目の宣言の AP: $r"
 docker compose stop radsec-edge >/dev/null
-docker run --rm -v "$HOSTDIR:/h" busybox:1.37.0 sh -c 'rm -rf /h/data/* && cp -a /h/data.bak/. /h/data/ && rm -rf /h/data.bak'
-docker compose up -d --wait radsec-edge
+docker run --rm -v "$HOSTDIR:/h" busybox:1.37.0 sh -c 'rm -rf /h/data/* && cp -a /h/data.bak/. /h/data/ && mv /h/data/backup.db /h/data/radsec-edge.db && rm -rf /h/data.bak'
+docker compose up -d --wait radsec-edge || fail "戻した後の起動"
 r=$(api new GET /tenants/42) && [ "$(code "$r")" = 200 ] || fail "戻した後: $r"
 [ "$(body "$r" | jqv 'v["revision"]')" = 3 ] || fail "戻した後の版: $r"
-pass "バックアップと戻し"
+pass "止めずに取るバックアップと戻し"
 
 # テナントの削除（コンテナも消える）。
 r=$(api new DELETE /tenants/42) && [ "$(code "$r")" = 204 ] || fail "削除: $r"

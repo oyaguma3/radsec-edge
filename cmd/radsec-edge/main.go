@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,6 +47,7 @@ commands:
   server-cert  管理API のサーバー証明書（なければ作る）を標準出力に、フィンガープリントを標準エラーに出す（管理モード）
   replace-server-cert  管理API のサーバー証明書を作り直して標準出力に出す（動いているサーバーは SIGHUP で読み直す。管理モード）
   healthcheck  動いている radsec-edge の /healthz を確かめる（compose の healthcheck 用）
+  backup -out <ファイル>  動かしたまま DB の写しを作る（SQLite の VACUUM INTO。止めずにバックアップを取る）
 
 設定は環境変数（接頭辞 EDGE_）で与える。管理クライアントのピンとサーバー証明書は SIGHUP で読み直す。
 `
@@ -70,6 +72,8 @@ func main() {
 		err = replaceServerCert(ctx, os.Stdout, os.Stderr)
 	case "healthcheck":
 		err = healthcheck(ctx)
+	case "backup":
+		err = backup(ctx, args[1:], os.Stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -302,6 +306,37 @@ func serverCert(stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "サーバー証明書を作りました（SAN: %v）。\n", cfg.TLSHosts)
 	}
 	fmt.Fprintf(stderr, "SHA-256 フィンガープリント: %s（有効期限 %s）\n", certs.Fingerprint(f.Leaf()), f.Leaf().NotAfter.Local().Format(time.DateOnly))
+	return nil
+}
+
+// backup は、動いている radsec-edge を止めずに DB の写しを作る（§24.14 の U6-10）。監査ログに残す。
+// テナントのサーバー証明書の鍵（EDGE_DATA_DIR の keys）は DB に入らないので、写しと一緒にファイルで写す（deploy の backup.sh）。
+func backup(ctx context.Context, args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	out := fs.String("out", "", "写しのファイル（なければ作る。あれば失敗する）")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *out == "" || fs.NArg() > 0 {
+		fs.Usage()
+		return errors.New("-out is required")
+	}
+	_, _, d, err := openDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Backup(ctx, *out); err != nil {
+		return err
+	}
+	if err := d.InsertAudit(ctx, db.AuditEntry{Operator: "cli", Source: db.SourceSystem, Action: "backup", Target: filepath.Base(*out)}); err != nil {
+		return err
+	}
+	fmt.Fprintf(stderr, "DB の写しを作りました: %s\n", *out)
 	return nil
 }
 

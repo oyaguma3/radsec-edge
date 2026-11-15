@@ -470,3 +470,35 @@ func TestMigrate0003KeepsRows(t *testing.T) {
 		t.Errorf("aps left: %+v", aps)
 	}
 }
+
+// 動かしたまま写しを作れ、写しにはひな形の記録も入る。同じファイルには作らない（§24.14 の U6-10）。
+func TestBackupAndTemplate(t *testing.T) {
+	d := open(t)
+	ctx := t.Context()
+	if _, err := d.CreateTenant(ctx, TenantSpec{ID: "tenant-a", Slug: "tenant-a", Port: 20001, AuthUpstream: netip.MustParseAddrPort("10.0.0.10:1812"),
+		AcctUpstream: netip.MustParseAddrPort("10.0.0.10:1813")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetTemplate(ctx, "tenant-a", 1, "sha256:bb", 1, "sha256:aa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetTemplate(ctx, "none", 1, "sha256:bb", 0, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetTemplate(none) = %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup.db")
+	if err := d.Backup(ctx, out); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Backup(ctx, out); err == nil {
+		t.Error("backup over an existing file")
+	}
+	b, err := Open(ctx, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	tn, err := b.Tenant(ctx, "tenant-a")
+	if err != nil || tn.Template != 1 || tn.ImageID != "sha256:bb" || tn.PrevTemplate != 1 || tn.PrevImageID != "sha256:aa" {
+		t.Errorf("tenant in the backup = %+v, %v", tn, err)
+	}
+}

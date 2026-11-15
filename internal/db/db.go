@@ -203,6 +203,15 @@ func (d *DB) Migrate(ctx context.Context) ([]int, error) {
 	return applied, nil
 }
 
+// Backup は、動かしたまま DB の写しを path に作る（SQLite の VACUUM INTO。radsec-ca と同じ。§24.14 の U6-10）。path にファイルがあれば失敗する。
+// テナントのサーバー証明書の鍵は DB ではなく EDGE_DATA_DIR の keys にあるので、写しと一緒にそのディレクトリも写す。
+func (d *DB) Backup(ctx context.Context, path string) error {
+	if _, err := d.sql.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
+		return fmt.Errorf("backup to %s: %w", path, err)
+	}
+	return nil
+}
+
 // SchemaVersion は、適用済みの移行のうち最も新しい番号を返す（なければ 0）。
 func (d *DB) SchemaVersion(ctx context.Context) (int, error) {
 	var v int
