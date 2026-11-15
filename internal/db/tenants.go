@@ -38,6 +38,10 @@ type Tenant struct {
 	AppliedHash                     string
 	AppliedPort                     int
 	AppliedAt, CreatedAt, UpdatedAt time.Time
+	// Template と ImageID はコンテナのひな形の版と radsecproxy のイメージの ID（Template が 0 ならまだ記録していない）。
+	// PrevTemplate と PrevImageID は 1 つ前の形（前の形に戻すときに使う。§24.14 の U6-1・U6-4）。
+	Template, PrevTemplate int
+	ImageID, PrevImageID   string
 }
 
 // Pending は未反映の変更があるか。
@@ -45,7 +49,7 @@ func (t Tenant) Pending() bool { return t.AppliedVersion < t.DesiredVersion }
 
 const tenantColumns = `id, slug, port, auth_upstream, acct_upstream, crl_url, client_ca_pem, server_cert_pem, probe_cert_pem,
 	enabled, desired_version, applied_version, applied_hash, applied_port, applied_at, created_at, updated_at,
-	source_cidrs, shared_match_attr, shared_match_pattern, revision, applied_revision`
+	source_cidrs, shared_match_attr, shared_match_pattern, revision, applied_revision, template, image_id, prev_template, prev_image_id`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -55,7 +59,7 @@ func scanTenant(s scanner) (Tenant, error) {
 	var applied, created, updated int64
 	err := s.Scan(&t.ID, &t.Slug, &t.Port, &auth, &acct, &t.CRLURL, &t.ClientCAPEM, &t.ServerCertPEM, &t.ProbeCertPEM,
 		&t.Enabled, &t.DesiredVersion, &t.AppliedVersion, &t.AppliedHash, &t.AppliedPort, &applied, &created, &updated,
-		&cidrs, &t.SharedMatchAttr, &t.SharedMatchPattern, &t.Revision, &t.AppliedRevision)
+		&cidrs, &t.SharedMatchAttr, &t.SharedMatchPattern, &t.Revision, &t.AppliedRevision, &t.Template, &t.ImageID, &t.PrevTemplate, &t.PrevImageID)
 	if err != nil {
 		return Tenant{}, err
 	}
@@ -255,6 +259,19 @@ func (d *DB) MarkApplied(ctx context.Context, id string, version, revision int64
 		version, revision, hash, port, millis(d.now()), id)
 	if err != nil {
 		return fmt.Errorf("mark applied %s: %w", id, err)
+	}
+	return nil
+}
+
+// SetTemplate はテナントのコンテナのひな形の記録を、今の形（template と image）と 1 つ前の形（prevTemplate と prevImage）にする。
+func (d *DB) SetTemplate(ctx context.Context, id string, template int, image string, prevTemplate int, prevImage string) error {
+	res, err := d.sql.ExecContext(ctx, "UPDATE tenants SET template = ?, image_id = ?, prev_template = ?, prev_image_id = ? WHERE id = ?",
+		template, image, prevTemplate, prevImage, id)
+	if err != nil {
+		return fmt.Errorf("set template %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

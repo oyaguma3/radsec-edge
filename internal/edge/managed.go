@@ -171,12 +171,32 @@ func (s *Service) missingCRLs(ctx context.Context, t db.Tenant) ([]string, error
 // StartApply は反映を裏で始める（§24.11 の EA5）。テナントがない・停止している・証明書が足りないときは誤りを返す（足りない CRL は裏の処理の
 // 最初に取りに行く）。すでに動いていれば、何もせずに started = false を返す（取り残した変更は中央の次の周回が拾う）。
 func (s *Service) StartApply(ctx context.Context, a Actor, id string) (started bool, err error) {
+	return s.StartApplyTemplate(ctx, a, id, TemplateKeep)
+}
+
+// StartApplyTemplate は StartApply の、コンテナのひな形の扱い mode を指定する形（§24.14 の U6-4）。今の形のイメージがない・前の形に戻せない
+// ときは、裏の処理を始めずに誤りを返す。すでに動いている反映があれば、その反映の扱いのまま started = false を返す。
+func (s *Service) StartApplyTemplate(ctx context.Context, a Actor, id string, mode TemplateMode) (started bool, err error) {
 	t, err := s.DB.Tenant(ctx, id)
 	if err != nil {
 		return false, err
 	}
 	if !t.Enabled {
 		return false, invalidCause(CauseTenantStopped, "停止しているテナントは反映できません。起動してから反映してください")
+	}
+	if mode != TemplateKeep {
+		st, err := s.AgentStatus(ctx)
+		if err != nil {
+			return false, fmt.Errorf("agent: %w", err)
+		}
+		switch ts := TemplateStateOf(t, st); {
+		case mode == TemplateLatest && !st.ImagePresent:
+			return false, invalidCause(CauseTemplateUnavailable, "radsecproxy のイメージ %s がホストにないので、今の形にできません", st.Image)
+		case mode == TemplatePrevious && ts.Previous.IsZero():
+			return false, invalidCause(CauseNoPreviousTemplate, "前の形の記録がないので、前の形に戻せません")
+		case mode == TemplatePrevious && !ts.CanRollback:
+			return false, invalidCause(CauseTemplateUnavailable, "前の形（ひな形の版 %d、イメージ %s）が使えないので、前の形に戻せません", ts.Previous.Template, agent.ShortImage(ts.Previous.Image))
+		}
 	}
 	missing, err := s.Missing(ctx, t)
 	if err != nil {
@@ -208,19 +228,19 @@ func (s *Service) StartApply(ctx context.Context, a Actor, id string) (started b
 			delete(s.applying, id)
 			s.mu.Unlock()
 		}()
-		s.runApply(bg, a, t)
+		s.runApply(bg, a, t, mode)
 	})
 	return true, nil
 }
 
 // runApply は裏の反映の中身。Apply が記録を残さずに終わったとき（排他を取れないなど）は、ここで失敗を記録する。
-func (s *Service) runApply(ctx context.Context, a Actor, t db.Tenant) {
+func (s *Service) runApply(ctx context.Context, a Actor, t db.Tenant, mode TemplateMode) {
 	if crls, err := s.missingCRLs(ctx, t); err == nil && len(crls) > 0 {
 		if err := s.RefreshCRL(ctx, a, t.ID); err != nil {
 			s.Log.Warn("cannot fetch the missing crl before apply", "tenant", t.ID, "error", err)
 		}
 	}
-	rec, err := s.Apply(ctx, a, t.ID)
+	rec, err := s.ApplyTemplate(ctx, a, t.ID, mode)
 	if err != nil && rec.TenantID == "" && !errors.Is(err, db.ErrNotFound) {
 		result := db.ResultFailed
 		if s.stopping(ctx) {
@@ -273,6 +293,9 @@ func (s *Service) AgentStatus(ctx context.Context) (agent.Status, error) {
 	s.statusCache, s.statusAt = st, s.Now()
 	return st, nil
 }
+
+// ForgetAgentStatus は agent の状態の写しを捨てる（イメージを読み込んだ直後などに、すぐ今の状態を見るとき）。
+func (s *Service) ForgetAgentStatus() { s.forgetStatus() }
 
 // forgetStatus は agent の状態の写しを捨てる（コンテナを変えたとき。すぐ後の読み出しに古い状態を見せないように）。
 func (s *Service) forgetStatus() {

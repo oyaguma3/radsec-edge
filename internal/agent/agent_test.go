@@ -51,27 +51,53 @@ func TestRejectsBadRequests(t *testing.T) {
 			t.Errorf("%s: %v, want 400", name, err)
 		}
 	}
-	_, err := c.Ensure(ctx, "tenant-a", "tenant-a", 2083)
+	_, err := c.Ensure(ctx, "tenant-a", "tenant-a", 2083, Ref{})
 	check("port out of range", err)
-	_, err = c.Ensure(ctx, "tenant-a", "../etc", 20830)
+	_, err = c.Ensure(ctx, "tenant-a", "../etc", 20830, Ref{})
 	check("bad slug", err)
-	_, err = c.Ensure(ctx, "Tenant", "tenant-a", 20830)
+	_, err = c.Ensure(ctx, "Tenant", "tenant-a", 20830, Ref{})
 	check("bad id", err)
-	_, err = c.Validate(ctx, "tenant-a", "../../../etc")
+	_, err = c.Validate(ctx, "tenant-a", "../../../etc", "")
 	check("bad gen", err)
 	_, err = c.Logs(ctx, "tenant-a", 100000)
 	check("too many lines", err)
 	err = c.call(ctx, http.MethodPost, tenantPath("tenant-a", "signal"), SignalRequest{Signal: "KILL"}, nil)
 	check("signal other than HUP", err)
-	// 知らない項目（イメージやマウントの指定）は断る。
-	err = c.call(ctx, http.MethodPost, tenantPath("tenant-a", "ensure"), map[string]any{"slug": "tenant-a", "port": 20830, "image": "evil"}, nil)
+	// 知らない項目（マウントや権限の指定）は断る。
+	err = c.call(ctx, http.MethodPost, tenantPath("tenant-a", "ensure"), map[string]any{"slug": "tenant-a", "port": 20830, "mounts": "/"}, nil)
 	check("unknown member", err)
+	// イメージは ID の形のものだけ、ひな形の版はコードが作れるものだけを受ける（Docker に触れる前に 409。§24.14 の U6-5）。
+	conflict := func(name string, err error, target error) {
+		t.Helper()
+		if e, ok := errors.AsType[*Error](err); !ok || e.Status != http.StatusConflict || !errors.Is(err, target) {
+			t.Errorf("%s: %v, want 409 %v", name, err, target)
+		}
+	}
+	_, err = c.Ensure(ctx, "tenant-a", "tenant-a", 20830, Ref{Template: 1, Image: "evil/image:latest"})
+	conflict("image by name", err, ErrImageNotAllowed)
+	_, err = c.Ensure(ctx, "tenant-a", "tenant-a", 20830, Ref{Template: 99})
+	conflict("unknown template", err, ErrUnknownTemplate)
+	_, err = c.Validate(ctx, "tenant-a", "0123456789abcdef", "busybox")
+	conflict("validate with an image by name", err, ErrImageNotAllowed)
+}
+
+// testImage は試験のイメージの ID（Docker に触れない試験で使う）。
+const testImage = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// spec1 は版 1 のひな形を作る（作れなければ試験を止める）。
+func spec1(t *testing.T, publishAddr, fluentd string, port int, image string) spec {
+	t.Helper()
+	s, err := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", publishAddr, fluentd, "12", "tenant-a", port, Ref{Template: 1, Image: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
 
 func TestSpec(t *testing.T) {
-	s := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "", "12", "tenant-a", 20831)
+	s := spec1(t, "", "", 20831, testImage)
 	hc := s.HostConfig
-	if s.Image != Image || s.User != "10083:10083" || !hc.Init || !hc.ReadonlyRootfs || hc.Privileged ||
+	if s.Image != testImage || s.User != "10083:10083" || !hc.Init || !hc.ReadonlyRootfs || hc.Privileged ||
 		len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" || hc.SecurityOpt[0] != "no-new-privileges:true" {
 		t.Errorf("security options: %+v", s)
 	}
@@ -84,11 +110,18 @@ func TestSpec(t *testing.T) {
 	if hc.RestartPolicy.Name != "unless-stopped" || hc.LogConfig.Config["max-size"] != "10m" || hc.LogConfig.Config["max-file"] != "5" {
 		t.Errorf("restart / log: %+v", hc)
 	}
-	if s.Labels[LabelTenant] != "12" || s.Labels[LabelSlug] != "tenant-a" || s.Labels[LabelPort] != "20831" || s.Labels[LabelSpec] == "" {
+	if s.Labels[LabelTenant] != "12" || s.Labels[LabelSlug] != "tenant-a" || s.Labels[LabelPort] != "20831" || s.Labels[LabelTemplate] != "1" || s.Labels[LabelSpec] == "" {
 		t.Errorf("labels: %v", s.Labels)
 	}
-	if other := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "", "12", "tenant-a", 20832); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
+	if other := spec1(t, "", "", 20832, testImage); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
 		t.Error("spec hash does not change with the port")
+	}
+	// イメージの ID もひな形のハッシュに入る（同じタグで作り直したイメージは別のひな形。§24.14 の U6-1）。
+	if other := spec1(t, "", "", 20831, strings.Replace(testImage, "0123", "4567", 1)); other.Labels[LabelSpec] == s.Labels[LabelSpec] {
+		t.Error("spec hash does not change with the image")
+	}
+	if _, err := tenantSpec("/t", "n", "", "", "12", "tenant-a", 20831, Ref{Template: 2, Image: testImage}); !errors.Is(err, ErrUnknownTemplate) {
+		t.Errorf("unknown template: %v", err)
 	}
 	// malloc の領域の数を絞る（§24.13 の T5-21）。環境変数もひな形のハッシュに入る（変われば作り直す）。
 	if !slices.Equal(s.Env, []string{"MALLOC_ARENA_MAX=2"}) {
@@ -100,23 +133,33 @@ func TestSpec(t *testing.T) {
 		t.Error("spec hash does not change with the environment")
 	}
 	// 公開するアドレスを指定すると、そのアドレスだけに公開し、ひな形も変わる（作り直す）。
-	bound := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "192.0.2.1", "", "12", "tenant-a", 20831)
+	bound := spec1(t, "192.0.2.1", "", 20831, testImage)
 	if b := bound.HostConfig.PortBindings[ContainerPort]; b[0].HostIP != "192.0.2.1" || bound.Labels[LabelSpec] == s.Labels[LabelSpec] {
 		t.Errorf("publish address: %+v", bound.HostConfig.PortBindings)
 	}
 	// Fluent Bit のアドレスを与えると、fluentd のドライバーで送り、待ち行列を絞る（§24.11 の EA14）。ひな形も変わる（作り直す）。
-	fb := tenantSpec("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "localhost:24224", "12", "tenant-a", 20831)
+	fb := spec1(t, "", "localhost:24224", 20831, testImage)
 	lc := fb.HostConfig.LogConfig
 	if lc.Type != "fluentd" || lc.Config["fluentd-address"] != "localhost:24224" || lc.Config["fluentd-buffer-limit"] != "8192" || lc.Config["tag"] != "tenant.12" ||
 		lc.Config["cache-max-size"] != "10m" || fb.Labels[LabelSpec] == s.Labels[LabelSpec] {
 		t.Errorf("fluentd: %+v", lc)
 	}
-	v := validateSpec("/t", "n", "tenant-a", "0123456789abcdef")
-	if v.HostConfig.LogConfig.Type != "json-file" {
+	v := validateSpec("/t", "n", "tenant-a", "0123456789abcdef", testImage)
+	if v.HostConfig.LogConfig.Type != "json-file" || v.Image != testImage {
 		t.Errorf("validate log: %+v", v.HostConfig.LogConfig)
 	}
 	if v.HostConfig.Mounts[0].Source != "/t/tenant-a/gen/0123456789abcdef" || v.HostConfig.Mounts[0].Target != "/conf/current" {
 		t.Errorf("validate mount: %+v", v.HostConfig.Mounts)
+	}
+}
+
+// 段階 6 より前の作りのハッシュ（b482617 のコードで計算した値）と同じ値を作る。動いているコンテナを版 1 とみなして作り直さないため（§24.14 の U6-5）。
+func TestLegacySpecHash(t *testing.T) {
+	if h := legacySpecHash("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "203.0.113.5", "127.0.0.1:24224", "17", "acme", 20017); h != "4801bd80dd0331d8" {
+		t.Errorf("legacy hash with Fluent Bit = %s", h)
+	}
+	if h := legacySpecHash("/var/lib/radsec-edge/tenants", "radsec-edge-tenants", "", "", "17", "acme", 20017); h != "11f4aebe498e321e" {
+		t.Errorf("legacy hash = %s", h)
 	}
 }
 
@@ -218,19 +261,19 @@ func TestDockerLifecycle(t *testing.T) {
 
 	f := newFixture(t, tenantsDir, slug)
 	gen := f.stage(t)
-	if res, err := c.Validate(ctx, slug, gen); err != nil || !res.OK {
+	if res, err := c.Validate(ctx, slug, gen, ""); err != nil || !res.OK {
 		t.Fatalf("Validate = %+v, %v", res, err)
 	}
 
-	if a, err := c.Ensure(ctx, slug, slug, port); err != nil || a != EnsureCreated {
-		t.Fatalf("Ensure = %q, %v", a, err)
+	if r, err := c.Ensure(ctx, slug, slug, port, Ref{}); err != nil || r.Action != EnsureCreated || r.Ref != st.Latest() {
+		t.Fatalf("Ensure = %+v, %v (latest %+v)", r, err, st.Latest())
 	}
-	if a, err := c.Ensure(ctx, slug, slug, port); err != nil || a != EnsureNone {
-		t.Fatalf("second Ensure = %q, %v", a, err)
+	if r, err := c.Ensure(ctx, slug, slug, port, st.Latest()); err != nil || r.Action != EnsureNone {
+		t.Fatalf("second Ensure = %+v, %v", r, err)
 	}
 	waitRunning(t, c, slug)
 	ct := container(t, c, slug)
-	if ct.Name != ContainerName(slug) || ct.Port != port || !ct.SpecCurrent {
+	if ct.Name != ContainerName(slug) || ct.Port != port || ct.Ref() != st.Latest() {
 		t.Errorf("container = %+v", ct)
 	}
 	// 公開したポートで TLS を受けている（ハンドシェイクの中身はヘルスチェックの試験で確かめる）。
@@ -257,12 +300,12 @@ func TestDockerLifecycle(t *testing.T) {
 	if ct := container(t, c, slug); ct.Running {
 		t.Errorf("running after Stop: %+v", ct)
 	}
-	if a, err := c.Ensure(ctx, slug, slug, port); err != nil || a != EnsureStarted {
-		t.Fatalf("Ensure after Stop = %q, %v", a, err)
+	if r, err := c.Ensure(ctx, slug, slug, port, Ref{}); err != nil || r.Action != EnsureStarted {
+		t.Fatalf("Ensure after Stop = %+v, %v", r, err)
 	}
 	// ポートが変われば作り直す。
-	if a, err := c.Ensure(ctx, slug, slug, port+1); err != nil || a != EnsureRecreated {
-		t.Fatalf("Ensure with another port = %q, %v", a, err)
+	if r, err := c.Ensure(ctx, slug, slug, port+1, Ref{}); err != nil || r.Action != EnsureRecreated {
+		t.Fatalf("Ensure with another port = %+v, %v", r, err)
 	}
 	waitRunning(t, c, slug)
 	if ct := container(t, c, slug); ct.Port != port+1 {
@@ -290,7 +333,7 @@ func TestDockerValidateRejects(t *testing.T) {
 		t.Fatal(err)
 	}
 	OpenForTest(t, tenantsDir)
-	res, err := c.Validate(t.Context(), "t-broken", gen)
+	res, err := c.Validate(t.Context(), "t-broken", gen, "")
 	if err != nil || res.OK || res.Output == "" {
 		t.Fatalf("Validate(broken) = %+v, %v", res, err)
 	}
@@ -326,4 +369,91 @@ func waitRunning(t *testing.T, c *Client, id string) {
 	}
 	logs, _ := c.Logs(t.Context(), id, 50)
 	t.Fatalf("container %s is not running:\n%s", id, logs)
+}
+
+// buildImage は、radsecproxy のイメージにラベルを足しただけの別のイメージ（ID が違う）を作り、tag を付けて ID を返す。後で消す。
+func buildImage(t *testing.T, tag string) string {
+	t.Helper()
+	var rnd [4]byte
+	rand.Read(rnd[:])
+	cmd := exec.Command("docker", "build", "-q", "-t", tag, "-")
+	cmd.Stdin = strings.NewReader("FROM " + Image + "\nLABEL radsec-edge.test=" + hex.EncodeToString(rnd[:]) + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("docker build %s: %v", tag, err)
+	}
+	id := strings.TrimSpace(string(out))
+	t.Cleanup(func() {
+		tags, _ := exec.Command("docker", "image", "inspect", "-f", `{{join .RepoTags " "}}`, id).Output()
+		for tg := range strings.FieldsSeq(string(tags)) {
+			exec.Command("docker", "rmi", tg).Run()
+		}
+		exec.Command("docker", "rmi", id).Run()
+	})
+	return id
+}
+
+// ひな形のイメージを替えて作り直し、前のイメージに戻せる。テナントのコンテナが使っているイメージのタグがなくなっても（同じタグで別の
+// イメージを読み込んだとき）、残すタグを付けて戻せるようにする。radsecproxy のリポジトリでないイメージは使わない（§24.14 の U6-1・U6-5）。
+func TestDockerTemplates(t *testing.T) {
+	d, tenantsDir, network := dockerEnv(t)
+	c := startServer(t, d, tenantsDir, network)
+	ctx := t.Context()
+	var rnd [3]byte
+	rand.Read(rnd[:])
+	sfx := hex.EncodeToString(rnd[:])
+	slug := "t-" + sfx
+	const port = 20996
+	st, err := c.Status(ctx)
+	if err != nil || !st.ImagePresent || st.LatestTemplate != LatestTemplate {
+		t.Fatalf("Status = %+v, %v", st, err)
+	}
+	newer := buildImage(t, ImageRepo+":test-"+sfx)
+	other := buildImage(t, "radsec-edge-test/other:"+sfx)
+
+	f := newFixture(t, tenantsDir, slug)
+	gen := f.stage(t)
+	if res, err := c.Validate(ctx, slug, gen, newer); err != nil || !res.OK {
+		t.Fatalf("Validate with the newer image = %+v, %v", res, err)
+	}
+	if _, err := c.Validate(ctx, slug, gen, other); !errors.Is(err, ErrImageNotAllowed) {
+		t.Errorf("Validate with another repository = %v", err)
+	}
+	if r, err := c.Ensure(ctx, slug, slug, port, Ref{}); err != nil || r.Action != EnsureCreated {
+		t.Fatalf("Ensure = %+v, %v", r, err)
+	}
+	if _, err := c.Ensure(ctx, slug, slug, port, Ref{Template: 1, Image: other}); !errors.Is(err, ErrImageNotAllowed) {
+		t.Errorf("Ensure with another repository = %v", err)
+	}
+	// 新しいイメージへ作り直す。
+	if r, err := c.Ensure(ctx, slug, slug, port, Ref{Template: 1, Image: newer}); err != nil || r.Action != EnsureRecreated || r.Ref.Image != newer {
+		t.Fatalf("Ensure with the newer image = %+v, %v", r, err)
+	}
+	waitRunning(t, c, slug)
+	if ct := container(t, c, slug); ct.Ref() != (Ref{Template: 1, Image: newer}) {
+		t.Errorf("container after the upgrade = %+v", ct)
+	}
+	// 新しいイメージのタグを外しても（同じタグで別のイメージを読み込んだのと同じ）、使っているので残すタグが付き、戻せる。
+	if out, err := exec.Command("docker", "rmi", "-f", ImageRepo+":test-"+sfx).CombinedOutput(); err != nil {
+		t.Fatalf("untag: %v\n%s", err, out)
+	}
+	st, err = c.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := ImageRepo + ":" + KeepTagPrefix + ShortImage(newer)
+	if !slices.ContainsFunc(st.Images, func(im ImageInfo) bool { return im.ID == newer && slices.Contains(im.Tags, keep) && im.InUse == 1 }) {
+		t.Errorf("the image in use is not kept: %+v", st.Images)
+	}
+	// 前のイメージ（今のタグ）に戻し、また新しいイメージ（残すタグ）にする。
+	if r, err := c.Ensure(ctx, slug, slug, port, st.Latest()); err != nil || r.Action != EnsureRecreated || r.Ref != st.Latest() {
+		t.Fatalf("Ensure back to the previous image = %+v, %v", r, err)
+	}
+	if r, err := c.Ensure(ctx, slug, slug, port, Ref{Template: 1, Image: newer}); err != nil || r.Action != EnsureRecreated {
+		t.Fatalf("Ensure with the kept image = %+v, %v", r, err)
+	}
+	waitRunning(t, c, slug)
+	if err := c.Remove(ctx, slug); err != nil {
+		t.Fatal(err)
+	}
 }

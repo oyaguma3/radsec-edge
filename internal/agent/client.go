@@ -82,11 +82,12 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 	return st, err
 }
 
-// Ensure はテナントのコンテナを作る・起動する（あって動いていれば何もしない）。行ったことを返す。
-func (c *Client) Ensure(ctx context.Context, id, slug string, port int) (string, error) {
+// Ensure はテナントのコンテナをひな形 ref で作る・起動する（あって動いていれば何もしない。ref が零値なら今の形）。
+// 行ったことと、使ったひな形を返す。
+func (c *Client) Ensure(ctx context.Context, id, slug string, port int, ref Ref) (EnsureResult, error) {
 	var res EnsureResult
-	err := c.call(ctx, http.MethodPost, tenantPath(id, "ensure"), EnsureRequest{Slug: slug, Port: port}, &res)
-	return res.Action, err
+	err := c.call(ctx, http.MethodPost, tenantPath(id, "ensure"), EnsureRequest{Slug: slug, Port: port, Ref: ref}, &res)
+	return res, err
 }
 
 // Restart はテナントのコンテナを再起動する。
@@ -123,9 +124,9 @@ func (c *Client) LogsSince(ctx context.Context, id string, since time.Time) (str
 	return res.Logs, err
 }
 
-// Validate はテナントの版 gen の設定を radsecproxy -p で検査する。
-func (c *Client) Validate(ctx context.Context, slug, gen string) (ValidateResult, error) {
+// Validate はテナントの版 gen の設定を、イメージ image（空なら今のタグ）の radsecproxy -p で検査する。
+func (c *Client) Validate(ctx context.Context, slug, gen, image string) (ValidateResult, error) {
 	var res ValidateResult
-	err := c.call(ctx, http.MethodPost, "/v1/validate", ValidateRequest{Slug: slug, Gen: gen}, &res)
+	err := c.call(ctx, http.MethodPost, "/v1/validate", ValidateRequest{Slug: slug, Gen: gen, Image: image}, &res)
 	return res, err
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oyaguma3/radsec-edge/internal/agent"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge/edgetest"
 	"github.com/oyaguma3/radsec-edge/internal/pki/pkitest"
@@ -115,7 +116,7 @@ func TestRecoverInterrupted(t *testing.T) {
 
 	// 最初の反映の途中で落ちた: 反映済みの版がないので、止めて current を外す。
 	e.interrupt(t, "tenant-a")
-	if _, err := e.svc.Agent.Ensure(ctx, "tenant-a", "tenant-a", 20000); err != nil {
+	if _, err := e.svc.Agent.Ensure(ctx, "tenant-a", "tenant-a", 20000, agent.Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	e.agent.TakeCalls()
@@ -319,7 +320,7 @@ func TestAgentStatusCache(t *testing.T) {
 	if _, err := e.svc.AgentStatus(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Agent.Ensure(ctx, "x", "x", 20000); err != nil {
+	if _, err := e.svc.Agent.Ensure(ctx, "x", "x", 20000, agent.Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	st, _ := e.svc.AgentStatus(ctx)
@@ -332,7 +333,7 @@ func TestAgentStatusCache(t *testing.T) {
 		t.Error("the cache did not expire")
 	}
 	// コンテナを変えたら写しを捨てる。
-	if _, err := e.svc.Agent.Ensure(ctx, "y", "y", 20001); err != nil {
+	if _, err := e.svc.Agent.Ensure(ctx, "y", "y", 20001, agent.Ref{}); err != nil {
 		t.Fatal(err)
 	}
 	e.svc.forgetStatus()
@@ -348,12 +349,12 @@ type ensureHookAgent struct {
 	onEnsure func()
 }
 
-func (a *ensureHookAgent) Ensure(ctx context.Context, id, slug string, port int) (string, error) {
+func (a *ensureHookAgent) Ensure(ctx context.Context, id, slug string, port int, ref agent.Ref) (agent.EnsureResult, error) {
 	if f := a.onEnsure; f != nil {
 		a.onEnsure = nil
 		f()
 	}
-	return a.FakeAgent.Ensure(ctx, id, slug, port)
+	return a.FakeAgent.Ensure(ctx, id, slug, port, ref)
 }
 
 // 整合ループの途中で宣言した新しいテナントのディレクトリを消さない（管理モードでは ID と slug が違う）。

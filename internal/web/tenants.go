@@ -191,6 +191,9 @@ type tenantData struct {
 	Brought     []broughtRow
 	BroughtCRLs []broughtCRL
 	Shared      []db.SharedSeen
+	// Template はコンテナのひな形の状態（agent に届かなければ nil）。ConfigCurrent・ConfigKnown は設定の書き方が今か（§24.14 の U6-7）。
+	Template                   *edge.TemplateState
+	ConfigCurrent, ConfigKnown bool
 }
 
 // broughtRow は持ち込みの CA の 1 行。
@@ -243,9 +246,14 @@ func (h *Handler) loadTenant(ctx context.Context, id string) (tenantData, error)
 	cancel()
 	if err != nil {
 		d.AgentError = err.Error()
-	} else if c, ok := st.Container(id); ok {
-		d.Container = &c
+	} else {
+		if c, ok := st.Container(id); ok {
+			d.Container = &c
+		}
+		ts := edge.TemplateStateOf(t, st)
+		d.Template = &ts
 	}
+	d.ConfigCurrent, d.ConfigKnown = h.Edge.ConfigCurrent(t)
 	var started time.Time
 	if d.Container != nil && d.Container.Running {
 		started = d.Container.StartedAt
@@ -387,8 +395,24 @@ func (h *Handler) tenantApply(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := h.opContext(r)
 	defer cancel()
 	id := r.PathValue("id")
-	rec, err := h.Edge.Apply(ctx, actorFrom(ctx), id)
+	// template は今の形へ・前の形へ（§24.14 の U6-4）。管理モードでは中央（OSS/BSS）から行う。
+	mode, ok := edge.ParseTemplateMode(r.PostFormValue("template"))
+	if !ok {
+		h.renderError(w, r, http.StatusBadRequest, "ひな形の指定が正しくありません。")
+		return
+	}
+	if mode != edge.TemplateKeep && h.managed() {
+		h.renderError(w, r, http.StatusForbidden, "管理モードでは、ひな形の反映し直しは中央（OSS/BSS）から行います。")
+		return
+	}
+	rec, err := h.Edge.ApplyTemplate(ctx, actorFrom(ctx), id, mode)
 	msg := "反映しました（版 " + strconv.FormatInt(rec.Version, 10) + "、" + actionLabel(rec.Action) + "）。ヘルスチェックも通りました。"
+	switch mode {
+	case edge.TemplateLatest:
+		msg = "今の形で反映し直しました（" + actionLabel(rec.Action) + "）。ヘルスチェックも通りました。"
+	case edge.TemplatePrevious:
+		msg = "前の形に戻しました（" + actionLabel(rec.Action) + "）。ヘルスチェックも通りました。"
+	}
 	if err != nil && !edge.IsInput(err) && rec.Result != "" {
 		// 反映の失敗（前の版のまま・前の版に戻した）は、理由を見せる。
 		err = &edge.InputError{Msg: resultLabel(rec.Result) + ": " + err.Error()}

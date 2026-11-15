@@ -297,6 +297,19 @@ func (h *Handler) idempotent(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// readOptionalJSON は readJSON と同じだが、本文が空なら何もしない。
+func readOptionalJSON(r *http.Request, v any) *problem {
+	b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil || len(b) > maxBodyBytes {
+		return badRequest("body", "request body is too large or could not be read")
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return readJSON(r, v)
+}
+
 // readJSON は要求の本文を読む（知らない項目は断る）。
 func readJSON(r *http.Request, v any) *problem {
 	b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))

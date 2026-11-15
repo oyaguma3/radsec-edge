@@ -78,6 +78,44 @@ type summaryJSON struct {
 	Apply        applyJSON      `json:"apply"`
 	Container    *containerJSON `json:"container,omitempty"`
 	APCount      int            `json:"apCount"`
+	// Template はコンテナのひな形の状態、ConfigCurrent は設定の書き方が今か（分からなければ省く。§24.14 の U6-7）。
+	Template      templateJSON `json:"template"`
+	ConfigCurrent *bool        `json:"configCurrent,omitempty"`
+}
+
+// refJSON はコンテナのひな形（ひな形の版と radsecproxy のイメージの ID）。
+type refJSON struct {
+	Version int    `json:"version"`
+	Image   string `json:"image"`
+}
+
+func refOrNil(r agent.Ref) *refJSON {
+	if r.IsZero() {
+		return nil
+	}
+	return &refJSON{Version: r.Template, Image: r.Image}
+}
+
+// templateJSON はテナントのコンテナのひな形の状態。Current と CanRollback は agent に届かないと省く。
+type templateJSON struct {
+	// Recorded は記録の形（まだ記録していなければ、動いているコンテナの形）、Running は動いているコンテナの形、Previous は 1 つ前の形。
+	Recorded *refJSON `json:"recorded,omitempty"`
+	Running  *refJSON `json:"running,omitempty"`
+	Previous *refJSON `json:"previous,omitempty"`
+	// Current は記録が今の形と同じで、コンテナも記録どおりに動いているか（false なら古い）。Mismatch はコンテナが記録と違う形で動いているか。
+	Current     *bool `json:"current,omitempty"`
+	Mismatch    bool  `json:"mismatch,omitzero"`
+	CanRollback *bool `json:"canRollback,omitempty"`
+}
+
+// templateOf はテナントのひな形の状態を作る（st が取れていなければ、記録だけ）。
+func templateOf(t db.Tenant, st agent.Status) templateJSON {
+	if !st.DockerOK {
+		return templateJSON{Recorded: refOrNil(edge.RefOf(t)), Previous: refOrNil(edge.PrevRefOf(t))}
+	}
+	ts := edge.TemplateStateOf(t, st)
+	return templateJSON{Recorded: refOrNil(ts.Recorded), Running: refOrNil(ts.Running), Previous: refOrNil(ts.Previous),
+		Current: new(ts.Current), Mismatch: ts.Mismatch, CanRollback: new(ts.CanRollback)}
 }
 
 type crlJSON struct {
@@ -206,6 +244,10 @@ func (h *Handler) summary(ctx context.Context, t db.Tenant, apply applyJSON, st 
 	if c, ok := st().Container(t.ID); ok {
 		out.Container = &containerJSON{State: c.State, Running: c.Running, Restarting: c.Restarting, RestartCount: c.RestartCount, StartedAt: utcOrZero(c.StartedAt), Port: c.Port}
 	}
+	out.Template = templateOf(t, st())
+	if cur, known := h.Edge.ConfigCurrent(t); known {
+		out.ConfigCurrent = new(cur)
+	}
 	return out, nil
 }
 
@@ -246,6 +288,21 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Network        string `json:"network,omitempty"`
 		NetworkPresent bool   `json:"networkPresent"`
 	}
+	type imageJSON struct {
+		ID      string    `json:"id"`
+		Tags    []string  `json:"tags"`
+		Created time.Time `json:"created,omitzero"`
+		InUse   int       `json:"inUse"`
+	}
+	// templatesJSON は今の形と、古いテナントの数（§24.14 の U6-7）。agent に届かなければ Latest は省き、数は記録だけで数えない。
+	type templatesJSON struct {
+		Latest             *refJSON    `json:"latest,omitempty"`
+		Supported          []int       `json:"supported"`
+		StaleTenants       int         `json:"staleTenants"`
+		MismatchTenants    int         `json:"mismatchTenants"`
+		ConfigStaleTenants int         `json:"configStaleTenants"`
+		Images             []imageJSON `json:"images"`
+	}
 	type capacityJSON struct {
 		Max  int `json:"max"`
 		Used int `json:"used"`
@@ -270,6 +327,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Agent        agentJSON     `json:"agent"`
 		Capacity     capacityJSON  `json:"capacity"`
 		Reconcile    reconcileJSON `json:"reconcile"`
+		Templates    templatesJSON `json:"templates"`
 		AdminClients []string      `json:"adminClients"`
 		Tenants      []tenantCRLs  `json:"tenants"`
 	}{Service: "radsec-edge", Version: h.Version, Mode: h.Mode, URNPrefix: h.Edge.URNPrefix, DNSDomain: h.Edge.DNSDomain,
@@ -277,7 +335,26 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Agent: agentJSON{OK: agentErr == "", Error: agentErr, Version: st.Version, DockerOK: st.DockerOK, DockerError: st.DockerError, Image: st.Image,
 			ImagePresent: st.ImagePresent, Network: st.Network, NetworkPresent: st.NetworkPresent},
 		Capacity:  capacityJSON{Max: h.Edge.Capacity, Used: len(tenants), Free: max(h.Edge.Capacity-len(tenants), 0)},
-		Reconcile: reconcileJSON{At: utcOrZero(rec.At), Error: rec.Error}, AdminClients: []string{}, Tenants: []tenantCRLs{}}
+		Reconcile: reconcileJSON{At: utcOrZero(rec.At), Error: rec.Error}, AdminClients: []string{}, Tenants: []tenantCRLs{},
+		Templates: templatesJSON{Supported: agent.Templates, Images: []imageJSON{}}}
+	if st.DockerOK {
+		out.Templates.Latest = refOrNil(st.Latest())
+		for _, im := range st.Images {
+			out.Templates.Images = append(out.Templates.Images, imageJSON{ID: im.ID, Tags: im.Tags, Created: utcOrZero(im.Created), InUse: im.InUse})
+		}
+		for _, t := range tenants {
+			ts := edge.TemplateStateOf(t, st)
+			if ts.Mismatch {
+				out.Templates.MismatchTenants++
+			}
+			if !ts.Current && !ts.Recorded.IsZero() {
+				out.Templates.StaleTenants++
+			}
+			if cur, known := h.Edge.ConfigCurrent(t); known && !cur {
+				out.Templates.ConfigStaleTenants++
+			}
+		}
+	}
 	if h.AdminClients != nil {
 		out.AdminClients = h.AdminClients()
 	}
@@ -565,9 +642,22 @@ func (h *Handler) putCert(kind keystore.Kind) http.HandlerFunc {
 }
 
 // apply は反映を裏で始める（§24.11 の EA5）。結果は GET /tenants/{tenantId} の apply と appliedRevision で見る。
+// 本文は省けて、{"template":"latest"} で今の形へ、{"template":"previous"} で前の形へコンテナを作り直す（§24.14 の U6-4）。
 func (h *Handler) apply(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("tenantId")
-	started, err := h.Edge.StartApply(r.Context(), actor(r), id)
+	var body struct {
+		Template string `json:"template"`
+	}
+	if p := readOptionalJSON(r, &body); p != nil {
+		p.write(w)
+		return
+	}
+	mode, ok := edge.ParseTemplateMode(body.Template)
+	if !ok {
+		badRequest("template", "template must be latest or previous").write(w)
+		return
+	}
+	started, err := h.Edge.StartApplyTemplate(r.Context(), actor(r), id, mode)
 	if err != nil {
 		h.fail(w, r, err)
 		return

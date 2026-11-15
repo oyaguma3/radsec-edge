@@ -392,6 +392,35 @@ func TestApplyFlow(t *testing.T) {
 		t.Errorf("after apply 2: %v", got)
 	}
 
+	// コンテナのひな形（§24.14 の U6-4・U6-7）。反映の後は今の形で、前の形はない。
+	tpl := got["template"].(map[string]any)
+	if tpl["current"] != true || tpl["canRollback"] != false || tpl["recorded"].(map[string]any)["image"] != edgetest.ImageA {
+		t.Errorf("template after apply = %v", tpl)
+	}
+	expect(t, "bad template", e.do(t, "POST", "/tenants/1/apply", map[string]string{"template": "newest"}, idem()), 400, "VALIDATION")
+	expect(t, "no previous", e.do(t, "POST", "/tenants/1/apply", map[string]string{"template": "previous"}, idem()), 409, "NO_PREVIOUS_TEMPLATE")
+	// 新しいイメージを読み込むと古いと分かり（/status にも数が出る）、今の形へ作り直せる。
+	e.agent.ImageID, e.agent.Images = edgetest.ImageB, []string{edgetest.ImageA}
+	e.svc.ForgetAgentStatus()
+	if tpl := e.do(t, "GET", "/tenants", nil, nil).body["items"].([]any)[0].(map[string]any)["template"].(map[string]any); tpl["current"] != false {
+		t.Errorf("template after loading a new image = %v", tpl)
+	}
+	st := e.do(t, "GET", "/status", nil, nil).body["templates"].(map[string]any)
+	if st["staleTenants"] != float64(1) || st["latest"].(map[string]any)["image"] != edgetest.ImageB {
+		t.Errorf("status templates = %v", st)
+	}
+	expect(t, "latest", e.do(t, "POST", "/tenants/1/apply", map[string]string{"template": "latest"}, idem()), 202, "")
+	for range 200 {
+		got = e.do(t, "GET", "/tenants/1", nil, nil).body
+		if tpl := got["template"].(map[string]any); tpl["current"] == true && got["apply"].(map[string]any)["state"] == "idle" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tpl := got["template"].(map[string]any); tpl["current"] != true || tpl["canRollback"] != true || tpl["previous"].(map[string]any)["image"] != edgetest.ImageA {
+		t.Errorf("template after latest = %v", tpl)
+	}
+
 	// 運用の操作。
 	expect(t, "restart", e.do(t, "POST", "/tenants/1/restart", nil, idem()), 204, "")
 	e.mu.Lock()

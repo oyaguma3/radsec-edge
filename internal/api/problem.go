@@ -56,7 +56,7 @@ func (p *problem) write(w http.ResponseWriter) {
 // statusOf は edge の誤りの符号から HTTP のステータスを決める。
 func statusOf(cause string) int {
 	switch cause {
-	case edge.CauseSlugImmutable, edge.CauseCapacityExceeded, edge.CauseConflict:
+	case edge.CauseSlugImmutable, edge.CauseCapacityExceeded, edge.CauseConflict, edge.CauseNoPreviousTemplate, edge.CauseTemplateUnavailable:
 		return http.StatusConflict
 	}
 	return http.StatusUnprocessableEntity

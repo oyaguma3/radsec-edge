@@ -114,10 +114,12 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Summary はコンテナの一覧の 1 件。
 type Summary struct {
-	ID     string            `json:"Id"`
-	Names  []string          `json:"Names"`
-	Labels map[string]string `json:"Labels"`
-	State  string            `json:"State"`
+	ID string `json:"Id"`
+	// ImageID はコンテナが使っているイメージの ID。
+	ImageID string            `json:"ImageID"`
+	Names   []string          `json:"Names"`
+	Labels  map[string]string `json:"Labels"`
+	State   string            `json:"State"`
 }
 
 // List は、ラベル label（"名前" または "名前=値"）の付いたコンテナを、止まっているものも含めて返す。
@@ -133,8 +135,10 @@ func (c *Client) List(ctx context.Context, label string) ([]Summary, error) {
 
 // Inspect はコンテナの詳しい状態。
 type Inspect struct {
-	ID           string `json:"Id"`
-	Name         string `json:"Name"`
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
+	// Image はコンテナが使っているイメージの ID（sha256:...）。
+	Image        string `json:"Image"`
 	RestartCount int    `json:"RestartCount"`
 	State        struct {
 		Status     string `json:"Status"`
@@ -272,6 +276,44 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// ImageInfo はイメージの詳しい状態。
+type ImageInfo struct {
+	ID       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Created  string   `json:"Created"`
+}
+
+// InspectImage はイメージ ref（タグか ID）の状態を返す。なければ ErrNotFound。ref は / を含むのでエスケープしない
+// （呼び出し側が決まった値か検証した ID だけを渡す）。
+func (c *Client) InspectImage(ctx context.Context, ref string) (ImageInfo, error) {
+	var out ImageInfo
+	err := c.do(ctx, http.MethodGet, "/images/"+ref+"/json", nil, nil, &out)
+	return out, err
+}
+
+// ImageSummary はイメージの一覧の 1 行。
+type ImageSummary struct {
+	ID       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Created  int64    `json:"Created"`
+}
+
+// Images は、リポジトリ repo のタグの付いたイメージを返す。
+func (c *Client) Images(ctx context.Context, repo string) ([]ImageSummary, error) {
+	filters, err := json.Marshal(map[string][]string{"reference": {repo}})
+	if err != nil {
+		return nil, err
+	}
+	var out []ImageSummary
+	err = c.do(ctx, http.MethodGet, "/images/json", url.Values{"filters": {string(filters)}}, nil, &out)
+	return out, err
+}
+
+// TagImage はイメージ id に repo:tag のタグを付ける。
+func (c *Client) TagImage(ctx context.Context, id, repo, tag string) error {
+	return c.do(ctx, http.MethodPost, "/images/"+url.PathEscape(id)+"/tag", url.Values{"repo": {repo}, "tag": {tag}}, nil, nil)
 }
 
 // NetworkSubnets はネットワークのサブネット（CIDR）を返す。

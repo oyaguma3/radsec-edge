@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -27,11 +28,22 @@ type FakeAgent struct {
 	FailEnsure error
 	// ValidateWait は Validate の前に呼ぶ（nil でなければ）。誤りを返すと Validate はその誤りを返す（止めるときの取り消しの試験）。
 	ValidateWait func(ctx context.Context) error
+	// ImageID は今のタグのイメージの ID、Images はホストにある radsecproxy のイメージの ID（ImageID は含めなくてよい）。
+	// Validated は Validate に渡されたイメージの記録。
+	ImageID   string
+	Images    []string
+	Validated []string
 }
+
+// テスト用のイメージの ID。
+const (
+	ImageA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	ImageB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
 
 // NewFakeAgent は偽物の agent を作る。
 func NewFakeAgent() *FakeAgent {
-	return &FakeAgent{Containers: map[string]*agent.Container{}, LogsText: map[string]string{}, ValidateOK: true}
+	return &FakeAgent{Containers: map[string]*agent.Container{}, LogsText: map[string]string{}, ValidateOK: true, ImageID: ImageA}
 }
 
 func (f *FakeAgent) call(s string) {
@@ -50,33 +62,69 @@ func (f *FakeAgent) TakeCalls() []string {
 func (f *FakeAgent) Status(context.Context) (agent.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st := agent.Status{DockerOK: true, ImagePresent: true, NetworkPresent: true, NetworkSubnets: f.NetworkSubnets}
+	st := agent.Status{DockerOK: true, ImagePresent: f.ImageID != "", ImageID: f.ImageID, NetworkPresent: true, NetworkSubnets: f.NetworkSubnets,
+		Image: agent.Image, LatestTemplate: agent.LatestTemplate, Templates: agent.Templates}
+	for _, id := range f.images() {
+		st.Images = append(st.Images, agent.ImageInfo{ID: id})
+	}
 	for _, c := range f.Containers {
 		st.Containers = append(st.Containers, *c)
 	}
 	return st, nil
 }
 
-func (f *FakeAgent) Ensure(_ context.Context, id, slug string, port int) (string, error) {
+// images はホストにあるイメージの ID（今のタグのものと Images）。
+func (f *FakeAgent) images() []string {
+	out := slices.Clone(f.Images)
+	if f.ImageID != "" && !slices.Contains(out, f.ImageID) {
+		out = append(out, f.ImageID)
+	}
+	return out
+}
+
+// resolve は agent と同じく、零値を今の形にし、ないイメージと作れない版を断る。
+func (f *FakeAgent) resolve(ref agent.Ref) (agent.Ref, error) {
+	if ref.Template == 0 {
+		ref.Template = agent.LatestTemplate
+	}
+	if ref.Image == "" {
+		ref.Image = f.ImageID
+	}
+	if !agent.KnownTemplate(ref.Template) {
+		return agent.Ref{}, &agent.Error{Status: 409, Message: agent.ErrUnknownTemplate.Error()}
+	}
+	if ref.Image == "" || !slices.Contains(f.images(), ref.Image) {
+		return agent.Ref{}, &agent.Error{Status: 409, Message: agent.ErrImageNotAllowed.Error()}
+	}
+	return ref, nil
+}
+
+func (f *FakeAgent) Ensure(_ context.Context, id, slug string, port int, ref agent.Ref) (agent.EnsureResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.call("ensure " + id)
 	if f.FailEnsure != nil {
-		return "", f.FailEnsure
+		return agent.EnsureResult{}, f.FailEnsure
+	}
+	ref, err := f.resolve(ref)
+	if err != nil {
+		return agent.EnsureResult{}, err
 	}
 	c, ok := f.Containers[id]
 	switch {
 	case !ok:
-		f.Containers[id] = &agent.Container{TenantID: id, Slug: slug, Name: agent.ContainerName(slug), State: "running", Running: true, Port: port, SpecCurrent: true}
-		return agent.EnsureCreated, nil
-	case c.Port != port:
-		c.Port, c.Running, c.State = port, true, "running"
-		return agent.EnsureRecreated, nil
+		f.Containers[id] = &agent.Container{TenantID: id, Slug: slug, Name: agent.ContainerName(slug), State: "running", Running: true, Port: port,
+			Template: ref.Template, ImageID: ref.Image}
+		return agent.EnsureResult{Action: agent.EnsureCreated, Ref: ref}, nil
+	case c.Port != port || c.Ref() != ref:
+		f.call("recreate " + id)
+		c.Port, c.Running, c.State, c.Template, c.ImageID = port, true, "running", ref.Template, ref.Image
+		return agent.EnsureResult{Action: agent.EnsureRecreated, Ref: ref}, nil
 	case !c.Running:
 		c.Running, c.State = true, "running"
-		return agent.EnsureStarted, nil
+		return agent.EnsureResult{Action: agent.EnsureStarted, Ref: ref}, nil
 	}
-	return agent.EnsureNone, nil
+	return agent.EnsureResult{Action: agent.EnsureNone, Ref: ref}, nil
 }
 
 func (f *FakeAgent) op(name, id string, fn func(c *agent.Container)) error {
@@ -114,9 +162,10 @@ func (f *FakeAgent) LogsSince(_ context.Context, id string, since time.Time) (st
 	f.Since = append(f.Since, since)
 	return f.LogsText[id], nil
 }
-func (f *FakeAgent) Validate(ctx context.Context, slug, gen string) (agent.ValidateResult, error) {
+func (f *FakeAgent) Validate(ctx context.Context, slug, gen, image string) (agent.ValidateResult, error) {
 	f.mu.Lock()
 	f.call("validate " + slug)
+	f.Validated = append(f.Validated, image)
 	wait := f.ValidateWait
 	f.mu.Unlock()
 	if wait != nil {

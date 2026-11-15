@@ -27,14 +27,14 @@ import (
 // Agent は radsec-edge-agent の操作。*agent.Client が満たす。
 type Agent interface {
 	Status(ctx context.Context) (agent.Status, error)
-	Ensure(ctx context.Context, id, slug string, port int) (string, error)
+	Ensure(ctx context.Context, id, slug string, port int, ref agent.Ref) (agent.EnsureResult, error)
 	Restart(ctx context.Context, id string) error
 	Stop(ctx context.Context, id string) error
 	Remove(ctx context.Context, id string) error
 	SIGHUP(ctx context.Context, id string) error
 	Logs(ctx context.Context, id string, lines int) (string, error)
 	LogsSince(ctx context.Context, id string, since time.Time) (string, error)
-	Validate(ctx context.Context, slug, gen string) (agent.ValidateResult, error)
+	Validate(ctx context.Context, slug, gen, image string) (agent.ValidateResult, error)
 }
 
 // ProbeFunc はヘルスチェックの 1 回の試み（probe.Check と同じ形）。
@@ -97,6 +97,10 @@ type Service struct {
 	statusMu    sync.Mutex
 	statusCache agent.Status
 	statusAt    time.Time
+
+	// cfgState は、設定の書き方が今かの写し（テナントの ID → 計った結果。§24.14 の U6-2）。cfgMu で守る。
+	cfgMu    sync.Mutex
+	cfgState map[string]configEntry
 }
 
 // ReconcileState は最後の整合ループの結果（画面に出す）。
@@ -132,7 +136,7 @@ func New(o Options) *Service {
 		o.ApplyTimeout = 2 * time.Minute
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{Options: o, bgCtx: ctx, bgCancel: cancel, applying: map[string]time.Time{}}
+	return &Service{Options: o, bgCtx: ctx, bgCancel: cancel, applying: map[string]time.Time{}, cfgState: map[string]configEntry{}}
 }
 
 // stopping は、radsec-edge を止めるので裏の反映が取り消されたか（Shutdown。§24.13 の T5-19）。

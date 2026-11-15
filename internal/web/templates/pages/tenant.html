@@ -20,9 +20,21 @@
             {{- if .AgentError}}<span class="text-error">agent に届きません: {{.AgentError}}</span>
             {{- else}}{{template "container-badge" .Container}}{{with .Container}} <code class="text-xs">{{.Name}}</code>
               {{- if .RestartCount}} <span class="text-sm">再起動 {{.RestartCount}} 回</span>{{end}}
-              {{- if not .StartedAt.IsZero}} <span class="text-sm text-base-content/60">{{datetime .StartedAt}} に起動</span>{{end}}
-              {{- if not .SpecCurrent}} <span class="badge badge-warning badge-sm">ひな形が古い（次の反映で作り直します）</span>{{end}}{{end}}
+              {{- if not .StartedAt.IsZero}} <span class="text-sm text-base-content/60">{{datetime .StartedAt}} に起動</span>{{end}}{{end}}
             {{- end}}</td></tr>
+          {{- with .Template}}
+          <tr><th>コンテナのひな形</th><td>
+            {{- if .Recorded.Template}}版 {{.Recorded.Template}}、イメージ <code class="text-xs">{{shortImage .Recorded.Image}}</code>{{else}}まだ記録していません{{end}}
+            {{- if .Current}} <span class="badge badge-success badge-sm">今の形</span>
+            {{- else if .Mismatch}} <span class="badge badge-error badge-sm">記録と違う形で動いています（版 {{.Running.Template}}、イメージ {{shortImage .Running.Image}}）</span>
+            {{- else if .Recorded.Template}} <span class="badge badge-warning badge-sm">古い（今の形は版 {{.Latest.Template}}、イメージ {{shortImage .Latest.Image}}）</span>{{end}}
+            {{- if .Previous.Template}} <span class="text-sm text-base-content/60">前の形: 版 {{.Previous.Template}}、イメージ {{shortImage .Previous.Image}}{{if not .CanRollback}}（戻せません）{{end}}</span>{{end}}
+            </td></tr>
+          {{- end}}
+          <tr><th>設定の書き方</th><td>
+            {{- if not .ConfigKnown}}<span class="text-base-content/60">—</span>
+            {{- else if .ConfigCurrent}}<span class="badge badge-success badge-sm">今の書き方</span>
+            {{- else}}<span class="badge badge-warning badge-sm">古い（次の反映で今の書き方になります）</span>{{end}}</td></tr>
           <tr><th>ポート</th><td>{{.Tenant.Port}}{{if and .Tenant.AppliedPort (ne .Tenant.AppliedPort .Tenant.Port)}}（反映済みは {{.Tenant.AppliedPort}}）{{end}}</td></tr>
           <tr><th>望む状態の版</th><td>{{.Tenant.DesiredVersion}}</td></tr>
           <tr><th>反映済みの版</th><td>{{if .Tenant.AppliedVersion}}{{.Tenant.AppliedVersion}}（{{datetime .Tenant.AppliedAt}}、設定のハッシュ <code>{{short 16 .Tenant.AppliedHash}}</code>）{{else}}まだ反映していません{{end}}</td></tr>
@@ -44,6 +56,21 @@
         {{- else}}
         <form hx-post="/tenants/{{.Tenant.ID}}/start" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><button class="btn btn-sm btn-primary">起動</button></form>
         {{- end}}
+        {{- /* ひな形の反映し直し（単独モードだけ。管理モードでは中央から行う。§24.14 の U6-4・U6-7） */}}
+        {{- if and (not .Managed) .Tenant.Enabled .Tenant.AppliedVersion}}{{with .Template}}
+        {{- if and (not .Current) .Latest.Image}}
+        <form id="tenant-latest" hx-post="/tenants/{{$.Tenant.ID}}/apply" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><input type="hidden" name="template" value="latest"></form>
+        <button type="button" class="btn btn-sm" command="show-modal" commandfor="dialog-latest">今の形で反映し直す</button>
+        {{template "confirm" (dict "ID" "dialog-latest" "Title" "今の形で反映し直す" "Form" "tenant-latest" "Label" "反映し直す" "Class" "btn-primary"
+          "Message" (printf "テナント %s のコンテナを今の形（ひな形の版 %d、イメージ %s）で作り直します。このテナントの AP の接続がいったん切れます。ヘルスチェックが通らなければ元の形に戻します。よろしいですか？" $.Tenant.Slug .Latest.Template (shortImage .Latest.Image)))}}
+        {{- end}}
+        {{- if .CanRollback}}
+        <form id="tenant-previous" hx-post="/tenants/{{$.Tenant.ID}}/apply" hx-target="#tenant" hx-swap="outerHTML" hx-disabled-elt="#tenant button"><input type="hidden" name="template" value="previous"></form>
+        <button type="button" class="btn btn-sm" command="show-modal" commandfor="dialog-previous">前の形に戻す</button>
+        {{template "confirm" (dict "ID" "dialog-previous" "Title" "前の形に戻す" "Form" "tenant-previous" "Label" "戻す" "Class" "btn-primary"
+          "Message" (printf "テナント %s のコンテナを前の形（ひな形の版 %d、イメージ %s）で作り直します。このテナントの AP の接続がいったん切れます。よろしいですか？" $.Tenant.Slug .Previous.Template (shortImage .Previous.Image)))}}
+        {{- end}}
+        {{- end}}{{end}}
       </div>
     </div>
   </div>

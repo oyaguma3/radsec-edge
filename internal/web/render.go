@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oyaguma3/radsec-edge/internal/agent"
 	"github.com/oyaguma3/radsec-edge/internal/diff"
 )
 
@@ -28,6 +29,8 @@ var funcs = template.FuncMap{
 		}
 		return s[:n]
 	},
+	// shortImage はイメージの ID の短い形（sha256: を除いた 12 桁）。
+	"shortImage": agent.ShortImage,
 	// dict は「名前, 値, …」から部品に渡すマップを作る。
 	"dict": func(kv ...any) map[string]any {
 		m := map[string]any{}

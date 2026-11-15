@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,7 +146,7 @@ func (s *Server) find(ctx context.Context, id string) (docker.Summary, error) {
 }
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	st := Status{Version: s.version, Image: Image, Network: s.network, Containers: []Container{}}
+	st := Status{Version: s.version, Image: Image, LatestTemplate: LatestTemplate, Templates: Templates, Network: s.network, Containers: []Container{}}
 	ctx := r.Context()
 	if err := s.docker.Ping(ctx); err != nil {
 		st.DockerError = err.Error()
@@ -152,11 +154,14 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.DockerOK = true
-	var err error
-	if st.ImagePresent, err = s.docker.ImageExists(ctx, Image); err != nil {
+	switch in, err := s.docker.InspectImage(ctx, Image); {
+	case err == nil:
+		st.ImagePresent, st.ImageID = true, in.ID
+	case !errors.Is(err, docker.ErrNotFound):
 		s.fail(w, r, "inspect image", err)
 		return
 	}
+	var err error
 	if st.NetworkPresent, err = s.docker.NetworkExists(ctx, s.network); err != nil {
 		s.fail(w, r, "inspect network", err)
 		return
@@ -172,6 +177,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "list containers", err)
 		return
 	}
+	inUse := map[string]int{}
 	for _, c := range cs {
 		in, err := s.docker.InspectContainer(ctx, c.ID)
 		if errors.Is(err, docker.ErrNotFound) {
@@ -184,22 +190,117 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		ct := Container{
 			TenantID: c.Labels[LabelTenant], Slug: c.Labels[LabelSlug], Name: strings.TrimPrefix(in.Name, "/"), ID: in.ID,
 			State: in.State.Status, Running: in.State.Running, Restarting: in.State.Restarting,
-			RestartCount: in.RestartCount, ExitCode: in.State.ExitCode,
+			RestartCount: in.RestartCount, ExitCode: in.State.ExitCode, ImageID: in.Image,
 		}
 		if t, err := time.Parse(time.RFC3339Nano, in.State.StartedAt); err == nil && t.Year() > 1 {
 			ct.StartedAt = t
 		}
 		if p, err := strconv.Atoi(c.Labels[LabelPort]); err == nil && names.ValidSlug(ct.Slug) {
 			ct.Port = p
-			ct.SpecCurrent = tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, ct.TenantID, ct.Slug, p).Labels[LabelSpec] == c.Labels[LabelSpec]
+			ct.Template = s.templateOf(c.Labels, ct.TenantID, ct.Slug, p, in.Image)
+		}
+		if ct.Template != 0 {
+			inUse[in.Image]++
 		}
 		st.Containers = append(st.Containers, ct)
+	}
+	// テナントのコンテナが使っているイメージにタグがなくなっていれば（同じタグで新しいイメージを読み込んだとき）、残すタグを付ける。
+	for id := range inUse {
+		s.keep(ctx, id)
+	}
+	imgs, err := s.docker.Images(ctx, ImageRepo)
+	if err != nil {
+		s.fail(w, r, "list images", err)
+		return
+	}
+	for _, im := range imgs {
+		st.Images = append(st.Images, ImageInfo{ID: im.ID, Tags: im.RepoTags, Created: time.Unix(im.Created, 0).UTC(), InUse: inUse[im.ID]})
 	}
 	writeJSON(w, http.StatusOK, st)
 }
 
-// ensure はテナントのコンテナを固定のひな形から作り、起動する（あって動いていれば何もしない）。
-// ひな形やポートが違うコンテナは作り直す。
+// templateOf は、コンテナのラベルとイメージから、そのコンテナのひな形の版を返す（ひな形のハッシュが合わなければ 0）。
+// 段階 6 より前の作りで作ったコンテナ（ひな形の版のラベルがない）は、そのときのハッシュの作り方で照らし、合えば版 1 とする。
+func (s *Server) templateOf(labels map[string]string, tenantID, slug string, port int, image string) int {
+	if v, err := strconv.Atoi(labels[LabelTemplate]); err == nil {
+		want, err := tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, tenantID, slug, port, Ref{Template: v, Image: image})
+		if err == nil && want.Labels[LabelSpec] == labels[LabelSpec] {
+			return v
+		}
+		return 0
+	}
+	if labels[LabelTemplate] == "" && labels[LabelSpec] == legacySpecHash(s.tenantsDir, s.network, s.publishAddr, s.fluentd, tenantID, slug, port) {
+		return 1
+	}
+	return 0
+}
+
+// keep は、イメージ id に ImageRepo のタグがなければ、残すタグ（keep-<ID の 12 桁>）を付ける。失敗はログに残すだけ。
+func (s *Server) keep(ctx context.Context, id string) {
+	in, err := s.docker.InspectImage(ctx, id)
+	if err != nil || slices.ContainsFunc(in.RepoTags, isRepoTag) {
+		return
+	}
+	tag := KeepTagPrefix + ShortImage(id)
+	if err := s.docker.TagImage(ctx, id, ImageRepo, tag); err != nil {
+		s.log.Error("cannot tag the previous image", "image", id, "error", err)
+		return
+	}
+	s.log.Info("tagged the previous image to keep it", "image", id, "tag", ImageRepo+":"+tag)
+}
+
+// isRepoTag は ImageRepo のタグか。
+func isRepoTag(tag string) bool { return strings.HasPrefix(tag, ImageRepo+":") }
+
+// validImageID は sha256: で始まるイメージの ID の形か。
+func validImageID(id string) bool {
+	h, ok := strings.CutPrefix(id, "sha256:")
+	return ok && len(h) == 64 && strings.Trim(h, "0123456789abcdef") == ""
+}
+
+// allowedImage は image（空なら Image のタグ）が ImageRepo のタグの付いたイメージなら、その ID を返す（なければ ErrImageNotAllowed）。
+func (s *Server) allowedImage(ctx context.Context, image string) (string, error) {
+	ref := image
+	if ref == "" {
+		ref = Image
+	} else if !validImageID(ref) {
+		return "", fmt.Errorf("%w: %s", ErrImageNotAllowed, image)
+	}
+	in, err := s.docker.InspectImage(ctx, ref)
+	if errors.Is(err, docker.ErrNotFound) || (err == nil && !slices.ContainsFunc(in.RepoTags, isRepoTag)) {
+		return "", fmt.Errorf("%w: %s", ErrImageNotAllowed, ref)
+	}
+	if err != nil {
+		return "", err
+	}
+	return in.ID, nil
+}
+
+// resolve は要求のひな形を確かめる。版が 0 なら最新の版、イメージが空なら今のタグのイメージにする。
+func (s *Server) resolve(ctx context.Context, ref Ref) (Ref, error) {
+	ref.Template = cmp.Or(ref.Template, LatestTemplate)
+	if !KnownTemplate(ref.Template) {
+		return Ref{}, fmt.Errorf("%w: %d", ErrUnknownTemplate, ref.Template)
+	}
+	id, err := s.allowedImage(ctx, ref.Image)
+	if err != nil {
+		return Ref{}, err
+	}
+	ref.Image = id
+	return ref, nil
+}
+
+// failRef は resolve の誤りを応答にする（作れないひな形とイメージは 409）。
+func (s *Server) failRef(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrImageNotAllowed) || errors.Is(err, ErrUnknownTemplate) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.fail(w, r, "inspect image", err)
+}
+
+// ensure はテナントのコンテナを、要求のひな形（版とイメージ）で作り、起動する（あって動いていれば何もしない）。
+// ひな形やポートが違うコンテナは作り直す。作り直す前に、古いコンテナのイメージに残すタグを付ける（前の形に戻せるように）。
 func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 	id, ok := tenantID(w, r)
 	if !ok {
@@ -217,13 +318,22 @@ func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ctx := r.Context()
-	want := tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, id, req.Slug, req.Port)
+	ref, err := s.resolve(ctx, req.Ref)
+	if err != nil {
+		s.failRef(w, r, err)
+		return
+	}
+	want, err := tenantSpec(s.tenantsDir, s.network, s.publishAddr, s.fluentd, id, req.Slug, req.Port, ref)
+	if err != nil {
+		s.failRef(w, r, err)
+		return
+	}
 	action := EnsureCreated
 	cur, err := s.find(ctx, id)
 	switch {
 	case err == nil && cur.Labels[LabelSpec] == want.Labels[LabelSpec] && cur.Labels[LabelSlug] == req.Slug:
 		if cur.State == "running" {
-			writeJSON(w, http.StatusOK, EnsureResult{Action: EnsureNone})
+			writeJSON(w, http.StatusOK, EnsureResult{Action: EnsureNone, Ref: ref})
 			return
 		}
 		if err := s.docker.Start(ctx, cur.ID); err != nil {
@@ -231,9 +341,12 @@ func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.log.Info("tenant container started", "tenant", id, "container", cur.ID)
-		writeJSON(w, http.StatusOK, EnsureResult{Action: EnsureStarted})
+		writeJSON(w, http.StatusOK, EnsureResult{Action: EnsureStarted, Ref: ref})
 		return
 	case err == nil:
+		if cur.ImageID != "" && cur.ImageID != ref.Image {
+			s.keep(ctx, cur.ImageID)
+		}
 		if err := s.docker.Remove(ctx, cur.ID); err != nil && !errors.Is(err, docker.ErrNotFound) {
 			s.fail(w, r, "remove", err)
 			return
@@ -253,8 +366,8 @@ func (s *Server) ensure(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "start", err)
 		return
 	}
-	s.log.Info("tenant container "+action, "tenant", id, "slug", req.Slug, "port", req.Port, "container", cid)
-	writeJSON(w, http.StatusOK, EnsureResult{Action: action})
+	s.log.Info("tenant container "+action, "tenant", id, "slug", req.Slug, "port", req.Port, "container", cid, "template", ref.Template, "image", ShortImage(ref.Image))
+	writeJSON(w, http.StatusOK, EnsureResult{Action: action, Ref: ref})
 }
 
 // onContainer は、テナントのコンテナに対して op を行う。
@@ -350,10 +463,15 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), validateTimeout)
 	defer cancel()
+	image, err := s.allowedImage(ctx, req.Image)
+	if err != nil {
+		s.failRef(w, r, err)
+		return
+	}
 	var rnd [4]byte
 	rand.Read(rnd[:])
 	name := "radsec-edge-validate-" + req.Slug + "-" + hex.EncodeToString(rnd[:])
-	cid, err := s.docker.Create(ctx, name, validateSpec(s.tenantsDir, s.network, req.Slug, req.Gen))
+	cid, err := s.docker.Create(ctx, name, validateSpec(s.tenantsDir, s.network, req.Slug, req.Gen, image))
 	if err != nil {
 		s.fail(w, r, "validate: create", err)
 		return

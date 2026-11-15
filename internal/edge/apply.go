@@ -189,10 +189,16 @@ func (s *Service) record(ctx context.Context, a *db.Apply) {
 	level("apply", "tenant", a.TenantID, "version", a.Version, "trigger", a.Trigger, "action", a.Action, "result", a.Result, "error", a.Error)
 }
 
-// Apply はテナントの望む状態を反映する（§11.1）。生成 → 版のディレクトリに書いて構文検査 → current を付け替え →
-// SIGHUP か再起動 → ヘルスチェック → 失敗したら前の版に戻す。結果は反映の記録に残し、返す。
-// 反映できなかったとき（前の版のまま、または前の版に戻したとき）は、記録とともにエラーを返す。
+// Apply はテナントの望む状態を、記録のひな形のまま反映する（ApplyTemplate の TemplateKeep）。
 func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, error) {
+	return s.ApplyTemplate(ctx, a, id, TemplateKeep)
+}
+
+// ApplyTemplate はテナントの望む状態を反映する（§11.1）。生成 → 版のディレクトリに書いて構文検査 → current を付け替え →
+// SIGHUP か再起動 → ヘルスチェック → 失敗したら前の版に戻す。結果は反映の記録に残し、返す。
+// mode が TemplateLatest・TemplatePrevious なら、コンテナを今の形・前の形のひな形で作り直し、失敗したら元の形で作り直す（§24.14 の U6-4）。
+// 反映できなかったとき（前の版のまま、または前の版に戻したとき）は、記録とともにエラーを返す。
+func (s *Service) ApplyTemplate(ctx context.Context, a Actor, id string, mode TemplateMode) (db.Apply, error) {
 	unlock, err := s.acquire(ctx, id)
 	if err != nil {
 		return db.Apply{}, err
@@ -206,9 +212,43 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 	if !t.Enabled {
 		return db.Apply{}, invalidCause(CauseTenantStopped, "停止しているテナントは反映できません。起動してから反映してください")
 	}
+	st, err := s.Agent.Status(ctx)
+	if err != nil {
+		return db.Apply{}, fmt.Errorf("agent: %w", err)
+	}
 	// 前の反映が途中で止まっていれば、先に前の版へ戻す（§24.11 の EA6）。戻せなかったときは、差がなくても再起動して読み込ませる。
-	forceRestart := s.recoverInterrupted(ctx, a, t)
+	forceRestart := s.recoverInterrupted(ctx, a, t, st)
+	cur := s.recorded(ctx, t, st)
+	target := cur
+	switch mode {
+	case TemplateLatest:
+		if !st.ImagePresent {
+			return db.Apply{}, invalidCause(CauseTemplateUnavailable, "radsecproxy のイメージ %s がホストにないので、今の形にできません", st.Image)
+		}
+		target = st.Latest()
+	case TemplatePrevious:
+		ts := TemplateStateOf(t, st)
+		if ts.Previous.IsZero() {
+			return db.Apply{}, invalidCause(CauseNoPreviousTemplate, "前の形の記録がないので、前の形に戻せません")
+		}
+		if !ts.CanRollback {
+			return db.Apply{}, invalidCause(CauseTemplateUnavailable, "前の形（ひな形の版 %d、イメージ %s）が使えないので、前の形に戻せません", ts.Previous.Template, agent.ShortImage(ts.Previous.Image))
+		}
+		target = ts.Previous
+	}
+	changing := target != cur
 	rec := db.Apply{TenantID: id, Version: t.DesiredVersion, Revision: t.Revision, Trigger: db.TriggerApply, Operator: a.Operator, Started: s.Now()}
+	auditDetail := func() map[string]any {
+		d := map[string]any{"version": rec.Version, "result": rec.Result}
+		if rec.Action != "" {
+			d["action"] = rec.Action
+		}
+		if mode != TemplateKeep || changing {
+			d["template_mode"], d["template"], d["image"] = string(mode), target.Template, agent.ShortImage(target.Image)
+			d["from_template"], d["from_image"] = cur.Template, agent.ShortImage(cur.Image)
+		}
+		return d
+	}
 	fail := func(result string, err error) (db.Apply, error) {
 		if s.stopping(ctx) {
 			// 止めるときの取り消しで、前の版のまま終えたか前の版に戻した（§24.13 の T5-19）。中央は interrupted を自動でやり直す
@@ -216,7 +256,7 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 		}
 		rec.Result, rec.Error = result, err.Error()
 		s.record(ctx, &rec)
-		s.audit(ctx, a, "tenant.apply", id, map[string]any{"version": rec.Version, "result": rec.Result})
+		s.audit(ctx, a, "tenant.apply", id, auditDetail())
 		return rec, err
 	}
 
@@ -233,52 +273,67 @@ func (s *Service) Apply(ctx context.Context, a Actor, id string) (db.Apply, erro
 	if err != nil {
 		return fail(db.ResultFailed, err)
 	}
-	if gen != oldGen {
-		res, err := s.Agent.Validate(ctx, t.Slug, gen)
+	// 設定が同じでも、ひな形（radsecproxy の版）を替えるときは、そのイメージで検査する。
+	if gen != oldGen || changing {
+		res, err := s.Agent.Validate(ctx, t.Slug, gen, target.Image)
 		if err != nil {
 			return fail(db.ResultFailed, fmt.Errorf("構文検査ができません: %w", err))
 		}
 		if !res.OK {
 			return fail(db.ResultFailed, fmt.Errorf("radsecproxy の構文検査で誤りが見つかりました:\n%s", strings.TrimSpace(res.Output)))
 		}
-		if err := s.Store.Activate(t.Slug, gen); err != nil {
-			return fail(db.ResultFailed, err)
+		if gen != oldGen {
+			if err := s.Store.Activate(t.Slug, gen); err != nil {
+				return fail(db.ResultFailed, err)
+			}
 		}
 	}
 	want := b.ActionFrom(old)
 	if forceRestart {
 		want = rsconf.ActionRestart
 	}
-	rec.Action, err = s.bring(ctx, t, t.Port, want)
+	rec.Action, err = s.bring(ctx, t, t.Port, want, target)
 	if err == nil {
 		err = s.probeUntil(ctx, t, t.Port)
 	}
 	if err != nil {
-		// 前の版に戻す（前の版がなければ止めて、current を外す。整合ループが壊れた版で起動しないように）。
-		if rerr := s.rollback(ctx, t, oldGen); rerr != nil {
+		// 前の版と元のひな形に戻す（前の版がなければ止めて、current を外す。整合ループが壊れた版で起動しないように）。
+		if rerr := s.rollback(ctx, t, oldGen, cur); rerr != nil {
 			err = fmt.Errorf("%w（前の版に戻すのにも失敗しました: %v）", err, rerr)
+		}
+		if unusable(err) {
+			return fail(db.ResultFailed, invalidCause(CauseTemplateUnavailable, "ひな形（版 %d、イメージ %s）が使えません: %v", target.Template, agent.ShortImage(target.Image), err))
 		}
 		return fail(db.ResultRolledBack, err)
 	}
 	if err := s.DB.MarkApplied(ctx, id, t.DesiredVersion, t.Revision, b.Hash(), t.Port); err != nil {
 		return fail(db.ResultFailed, err)
 	}
+	if prev := PrevRefOf(t); changing || RefOf(t) != target {
+		if changing {
+			prev = cur
+		}
+		if err := s.DB.SetTemplate(ctx, id, target.Template, target.Image, prev.Template, prev.Image); err != nil {
+			return fail(db.ResultFailed, err)
+		}
+	}
+	s.forgetConfigState(id)
 	if err := s.Store.Prune(t.Slug, keepGenerations); err != nil {
 		s.Log.Warn("cannot remove old generations", "tenant", id, "error", err)
 	}
 	rec.Result = db.ResultOK
 	s.record(ctx, &rec)
-	s.audit(ctx, a, "tenant.apply", id, map[string]any{"version": rec.Version, "result": rec.Result, "action": rec.Action})
+	s.audit(ctx, a, "tenant.apply", id, auditDetail())
 	return rec, nil
 }
 
-// bring は、コンテナを作る・起動する（Ensure）。動いていたコンテナには、want（SIGHUP か再起動）を行う。行ったことを返す。
-func (s *Service) bring(ctx context.Context, t db.Tenant, port int, want rsconf.Action) (string, error) {
-	action, err := s.Agent.Ensure(ctx, t.ID, t.Slug, port)
+// bring は、コンテナをひな形 ref で作る・起動する（Ensure）。動いていたコンテナには、want（SIGHUP か再起動）を行う。行ったことを返す。
+func (s *Service) bring(ctx context.Context, t db.Tenant, port int, want rsconf.Action, ref agent.Ref) (string, error) {
+	res, err := s.Agent.Ensure(ctx, t.ID, t.Slug, port, ref)
 	if err != nil {
 		return "ensure", err
 	}
-	if action != agent.EnsureNone {
+	if action := res.Action; action != agent.EnsureNone {
 		return action, nil // 作った・起動したコンテナは、新しい版を読んでいる
 	}
 	switch want {
@@ -293,7 +348,7 @@ func (s *Service) bring(ctx context.Context, t db.Tenant, port int, want rsconf.
 // recoverInterrupted は、反映の途中でプロセスが止まって current が反映済みの版と違っていれば、反映済みの版に戻す（§24.11 の EA6）。
 // 排他の中で current と反映済みの版が違うのは、途中で止まったときだけである（反映と CRL の更新は排他の中で MarkApplied まで行う）。
 // 戻せなかったら true を返す（呼び出し側が反映するときは、再起動して読み込ませる）。呼び出し側でテナントの排他を取る。
-func (s *Service) recoverInterrupted(ctx context.Context, a Actor, t db.Tenant) bool {
+func (s *Service) recoverInterrupted(ctx context.Context, a Actor, t db.Tenant, st agent.Status) bool {
 	gen, _, err := s.Store.Current(t.Slug)
 	if err != nil {
 		s.Log.Error("cannot read the current generation", "tenant", t.ID, "error", err)
@@ -314,7 +369,7 @@ func (s *Service) recoverInterrupted(ctx context.Context, a Actor, t db.Tenant) 
 		}
 	}
 	if t.Enabled || applied == "" {
-		err = s.rollback(ctx, t, applied)
+		err = s.rollback(ctx, t, applied, s.recorded(ctx, t, st))
 	} else {
 		err = s.Store.Activate(t.Slug, applied) // 停止しているテナントは起動しない
 	}
@@ -335,8 +390,8 @@ func appliedGen(t db.Tenant) string {
 	return t.AppliedHash[:16]
 }
 
-// rollback は前の版 oldGen に戻して再起動する。前の版がなければ、コンテナを止めて current を外す。
-func (s *Service) rollback(ctx context.Context, t db.Tenant, oldGen string) error {
+// rollback は前の版 oldGen とひな形 ref に戻して再起動する。前の版がなければ、コンテナを止めて current を外す。
+func (s *Service) rollback(ctx context.Context, t db.Tenant, oldGen string, ref agent.Ref) error {
 	ctx = context.WithoutCancel(ctx)
 	if oldGen == "" {
 		err := s.Agent.Stop(ctx, t.ID)
@@ -352,11 +407,11 @@ func (s *Service) rollback(ctx context.Context, t db.Tenant, oldGen string) erro
 	if port == 0 {
 		port = t.Port
 	}
-	action, err := s.Agent.Ensure(ctx, t.ID, t.Slug, port)
+	res, err := s.Agent.Ensure(ctx, t.ID, t.Slug, port, ref)
 	if err != nil {
 		return err
 	}
-	if action == agent.EnsureNone {
+	if res.Action == agent.EnsureNone {
 		if err := s.Agent.Restart(ctx, t.ID); err != nil {
 			return err
 		}
@@ -435,11 +490,30 @@ func (s *Service) syncTenant(ctx context.Context, t db.Tenant, st agent.Status, 
 	if port == 0 {
 		port = t.Port
 	}
-	// 再起動の途中（Docker が再起動の方針で起動し直している）のコンテナには触れない。
-	if exists && (c.Running || c.Restarting) && c.SpecCurrent && c.Port == port {
+	// 動いている（再起動の途中を含む）コンテナは、ひな形が記録や今の形と違っても作り直さない（§24.14 の U6-3）。
+	// 段階 6 より前に作ったコンテナは、ここで記録する。
+	if exists && (c.Running || c.Restarting) && c.Port == port {
+		s.recorded(ctx, t, st)
 		return nil
 	}
-	rec.Action, err = s.Agent.Ensure(ctx, t.ID, t.Slug, port)
+	ref := s.recorded(ctx, t, st)
+	res, err := s.Agent.Ensure(ctx, t.ID, t.Slug, port, ref)
+	if unusable(err) {
+		// 記録のイメージがない（消した）・作れない版のときは、今の形で作る（止めたままにしない）。
+		s.Log.Warn("the recorded template cannot be used; the container is made with the latest template", "tenant", t.ID,
+			"template", ref.Template, "image", agent.ShortImage(ref.Image), "error", err)
+		res, err = s.Agent.Ensure(ctx, t.ID, t.Slug, port, agent.Ref{})
+	}
+	if err == nil && (res.Ref != ref || RefOf(t).IsZero()) {
+		prev := PrevRefOf(t)
+		if !RefOf(t).IsZero() {
+			prev = RefOf(t)
+		}
+		if serr := s.DB.SetTemplate(ctx, t.ID, res.Ref.Template, res.Ref.Image, prev.Template, prev.Image); serr != nil {
+			s.Log.Error("cannot record the template", "tenant", t.ID, "error", serr)
+		}
+	}
+	rec.Action = res.Action
 	if err == nil && rec.Action == agent.EnsureNone {
 		return nil
 	}
@@ -494,10 +568,11 @@ func (s *Service) reconcile(ctx context.Context) error {
 		}
 		// 排他を待つ間に変わっているかもしれないので、読み直す。
 		if cur, err := s.DB.Tenant(ctx, t.ID); err == nil {
-			s.recoverInterrupted(ctx, System, cur)
+			s.recoverInterrupted(ctx, System, cur, st)
 			if err := s.syncTenant(ctx, cur, st, System); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", t.ID, err))
 			}
+			s.refreshConfigState(ctx, cur)
 		}
 		unlock()
 	}

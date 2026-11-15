@@ -39,7 +39,7 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("second Migrate = %v, %v", applied, err)
 	}
 	v, err := d.SchemaVersion(t.Context())
-	if err != nil || v != 4 {
+	if err != nil || v != 5 {
 		t.Fatalf("SchemaVersion = %d, %v", v, err)
 	}
 	// 新しい版で移行した DB は、古い版では使わない。
