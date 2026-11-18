@@ -305,7 +305,7 @@ CA のデータ（CA、発行した証明書、CRL、画面の利用者、監査
 - init（tini）を PID 1 にする（Docker の `init: true`）。radsecproxy は PID 1 だと SIGTERM で止まらず、停止の猶予が切れて SIGKILL されるまで待つことになる（§18.1 の V6。init を使うと再起動は約 0.3 秒）。
 - Docker のログは回転させる（`max-size`・`max-file`。案: 10 MB × 5）。AP の数が多いテナントでは、接続のたびにログが多く出るため（§10.3）。
 - 再起動の方針は `unless-stopped`。ラベル `radsec-edge.tenant=<ID>`（と `radsec-edge.slug=<slug>`）で管理の対象を識別し、ラベルのないコンテナには触れない。
-- ひな形の版（コードの中の番号。起動のしかた・環境変数・マウントなどを変えるときに上げる）をラベル `radsec-edge.template` に、ひな形のハッシュ（イメージの ID、利用者、コマンド、環境変数、ひな形の版、マウント、ポート、HostConfig）をラベル `radsec-edge.spec` に入れる。コードは今と 1 つ前のひな形の版を作れる（§24.14 の U6-5）。
+- ひな形の版（コードの中の番号。起動のしかた・環境変数・マウントなどや、新しい radsecproxy でしか読めない設定の書き方を変えるときに上げる。版 2 は設定の書き方だけが版 1 と違う。§24.15）をラベル `radsec-edge.template` に、ひな形のハッシュ（イメージの ID、利用者、コマンド、環境変数、ひな形の版、マウント、ポート、HostConfig）をラベル `radsec-edge.spec` に入れる。コードは今と 1 つ前のひな形の版を作れる（§24.14 の U6-5）。
 - 動いているコンテナは、ひな形が記録や今の形と違っても整合ループで作り直さない。作り直すのは、運用担当がテナントを選んで「今の形へ」「前の形へ」反映し直したときと、ポートが変わる反映のときだけ（§11.5、§24.14）。
 - API の要求からは、マウント・権限を指定させない。イメージは、radsecproxy のリポジトリ（`radsec-edge/radsecproxy`）のタグの付いたイメージの ID だけを受ける。`radsec-edge` が乗っ取られても、勝手なコンテナは作れない。テナントのコンテナが使っているイメージのタグがなくなったら（同じタグで新しいイメージを読み込んだとき）、agent が `keep-<ID の 12 桁>` のタグを付けて残す（前の形に戻せるように）。
 
@@ -321,6 +321,7 @@ D-08 §5.8 の検証の結果を、ひな形に入れる。
   - probe の client ブロックにも、AP と同じ rewrite（NAS-Identifier `<テナント>-probe`）を付ける。probe は Status-Server しか送らない（radsecproxy が自分で応える）が、上流に届くものの NAS-Identifier を必ず置き換えるため。この値も NAS-Identifier の一意の確認（§8.2）に含める。テナント `a` の AP `x-probe` と、テナント `a-x` の probe（`a-x-probe`）のように重なりうるため、どちらの登録のときも断る。
   - 照合は SAN の URI だけで行う（CN は照合しない）。radsecproxy は、AP がつなぐたびに、一致するまでの client ブロックのそれぞれについて、照合した属性ごとに「一致しない」の行をログに出す（LogLevel 2 でも出る。500 台目の AP の 1 回の接続で、CN と SAN の両方を照合すると 998 行。§18.1 の V4）。CN も SAN も CA が登録の情報から決めるので、片方で足りる。
 - server ブロックは上流の認証と課金（`type udp`、`statusServer on`）。`realm *` で両方に送る。上流の `host` は、ホスト名ではなく IP アドレス（トンネルの IP）で書く。radsecproxy は、起動のときに server のホスト名を引けないと終了する（§18.1 の V3）。
+- client ブロックには `TCPKeepalive on`（§24.13 の T5-18）。ひな形の版 2 からは `IdleTimeout 0` も書く（要求のない AP の TLS 接続を閉じない。無改造の radsecproxy は 15 分で閉じる。§24.15）。設定は、テナントのコンテナが動かすひな形の版の書き方で描く（版 1 で動くテナントには書かない。1.11.4-pc1 は `IdleTimeout` を知らないオプションとして断る）。
 - MVP セットでは、どの rewrite にもテナントの刻印の取り除きと付与を入れる。AP・グループ・probe・共通のブロック（持ち込みの CA があるときだけ）の順に並べる（§24.2、§24.4）。
 - `LogLevel 2` にする。LogLevel 3 は認証ごとの行と Status-Server の行が加わり、LogLevel 1 は拒否した証明書の CN も出なくなる（§18.1 の V4）。
 - radsecproxy は `-f`（フォアグラウンド）で動かす。ログは標準エラーに出て、Docker のログで読める（`LogDestination` は無視される）。
@@ -375,9 +376,11 @@ D-08 §5.8 の検証の結果を、ひな形に入れる。
 
 整合ループは、起動したときと一定の間隔（案: 1 分）で、SQLite のテナントとラベルのついたコンテナを突き合わせ、望む状態に戻す（ホストの再起動、手で止めたコンテナ、消えたコンテナ）。無効にしたテナントのコンテナは止める。
 
+- 起動の直後に agent に届かなければ（ホストの再起動で agent のソケットがまだないとき）、届くまで 5 秒ごとに、最大 2 分やり直す（その後は一定の間隔。§24.15 の R6-4）。CRL の更新で SIGHUP を受けたテナントのコンテナは、ホストを再起動しても Docker では起き上がらないため（Docker が「手で止めた」とみなす）。
+
 - 整合ループが戻すのは運用の状態だけで、未反映の変更は反映しない。反映済みの版（current）と反映済みのポートと、記録のひな形で、コンテナを作る・起動する。まだ反映していないテナントには何もしない。
 - 動いているコンテナは、ひな形が記録や今の形と違っても作り直さない（§24.14 の U6-3）。記録がない（段階 6 より前に作った）テナントは、動いているコンテナの形を記録する。なくなったコンテナを作るときに記録のイメージがホストにないときは、今の形で作って記録を改める（止めたままにしない）。
-- 整合ループは、反映済みのテナントの設定を今のコードの書き方で描いて反映済みと比べ、違えば「設定の書き方が古い」と管理API と画面に出す（反映済みのハッシュが変わるまで計り直さない。§24.14 の U6-2）。
+- 整合ループは、反映済みのテナントの設定を今のコードの書き方（記録のひな形の版の書き方。§24.15）で描いて反映済みと比べ、違えば「設定の書き方が古い」と管理API と画面に出す（反映済みのハッシュ・望む状態の版・記録の版が変わるまで計り直さない。ひな形をまだ記録していないテナントは計らない。§24.14 の U6-2）。
 - 停止・起動（画面の操作。`tenants` の `enabled`）は運用の状態で、望む状態の版を上げない。操作したらすぐにコンテナに効かせる。停止したテナントは、整合ループも起動しない。
 - Docker が再起動の方針で起動し直している途中のコンテナには触れない。
 - SQLite にないテナントのコンテナ（ラベルのあるもの）とディレクトリは片付ける。
@@ -843,13 +846,13 @@ client shared {
 
 ### 24.5 radsecproxy のビルド
 
-- テナントの radsecproxy のイメージ（`images/radsecproxy`）は、Debian のパッケージをやめ、radsecproxy 1.11.4 のソースの tar（SHA-256 を固定）に次のパッチを当ててビルドする（aka-mvpset の決定事項 32。パッチとラボは aka-mvpset の `verify/r10/`）。
+- テナントの radsecproxy のイメージ（`images/radsecproxy`）は、Debian のパッケージをやめ、radsecproxy のソースの tar（SHA-256 を固定。段階 6-5 から 1.11.5）に次のパッチを当ててビルドする（aka-mvpset の決定事項 32。パッチとラボは aka-mvpset の `verify/r10/`。段階 6-5 で client ブロックの `IdleTimeout` のパッチを足した。§24.15）。
   - tls ブロックごとのオプション `PartialChain`（on のとき、`CACertificateFile` の自己署名でない CA も信頼の起点にする。OpenSSL の `X509_V_FLAG_PARTIAL_CHAIN`）。
   - `PartialChain on` で `CRLCheck on` のときは、CRL の確認を相手の証明書（リーフ）だけにする。無改造の radsecproxy はチェーン全体を確かめる（`CRL_CHECK_ALL`）ので、起点にした CA そのものの CRL を求められ、正当な AP も拒否される。起点にした CA は設定で信頼しているものなので、その失効は束から外すことで扱う。
 - `PartialChain` を書かないテナントの振る舞いは無改造と同じなので、すべてのテナントでこの版を使う（単独モードも）。`PartialChain on` は、自己署名でない持ち込みの CA があるテナントにだけ書く。自己署名かは入力を信じず、エッジが証明書から判定する。
 - **CRL の期限が切れたとき**: 束の中の 1 つの CA の CRL が切れても、ほかの CA の AP は巻き込まれない（読み直す前は、切れた CA の新しい接続だけが拒否される。`SIGHUP` で切れるのは、切れた CA の AP の接続だけ。`verify/r11/`）。そこで **失効の反映を優先する**。持ち込みの CA の CRL が切れていても、別の CA の新しい CRL は置いて `SIGHUP` し、反映も止めない（警告を出す）。発行した CA の CRL が切れていれば、反映を断り、持ち込みの CA の新しい CRL も読み込ませない（DB には置き、発行した CA の CRL が新しくなった後の取得で入る）。こちらの AP の接続が切れ、ヘルスチェックも通らないため。
 - 新しい版が出たら追いかけ、パッチを当て直して aka-mvpset の `verify/r10` のラボを通す。パッチは upstream に提案する。
-- イメージのタグは、radsecproxy の版とパッチの版を表すものにする（例 `radsec-edge/radsecproxy:1.11.4-pc1`）。agent のイメージの名前（`internal/agent` の `Image`）も一緒に変える。
+- イメージのタグは、radsecproxy の版とパッチの版を表すものにする（`radsec-edge/radsecproxy:1.11.4-pc1`、段階 6-5 から `1.11.5-pc2`）。agent のイメージの名前（`internal/agent` の `Image`）も一緒に変える。
 
 ### 24.6 データと API の変更
 
@@ -995,5 +998,22 @@ aka-mvpset の段階 5（KAGOYA の VPS に 5 台。`verify/stage5/`）で見つ
 | U6-10 | `radsec-edge backup -out <ファイル>`（radsec-ca と同じ SQLite の `VACUUM INTO`。監査ログに残す）。毎日のバックアップは radsec-edge を止めずに、写しとデータのディレクトリ（動いている DB のファイルを除く。鍵のファイルは名前を変えて置く作りなのでそのまま写せる）を写す（aka-mvpset の `deploy/node/backup.sh`。運用ガイド 7 章） |
 | U6-11〜U6-13 | 順は radsec-edge → aka-provisioner（CI の固定）→ aka-ossbss → aka-mvpset。入れないもの: 設定の書き方を前の版に戻す口、エッジをまたぐ一括の反映し直し、時間をおいて自動で少しずつ進める反映、ひな形の版を 3 つ以上持つこと |
 
+- U6-2 は段階 6-5 で改めた: 設定は、テナントのコンテナが動かすひな形の版の書き方で描く（前の形に戻すと前の版の書き方になる。§24.15）。
+
 - 試験は、`TestDockerTemplates`（agent。イメージを替えて作り直し、タグを外しても残すタグで戻せる、radsecproxy のリポジトリでないイメージを断る）、`TestDockerTemplate`（エッジ。本物の Docker で前の形・今の形、整合ループが作り直さない）、`TestTemplate*`・`TestConfigCurrent`（偽の agent。作り直さない、今の形へ・前の形へ、失敗で戻す、前の作りのコンテナの記録、なくなったコンテナ）、`TestLegacySpecHash`（段階 6 より前のハッシュと同じ値）、`TestApplyFlow`（管理API）、`TestBackupAndTemplate`（DB）。
 
+### 24.15 段階 6-5 で決めたこと（2026-11-18。aka-mvpset の確認事項 C6-2 は推奨どおりで合意）
+
+aka-mvpset の段階 6-4 の受入試験の予行（UniFi の AP と実機の端末を一晩つないだ）で、エッジの radsecproxy が要求のない AP の TLS 接続を 15 分で閉じ（`tlsserverrd: timeout from …, client … (no requests), closing connection`）、AP の張り直しが遅い回（16〜59 分）は端末の Session-Timeout の認証し直しがその分遅れることが分かった（A6-13）。radsecproxy 1.11.4・1.11.5 は受け側の TLS の接続を `IDLE_TIMEOUT * 3`（900 秒）で閉じ、設定では変えられない。段階 6-3 の 5 台の再起動では、エッジを再起動するとテナントが使えない時間が約 25 秒ではなく約 85 秒になることも分かった（R6-4）。
+
+| # | 決めたこと |
+|---|---|
+| C6-2 ① | radsecproxy を 1.11.5（2026-11-13。GHSA-mf4w-p52g-j253 は `ModifyAttribute`・`ModifyVendorAttribute`・`SupplementVendorAttribute` の rewrite の空の VSA で落ちるもの、GHSA-4pv5-j49w-wfpp は動的な探索と TLS-PSK のもので、エッジの設定（`removeVendorAttribute`・`addVendorAttribute`・`supplementAttribute`・`removeAttribute`・`addAttribute`）はどちらにも当たらない）に上げ、パッチ `client-idletimeout.patch` で client ブロックのオプション `IdleTimeout`（秒。0 は閉じない）を足す。開発版（未リリース）の同じ名前のオプションを取り込んだもので、書かなければ今の 900 秒のまま。開発版は値を long で読んで int の欄に書くので、パッチは long で読んで 0〜2147483（poll のミリ秒が int に収まる範囲）を確かめてから入れる。PartialChain のパッチ（`partialchain-leafcrl.patch`）は 1.11.5 にそのまま当たる（`tlscommon.c`・`tlscommon.h` は 1.11.4 と同じ）。イメージのタグは `1.11.5-pc2`。tar の SHA-256 は GitHub のリリースの値と、署名は 1.11.4 と同じ鍵（`210FA7FB28E45779777BAA1C5963D59C3D68633B`）で確かめた |
+| C6-2 ② | ひな形の版 2（`LatestTemplate = 2`、作れる版は 1・2）。版 2 のコンテナの作りは版 1 と同じで、テナントの radsecproxy.conf の全部の client ブロックに `IdleTimeout 0` を書く。要求のない接続を閉じず、死活は `TCPKeepalive`（10 秒流れがなければ確かめ、30 秒応えがなければ切る）で見る。設定は、コンテナが動かすひな形の版の書き方で描く（rsconf の `Input.Template`）。普段の反映は記録の版、「今の形へ」は版 2、「前の形へ」は前の版の書き方になる。版 1 の書き方は段階 6-0 と同じ（1.11.4-pc1 は `IdleTimeout` を知らないオプションとして断るので、前の形に戻すと古いイメージで動く）。このコードで作れない版を記録したテナント（新しいコードの DB を戻したなど）は、設定を描く前に `409 TEMPLATE_UNAVAILABLE` で断る |
+| C6-2 ③ | 起動のときの整合を、agent に届くまで 5 秒ごとに、最大 2 分やり直す（R6-4）。ホストを再起動すると radsec-edge が agent より先に起き、最初の整合が agent に届かずに失敗し、次の周回（1 分後）まで待っていた。CRL の更新で SIGHUP を受けたテナントのコンテナは Docker では起き上がらない（aka-mvpset の T5-15）ので、その間テナントが使えなかった。やり直すのは agent（とその先の Docker）に届かなかったときだけで、ほかの誤り（ヘルスチェックの失敗など）は今どおり次の周回。2 分を過ぎたら今どおりの間隔に戻る |
+| C6-2 ④ | 試験: `TestRenderGolden`・`TestRenderMixedGolden`（版 1 は段階 6-0 の golden のまま一字一句同じ、版 2 は `IdleTimeout 0` の行だけが違う）、`TestRadsecproxyAccepts`（どの版の書き方も今のイメージが受ける）、`TestTemplateIdleTimeoutByVersion`（版 1 のテナントは新しいコードでも版 1 の書き方のまま反映し、今の形で `IdleTimeout 0` を書き、前の形で戻る。前のイメージを消して今の形で作り直したときは「設定の書き方が古い」と出て、次の反映で直る）、`TestTemplateUnknownVersion`、`TestTemplatesMatch`（agent が作れる版と rsconf が描ける版が同じ）、`TestDockerIdleTimeout`（本物の radsecproxy で、`IdleTimeout 0` は要求のない接続を閉じず、2 にすると約 2 秒で閉じてログに `(no requests), closing connection` が出る）、`TestRunRetriesUntilAgent`・`TestRunRetriesAtMostTwoMinutes`（偽の時計で、agent が 12 秒遅れて現れる起動。直す前のコードでは 20 秒たってもコンテナが止まったままで落ちる） |
+| C6-2 ⑤ | 運用ガイドの HUP の注記（10.3）にエッジのテナントのコンテナのこと、IdleTimeout の理由（10.6）、更新で版 2 になり全テナントが古くなること（10.9） |
+
+- この版に上げると、agent のイメージ（今のタグ）と最新のひな形の版が変わるので、全テナントが「古い」になる。整合ループは作り直さない（§24.14 の U6-3）。運用担当が選んだテナントを「今の形へ」反映し直すと、版 2 の設定と新しいイメージで作り直す（AP の接続がいったん切れる）。前の形（版 1 と 1.11.4-pc1）に戻せる。
+- 版 1 で動くテナントの設定の書き方は変わらないので、上げただけでは「設定の書き方が古い」にはならない。
+- 前の形（版 1）のイメージを消してからコンテナがなくなると、整合ループは今の形（版 2）で作る（§24.14 の U6-3）。設定は版 1 の書き方のまま動き（1.11.5-pc2 は版 1 の書き方も読める）、「設定の書き方が古い」と出て、次の反映で版 2 の書き方になる。

@@ -46,7 +46,7 @@ Cloudflare Tunnel のトークンは `secrets/tunnel-token` に置き、`sudo ch
 
 ### 2.3 イメージと起動
 
-イメージは公開していないので、タグからソースでビルドする。radsecproxy のイメージ（`radsec-edge/radsecproxy:1.11.4-pc1`。radsecproxy 1.11.4 のソースを GitHub から取り、SHA-256 を確かめてパッチを当ててビルドする）も作る。VPS の上ではビルドせず、手元か CI で作って `docker save` で送る。
+イメージは公開していないので、タグからソースでビルドする。radsecproxy のイメージ（`radsec-edge/radsecproxy:1.11.5-pc2`。radsecproxy 1.11.5 のソースを GitHub から取り、SHA-256 を確かめて 2 つのパッチを当ててビルドする）も作る。VPS の上ではビルドせず、手元か CI で作って `docker save` で送る。
 
 ```bash
 docker compose --profile build build
@@ -226,7 +226,7 @@ docker compose exec -T radsec-edge /radsec-edge server-cert > edge-admin.pem
 
 ### 10.3 ピンの入れ替え（aka-provisioner のクライアント証明書を替えるとき）
 
-新旧の 2 行を**その場で**書き、`SIGHUP` で読み直す（`sed -i` などでファイルを置き換えると、動いているコンテナは古い中身を読み続ける）。`docker compose kill -s SIGHUP` を送ったコンテナには Docker が「手で止めた」の印を付けるので、ホストを再起動すると `unless-stopped` でも起き上がらない（aka-mvpset の段階 5 の T5-15）。送った後に `docker compose up -d radsec-edge` を一度流して印を消す（動いているコンテナは作り直されない。aka-mvpset の配置では、起動のときに `aka-compose-up.service` が起こし直す）。aka-provisioner が新しい証明書を使い始めたら古い行を消して、もう一度 `SIGHUP` を送る。読めないときは前のピンのまま続け、ログに `EDGE_ADMIN_CLIENTS_RELOAD_ERR` を出す。
+新旧の 2 行を**その場で**書き、`SIGHUP` で読み直す（`sed -i` などでファイルを置き換えると、動いているコンテナは古い中身を読み続ける）。`docker compose kill -s SIGHUP` を送ったコンテナには Docker が「手で止めた」の印を付けるので、ホストを再起動すると `unless-stopped` でも起き上がらない（aka-mvpset の段階 5 の T5-15）。送った後に `docker compose up -d radsec-edge` を一度流して印を消す（動いているコンテナは作り直されない。aka-mvpset の配置では、起動のときに `aka-compose-up.service` が起こし直す）。テナントの radsecproxy のコンテナも、CRL の更新のたびに agent が SIGHUP を送るので同じ印が付き、ホストを再起動しても Docker では起き上がらない（compose の外のコンテナなので `docker compose up` も効かない）。これは `radsec-edge` の整合ループが起こす。起動の直後に agent に届かなければ 5 秒ごとに最大 2 分やり直すので、次の周回（1 分）を待たずに起こす（設計概要 §24.15 の R6-4。ログに `reconcile: the agent is not reachable yet; retrying` と `reconcile reached the agent`）。aka-provisioner が新しい証明書を使い始めたら古い行を消して、もう一度 `SIGHUP` を送る。読めないときは前のピンのまま続け、ログに `EDGE_ADMIN_CLIENTS_RELOAD_ERR` を出す。
 
 ```bash
 docker compose kill -s SIGHUP radsec-edge
@@ -292,6 +292,8 @@ docker compose kill -s SIGHUP radsec-edge
 
 AP からの接続には TCP の生存確認（radsecproxy の `TCPKeepalive on`）をしている。10 秒流れがなければ確かめ、30 秒応えがなければ切れたとみなす。NAT の内側の AP の接続は、しばらく流れがないとルーターが NAT の対応を黙って消すため（設計概要 §24.13）。
 
+ひな形の版 2 のテナント（段階 6-5 から）は、要求のない AP の接続を閉じない（client ブロックの `IdleTimeout 0`。パッチ版の radsecproxy 1.11.5-pc2 のオプション）。無改造の radsecproxy は 15 分要求のない接続を閉じ（ログ `tlsserverrd: timeout from …, client … (no requests), closing connection`）、張り直しの遅い AP（UniFi で 16〜59 分）では、その間の端末の認証し直し（Session-Timeout）が遅れた（aka-mvpset の受入試験の予行。設計概要 §24.15）。死活は上の TCP の生存確認で見る。版 1 のテナントは今までどおり 15 分で閉じる（上の行がログに出る）。
+
 テナントのコンテナは環境変数 `MALLOC_ARENA_MAX=2` で動かす。radsecproxy は AP の接続ごとにスレッドを作り、glibc の malloc がスレッドごとに領域を足して返さないので、既定のままだと AP の多いテナントほどメモリーが増えるため（設計概要 §10.2・§24.13 の T5-21）。
 
 設定の書き方（上の `TCPKeepalive` のようなテナントの設定のファイルの中身）とコンテナのひな形（上の環境変数や radsecproxy のイメージ）の変わる版に上げたときの扱いは 10.9。
@@ -315,11 +317,12 @@ AP からの接続には TCP の生存確認（radsecproxy の `TCPKeepalive on`
 コンテナのひな形（radsecproxy のイメージ、環境変数など）と設定の書き方が変わる版に上げても、エッジは動いているテナントのコンテナを作り直さない（設計概要 §24.14）。どのテナントが古いかを管理API と画面に出すので、運用担当が選んだテナントだけを反映し直す。
 
 - **ひな形**: テナントごとに、動かすひな形（ひな形の版と radsecproxy のイメージの ID）を記録する。radsecproxy のイメージを読み込み直すと（リリースのたびに作り直すので ID が変わる。aka-mvpset の `deploy/bin/build-images`）、全テナントが「古い」になる。`GET /tenants` の `template.current` が `false`、`GET /status` の `templates.staleTenants` に数が出る。
-- **設定の書き方**: 反映のたびに今のコードの書き方で描く。版に上げた後に反映していないテナントは `configCurrent` が `false`（`templates.configStaleTenants`）になり、次の反映（顧客が AP を足したときも含む）で今の書き方になる。前の書き方に戻す口はない。
+- **設定の書き方**: 反映のたびに、テナントのコンテナが動かすひな形の版の、今のコードの書き方で描く（段階 6-5 から。新しい版の書き方は古い radsecproxy が読めないことがあるため。前の形に戻すと前の版の書き方になる）。版に上げた後に反映していないテナントは `configCurrent` が `false`（`templates.configStaleTenants`）になり、次の反映（顧客が AP を足したときも含む）で今の書き方になる。同じ版の中で前の書き方に戻す口はない。
 - **反映し直す**: 中央（aka-ossbss のエッジの画面）でテナントを選んで「今の形で反映し直す」と、エッジごとに 1 件ずつ `POST /tenants/{id}/apply` に `{"template":"latest"}` を送り、1 件でも失敗したら残りに送らない（aka-ossbss の運用ガイド 14 章）。エッジは、新しいイメージで構文検査し、コンテナを作り直してヘルスチェックし、通らなければ元の形で作り直して「失敗（前の版に戻した）」にする。作り直すたびに、そのテナントの AP の接続がいったん切れる（AP はもう一方のスロットのエッジにつなぎ直す）。設定の書き方も同じ反映で今になる。
 - **順**: まず試しのテナント（外形監視のテナントなど）を 1 つ反映し直して確かめ、次に少しずつ。エッジは 1 台ずつ上げ、そのエッジの古いテナントを反映し終えてから次のエッジを上げる。
 - **前の形に戻す**: 反映し直した後に問題が分かったら、テナントを選んで「前の形に戻す」（`{"template":"previous"}`）。前のイメージは、使っているコンテナがなくなってもタグ `radsec-edge/radsecproxy:keep-<ID の 12 桁>` が付いて残る（agent が付ける）。`docker image prune -a` などで消すと戻せなくなる（`canRollback` が `false`）。
 - **ひな形の版**: コードは今と 1 つ前のひな形の版を作れる。2 つより前の版のテナントが残っているうちは、次に版の上がる radsec-edge に上げない（上げる前に `templates.staleTenants` が 0 であることを確かめる）。上げてしまったときは、作れない版のテナントのコンテナは動いているかぎり触らず、作り直しが要るときは今の形で作る。
+- **段階 6-5 の版（radsecproxy 1.11.5-pc2、ひな形の版 2）に上げるとき**: radsecproxy のイメージとひな形の版が変わるので全テナントが「古い」になる。版 1 で動くテナントは、普段の反映でも版 1 の書き方（`IdleTimeout` を書かない）と 1.11.4-pc1 のままで、`configCurrent` は `true` のまま。「今の形で反映し直す」と、版 2 の書き方（client ブロックに `IdleTimeout 0`）と 1.11.5-pc2 で作り直す。「前の形に戻す」と、版 1 の書き方と 1.11.4-pc1 に戻る（1.11.4-pc1 は `IdleTimeout` を知らないので、版 2 の書き方のまま古いイメージでは動かせない）。
 - 記録と違う形で動いているテナント（`template.mismatch`。反映が途中で止まった、DB を古いバックアップに戻したなど）も、整合ループは作り直さない。今の形か前の形を選んで反映し直す。
 - 残すタグのイメージは、要らなくなったら（そのイメージを使う記録も前の形もない）`docker rmi radsec-edge/radsecproxy:keep-<ID>` で消す。
 
