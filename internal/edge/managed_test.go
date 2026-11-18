@@ -95,7 +95,7 @@ func (e *env) interrupt(t *testing.T, id string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := e.svc.render(ctx, tn)
+	b, err := e.svc.render(ctx, tn, keepTemplate(tn))
 	if err != nil {
 		t.Fatal(err)
 	}

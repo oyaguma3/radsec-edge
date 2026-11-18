@@ -35,6 +35,10 @@ client {{.Name}} {
     certificateNameCheck off
 {{- /* NAT の内側の AP の接続を保ち、切れた接続に気づく（10 秒流れがなければ確かめ、30 秒応えがなければ切る。aka-mvpset の T5-18） */}}
     TCPKeepalive on
+{{- if $.IdleTimeoutZero}}
+{{- /* 要求のない AP の接続を閉じない（無改造は 15 分で閉じ、つなぎ直しの遅い AP の認証し直しが遅れる。死活は TCPKeepalive で見る。aka-mvpset の A6-13） */}}
+    IdleTimeout 0
+{{- end}}
 {{- if .Match}}
     matchCertificateAttribute {{.Match}}
 {{- end}}

@@ -12,7 +12,7 @@ import (
 )
 
 // testImage は結合の試験に使う radsecproxy のイメージ（images/radsecproxy から作る）。
-const testImage = "radsec-edge/radsecproxy:1.11.4-pc1"
+const testImage = "radsec-edge/radsecproxy:1.11.5-pc2"
 
 // radsecproxyCheck は、本物の radsecproxy の `-p`（構文検査）でバンドルを確かめる。
 // EDGE_TEST_DOCKER=1 のときだけ動かす（Docker とイメージが要る。CI では必ず動かす）。
@@ -34,14 +34,18 @@ func radsecproxyCheck(t *testing.T, b Bundle) (string, error) {
 	return string(out), err
 }
 
+// どのひな形の版の書き方も、今のイメージが受け付けること（版 1 の書き方は、記録のイメージがなくて今の形で作ったときに今のイメージで動く。§24.15）。
 func TestRadsecproxyAccepts(t *testing.T) {
 	f := newFixture(t)
-	b, err := Render(f.in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out, err := radsecproxyCheck(t, b); err != nil {
-		t.Fatalf("radsecproxy -p: %v\n%s", err, out)
+	for _, v := range Templates {
+		f.in.Template = v
+		b, err := Render(f.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := radsecproxyCheck(t, b); err != nil {
+			t.Fatalf("radsecproxy -p (template %d): %v\n%s", v, err, out)
+		}
 	}
 }
 

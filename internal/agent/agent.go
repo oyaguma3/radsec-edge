@@ -21,7 +21,7 @@ import (
 
 // Image は radsecproxy のイメージ（images/radsecproxy で作る。設計概要 §4）。新しく作るテナントのコンテナと、
 // 新しい形へ反映し直すコンテナは、このタグが今指しているイメージ（の ID）で作る（§24.14 の U6-1）。
-const Image = ImageRepo + ":1.11.4-pc1"
+const Image = ImageRepo + ":1.11.5-pc2"
 
 // ImageRepo は radsecproxy のイメージのリポジトリの名前。agent がコンテナに使うのは、このリポジトリのタグの付いたイメージだけ。
 // テナントのコンテナが使っているイメージにタグがなくなったら（同じタグで新しいイメージを読み込んだとき）、
@@ -32,11 +32,16 @@ const ImageRepo = "radsec-edge/radsecproxy"
 const KeepTagPrefix = "keep-"
 
 // LatestTemplate はコードの最新のひな形の版。Templates はこのコードが作れるひな形の版（今と 1 つ前まで。§24.14 の U6-5）。
-// ひな形（起動のしかた・環境変数・マウントなど）を変えるときは、版を 1 つ上げ、前の版の作り方を 1 つだけ残す。
-const LatestTemplate = 1
+// ひな形（起動のしかた・環境変数・マウントなど）や、radsecproxy の版でしか読めない設定の書き方を変えるときは、版を 1 つ上げ、
+// 前の版の作り方を 1 つだけ残す。
+//   - 版 1: 段階 6-0 の形（radsecproxy 1.11.4-pc1 で動く）。
+//   - 版 2: コンテナの作りは版 1 と同じで、テナントの radsecproxy.conf の client ブロックに IdleTimeout 0 を書く（rsconf の Input.Template）。
+//     IdleTimeout は client-idletimeout.patch のあるイメージ（1.11.5-pc2 から）でしか読めないので、版を分けて前の形（版 1 と古いイメージ）に
+//     戻せるようにする（§24.15）。
+const LatestTemplate = 2
 
 // Templates はこのコードが作れるひな形の版。
-var Templates = []int{1}
+var Templates = []int{1, 2}
 
 // KnownTemplate は v がこのコードで作れるひな形の版か。
 func KnownTemplate(v int) bool { return slices.Contains(Templates, v) }
@@ -294,10 +299,11 @@ func fluentdLog(address, tenantID string) logConfig {
 // publishAddr はテナントのポートを公開するホストのアドレス（空ならすべてのアドレス。§10.2）。fluentd は Fluent Bit のアドレス（空なら json-file のまま）。
 func tenantSpec(tenantsDir, network, publishAddr, fluentd, tenantID, slug string, port int, ref Ref) (spec, error) {
 	switch ref.Template {
-	case 1:
+	case 1, 2:
+		// 版 2 のコンテナの作りは版 1 と同じ（違いはテナントの設定の書き方だけ）。版のラベルはハッシュに入るので、版を替えると作り直す。
 		s := tenantSpecV1(tenantsDir, network, publishAddr, fluentd, tenantID, slug, port)
 		s.Image = ref.Image
-		s.Labels[LabelTemplate] = "1"
+		s.Labels[LabelTemplate] = strconv.Itoa(ref.Template)
 		s.Labels[LabelSpec] = specHash(s)
 		return s, nil
 	}

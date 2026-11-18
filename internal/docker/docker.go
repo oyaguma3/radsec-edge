@@ -268,7 +268,7 @@ func demux(r io.Reader) (string, error) {
 	}
 }
 
-// ImageExists はイメージがあるか。ref（例 radsec-edge/radsecproxy:1.11.4-pc1）は / を含むのでエスケープしない
+// ImageExists はイメージがあるか。ref（例 radsec-edge/radsecproxy:1.11.5-pc2）は / を含むのでエスケープしない
 // （呼び出し側が決まった値だけを渡す）。
 func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 	err := c.do(ctx, http.MethodGet, "/images/"+ref+"/json", nil, nil, nil)

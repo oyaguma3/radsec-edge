@@ -127,7 +127,7 @@ services:
   # docker compose --profile build build radsecproxy-image で作る（動かすサービスではない）。
   radsecproxy-image:
     build: images/radsecproxy
-    image: radsec-edge/radsecproxy:1.11.4-pc1
+    image: radsec-edge/radsecproxy:1.11.5-pc2
     profiles: ["build"]
 
 volumes:

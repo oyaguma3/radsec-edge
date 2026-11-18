@@ -3,6 +3,7 @@ package rsconf
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"maps"
 	"net/netip"
 	"os"
@@ -35,6 +36,7 @@ func newFixture(t *testing.T) *fixture {
 	csr, _ := pki.NewCSR(key, "x")
 	_, cert := serverCA.SignCSR(t, pkitest.Leaf{CN: "tenant-a server edge1", DNS: names.SlotNames("tenant-a", "radsec.test"), Server: true}, csr)
 	return &fixture{ca: ca, serverCA: serverCA, in: Input{
+		Template:      2,
 		Slug:          "tenant-a",
 		TenantID:      "42",
 		URNPrefix:     "example",
@@ -51,15 +53,19 @@ func newFixture(t *testing.T) *fixture {
 	}}
 }
 
-func TestRenderGolden(t *testing.T) {
-	f := newFixture(t)
-	b, err := Render(f.in)
-	if err != nil {
-		t.Fatal(err)
+// goldenName はひな形の版ごとの期待するファイルの名前（版 1 は段階 6-0 からのファイルのまま。§24.15）。
+func goldenName(base string, template int) string {
+	if template == 1 {
+		return filepath.Join("testdata", base+".conf")
 	}
-	golden := filepath.Join("testdata", "tenant-a.conf")
+	return filepath.Join("testdata", fmt.Sprintf("%s-v%d.conf", base, template))
+}
+
+// checkGolden は生成した設定を期待するファイルと比べる。
+func checkGolden(t *testing.T, golden string, conf []byte) {
+	t.Helper()
 	if *update {
-		if err := os.WriteFile(golden, b[FileConf], 0o644); err != nil {
+		if err := os.WriteFile(golden, conf, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -67,8 +73,44 @@ func TestRenderGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(b[FileConf], want) {
-		t.Errorf("radsecproxy.conf differs from %s (go test -update で書き直す):\n%s", golden, b[FileConf])
+	if !bytes.Equal(conf, want) {
+		t.Errorf("radsecproxy.conf differs from %s (go test -update で書き直す):\n%s", golden, conf)
+	}
+}
+
+// ひな形の版ごとの書き方。版 1 は段階 6-0 の書き方のまま（IdleTimeout を書かない。1.11.4-pc1 は知らないオプションとして断る）、
+// 版 2 は全部の client ブロックに IdleTimeout 0 を書く（§24.15）。違いは IdleTimeout の行だけ。
+func TestRenderGolden(t *testing.T) {
+	f := newFixture(t)
+	confs := map[int]string{}
+	for _, v := range Templates {
+		f.in.Template = v
+		b, err := Render(f.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkGolden(t, goldenName("tenant-a", v), b[FileConf])
+		confs[v] = string(b[FileConf])
+	}
+	if strings.Contains(confs[1], "IdleTimeout") {
+		t.Errorf("template 1 writes IdleTimeout:\n%s", confs[1])
+	}
+	if n := strings.Count(confs[2], "\n    IdleTimeout 0\n"); n != strings.Count(confs[2], "\nclient ") || n == 0 {
+		t.Errorf("template 2 writes IdleTimeout 0 in %d blocks:\n%s", n, confs[2])
+	}
+	if strings.ReplaceAll(confs[2], "    IdleTimeout 0\n", "") != confs[1] {
+		t.Error("templates 1 and 2 differ in more than IdleTimeout")
+	}
+	for _, v := range []int{0, 3} {
+		f.in.Template = v
+		if _, err := Render(f.in); err == nil || !strings.Contains(err.Error(), "ひな形の版") {
+			t.Errorf("Render(template %d) = %v", v, err)
+		}
+	}
+	f.in.Template = 2
+	b, err := Render(f.in)
+	if err != nil {
+		t.Fatal(err)
 	}
 	// CA のファイルには CA の証明書と CRL が入る。
 	entries, err := b.Trust()
@@ -175,22 +217,14 @@ func TestRenderMixedGolden(t *testing.T) {
 	groupAndBrought(t, f)
 	f.in.SourceCIDRs = []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("2001:db8::/32")}
 	f.in.ProbeCIDRs = []netip.Prefix{netip.MustParsePrefix("172.31.83.0/24")}
-	b, err := Render(f.in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	golden := filepath.Join("testdata", "tenant-a-mixed.conf")
-	if *update {
-		if err := os.WriteFile(golden, b[FileConf], 0o644); err != nil {
+	var b Bundle
+	for _, v := range Templates {
+		f.in.Template = v
+		var err error
+		if b, err = Render(f.in); err != nil {
 			t.Fatal(err)
 		}
-	}
-	want, err := os.ReadFile(golden)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(b[FileConf], want) {
-		t.Errorf("radsecproxy.conf differs from %s (go test -update で書き直す):\n%s", golden, b[FileConf])
+		checkGolden(t, goldenName("tenant-a-mixed", v), b[FileConf])
 	}
 	conf := string(b[FileConf])
 	// 共通のブロックは必ず最後のブロック。順は AP、グループ、probe、共通。

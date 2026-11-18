@@ -14,7 +14,7 @@ export COMPOSE_FILE=compose.yaml:compose.managed.yaml:compose.fluent-bit.yaml
 WORK=$(mktemp -d)
 HOSTDIR=$PWD/.guide-host
 FLUENT_PORT=24325
-RS_IMAGE=radsec-edge/radsecproxy:1.11.4-pc1
+RS_IMAGE=radsec-edge/radsecproxy:1.11.5-pc2
 BIND=127.0.0.1
 
 fail() {

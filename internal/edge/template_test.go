@@ -3,11 +3,16 @@ package edge
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/oyaguma3/radsec-edge/internal/agent"
 	"github.com/oyaguma3/radsec-edge/internal/db"
 	"github.com/oyaguma3/radsec-edge/internal/edge/edgetest"
+	"github.com/oyaguma3/radsec-edge/internal/names"
+	"github.com/oyaguma3/radsec-edge/internal/pki"
+	"github.com/oyaguma3/radsec-edge/internal/pki/pkitest"
+	"github.com/oyaguma3/radsec-edge/internal/rsconf"
 )
 
 // tenant は DB のテナントを読み直す。
@@ -40,8 +45,8 @@ func TestTemplateLatestAndPrevious(t *testing.T) {
 	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
 		t.Fatal(err)
 	}
-	a := agent.Ref{Template: 1, Image: edgetest.ImageA}
-	b := agent.Ref{Template: 1, Image: edgetest.ImageB}
+	a := agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageA}
+	b := agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageB}
 	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != a || !PrevRefOf(tn).IsZero() {
 		t.Fatalf("recorded after the first apply = %+v / %+v", RefOf(tn), PrevRefOf(tn))
 	}
@@ -116,7 +121,7 @@ func TestTemplateLatestRollsBack(t *testing.T) {
 	if err == nil || rec.Result != db.ResultRolledBack {
 		t.Fatalf("ApplyTemplate(latest) with a failing probe = %+v, %v", rec, err)
 	}
-	a := agent.Ref{Template: 1, Image: edgetest.ImageA}
+	a := agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageA}
 	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != a || !PrevRefOf(tn).IsZero() {
 		t.Errorf("recorded after the rollback = %+v / %+v", RefOf(tn), PrevRefOf(tn))
 	}
@@ -180,7 +185,7 @@ func TestTemplateRecordsRunningContainer(t *testing.T) {
 	if calls := e.agent.TakeCalls(); recreated(calls, "tenant-a") {
 		t.Errorf("recreated a running container: %v", calls)
 	}
-	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != (agent.Ref{Template: 1, Image: edgetest.ImageA}) {
+	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != (agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageA}) {
 		t.Errorf("recorded = %+v", RefOf(tn))
 	}
 }
@@ -193,8 +198,8 @@ func TestTemplateMissingContainer(t *testing.T) {
 	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
 		t.Fatal(err)
 	}
-	a := agent.Ref{Template: 1, Image: edgetest.ImageA}
-	b := agent.Ref{Template: 1, Image: edgetest.ImageB}
+	a := agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageA}
+	b := agent.Ref{Template: agent.LatestTemplate, Image: edgetest.ImageB}
 	e.agent.ImageID, e.agent.Images = edgetest.ImageB, []string{edgetest.ImageA}
 	if err := e.agent.Remove(ctx, "tenant-a"); err != nil {
 		t.Fatal(err)
@@ -247,4 +252,155 @@ func TestConfigCurrent(t *testing.T) {
 	if cur, known := e.svc.ConfigCurrent(e.tenant(t, "tenant-a")); cur || !known {
 		t.Errorf("ConfigCurrent after the template changed = %v, %v", cur, known)
 	}
+}
+
+// conf はテナントの今の版の radsecproxy.conf。
+func (e *env) conf(t *testing.T, slug string) string {
+	t.Helper()
+	_, b, err := e.svc.Store.Current(slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b[rsconf.FileConf])
+}
+
+// 版 1 で動くテナント（段階 6-0 の形）は、新しいコードでも版 1 の書き方のまま反映し（IdleTimeout を書かない。古い radsecproxy は
+// 知らないオプションとして断る）、今の形（版 2）に反映し直すと IdleTimeout 0 を書き、前の形に戻すと版 1 の書き方に戻る（§24.15）。
+func TestTemplateIdleTimeoutByVersion(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	v1 := agent.Ref{Template: 1, Image: edgetest.ImageA}
+	if err := e.db.SetTemplate(ctx, "tenant-a", v1.Template, v1.Image, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if c := e.conf(t, "tenant-a"); strings.Contains(c, "IdleTimeout") || !strings.Contains(c, "TCPKeepalive on") {
+		t.Errorf("template 1 config:\n%s", c)
+	}
+	// 新しいイメージを読み込んでも、普段の反映は版 1 の書き方のまま（作り直さない）。設定の書き方は今（版 1 として）。
+	e.agent.ImageID, e.agent.Images = edgetest.ImageB, []string{edgetest.ImageA}
+	if _, err := e.svc.PutAP(ctx, e.user, "tenant-a", "ap-001", e.apCert(t, "ap-001")); err != nil {
+		t.Fatal(err)
+	}
+	e.agent.TakeCalls()
+	if _, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := e.agent.TakeCalls(); recreated(calls, "tenant-a") {
+		t.Errorf("recreated without choosing: %v", calls)
+	}
+	if c := e.conf(t, "tenant-a"); strings.Contains(c, "IdleTimeout") || !strings.Contains(c, "client tenant-a-ap-001 ") {
+		t.Errorf("template 1 config after an AP was added:\n%s", c)
+	}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cur, known := e.svc.ConfigCurrent(e.tenant(t, "tenant-a")); !cur || !known {
+		t.Errorf("ConfigCurrent of template 1 = %v, %v", cur, known)
+	}
+	if ts := e.state(t, "tenant-a"); ts.Current || ts.Recorded != v1 {
+		t.Errorf("state of template 1 = %+v", ts)
+	}
+
+	// 今の形へ。版 2 の書き方（client ブロックごとに IdleTimeout 0）を新しいイメージで検査して作り直す。
+	v2 := agent.Ref{Template: 2, Image: edgetest.ImageB}
+	e.agent.Validated = nil
+	if rec, err := e.svc.ApplyTemplate(ctx, e.user, "tenant-a", TemplateLatest); err != nil || rec.Action != agent.EnsureRecreated {
+		t.Fatalf("ApplyTemplate(latest) = %+v, %v", rec, err)
+	}
+	c := e.conf(t, "tenant-a")
+	if n := strings.Count(c, "\n    IdleTimeout 0\n"); n != strings.Count(c, "\nclient ") || n != 2 {
+		t.Errorf("IdleTimeout 0 in %d blocks:\n%s", n, c)
+	}
+	if !slices.Equal(e.agent.Validated, []string{edgetest.ImageB}) {
+		t.Errorf("validated with %v", e.agent.Validated)
+	}
+	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != v2 || PrevRefOf(tn) != v1 {
+		t.Errorf("recorded after latest = %+v / %+v", RefOf(tn), PrevRefOf(tn))
+	}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cur, known := e.svc.ConfigCurrent(e.tenant(t, "tenant-a")); !cur || !known {
+		t.Errorf("ConfigCurrent of template 2 = %v, %v", cur, known)
+	}
+
+	// 前の形へ戻すと、版 1 の書き方を前のイメージで検査して作り直す。
+	e.agent.Validated = nil
+	if rec, err := e.svc.ApplyTemplate(ctx, e.user, "tenant-a", TemplatePrevious); err != nil || rec.Action != agent.EnsureRecreated {
+		t.Fatalf("ApplyTemplate(previous) = %+v, %v", rec, err)
+	}
+	if c := e.conf(t, "tenant-a"); strings.Contains(c, "IdleTimeout") {
+		t.Errorf("config after previous:\n%s", c)
+	}
+	if !slices.Equal(e.agent.Validated, []string{edgetest.ImageA}) {
+		t.Errorf("validated with %v", e.agent.Validated)
+	}
+	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != v1 || PrevRefOf(tn) != v2 {
+		t.Errorf("recorded after previous = %+v / %+v", RefOf(tn), PrevRefOf(tn))
+	}
+
+	// 前のイメージを消してからコンテナがなくなると、整合ループは今の形（版 2）で作る（§24.14 の U6-3）。設定は版 1 の書き方のまま
+	// （1.11.5-pc2 は版 1 の書き方も読める）なので「設定の書き方が古い」と出て、次の反映で版 2 の書き方になる。
+	e.agent.Images = nil
+	if err := e.agent.Remove(ctx, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if tn := e.tenant(t, "tenant-a"); RefOf(tn) != v2 {
+		t.Errorf("recorded after the fallback = %+v", RefOf(tn))
+	}
+	if cur, known := e.svc.ConfigCurrent(e.tenant(t, "tenant-a")); cur || !known {
+		t.Errorf("ConfigCurrent after the fallback = %v, %v", cur, known)
+	}
+	if rec, err := e.svc.Apply(ctx, e.user, "tenant-a"); err != nil || rec.Action != "restart" {
+		t.Fatalf("Apply after the fallback = %+v, %v", rec, err)
+	}
+	if c := e.conf(t, "tenant-a"); !strings.Contains(c, "\n    IdleTimeout 0\n") {
+		t.Errorf("config after the fallback and apply:\n%s", c)
+	}
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cur, known := e.svc.ConfigCurrent(e.tenant(t, "tenant-a")); !cur || !known {
+		t.Errorf("ConfigCurrent after the apply = %v, %v", cur, known)
+	}
+}
+
+// agent が作れるひな形の版と、rsconf が描ける設定の書き方の版は同じ（パッケージを分けているので、ここで確かめる）。
+func TestTemplatesMatch(t *testing.T) {
+	if !slices.Equal(agent.Templates, rsconf.Templates) || !slices.Contains(agent.Templates, agent.LatestTemplate) {
+		t.Errorf("agent.Templates = %v (latest %d), rsconf.Templates = %v", agent.Templates, agent.LatestTemplate, rsconf.Templates)
+	}
+}
+
+// このコードが作れない版を記録したテナント（新しいコードの DB を戻したなど）は、設定を描く前に断る。
+func TestTemplateUnknownVersion(t *testing.T) {
+	e := newEnv(t)
+	ctx := t.Context()
+	e.readyTenant(t, "tenant-a")
+	if err := e.db.SetTemplate(ctx, "tenant-a", 9, edgetest.ImageA, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := e.svc.Apply(ctx, e.user, "tenant-a")
+	if ie, ok := errors.AsType[*InputError](err); !ok || ie.Cause != CauseTemplateUnavailable || rec.Result != db.ResultFailed {
+		t.Errorf("Apply with template 9 = %+v, %v", rec, err)
+	}
+}
+
+// apCert は tenant-a の AP の証明書（PEM）を発行する。
+func (e *env) apCert(t *testing.T, name string) []byte {
+	t.Helper()
+	_, key := pkitest.NewKeyPair(t)
+	csr, err := pki.NewCSR(key, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, certPEM := e.ca.SignCSR(t, pkitest.Leaf{CN: "tenant-a-" + name, URI: names.SANURI("example", "tenant-a", name)}, csr)
+	return certPEM
 }

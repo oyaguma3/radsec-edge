@@ -49,8 +49,8 @@ func (s *Service) Missing(ctx context.Context, t db.Tenant) ([]string, error) {
 	return out, nil
 }
 
-// render はテナントの望む状態からバンドルを生成する。
-func (s *Service) render(ctx context.Context, t db.Tenant) (rsconf.Bundle, error) {
+// render はテナントの望む状態から、ひな形の版 template の書き方でバンドルを生成する（コンテナが動かす版の radsecproxy が読める形。§24.15）。
+func (s *Service) render(ctx context.Context, t db.Tenant, template int) (rsconf.Bundle, error) {
 	missing, err := s.Missing(ctx, t)
 	if err != nil {
 		return nil, err
@@ -75,7 +75,7 @@ func (s *Service) render(ctx context.Context, t db.Tenant) (rsconf.Bundle, error
 	if err != nil {
 		return nil, err
 	}
-	in := rsconf.Input{Slug: t.Slug, TenantID: t.ID, URNPrefix: s.URNPrefix, Stamp: s.Stamp, Auth: t.AuthUpstream, Acct: t.AcctUpstream, Secret: s.Secret,
+	in := rsconf.Input{Template: template, Slug: t.Slug, TenantID: t.ID, URNPrefix: s.URNPrefix, Stamp: s.Stamp, Auth: t.AuthUpstream, Acct: t.AcctUpstream, Secret: s.Secret,
 		ClientCAPEM: []byte(t.ClientCAPEM), CRLPEM: []byte(crl.PEM), ServerCertPEM: []byte(t.ServerCertPEM), ServerKeyPEM: key, Now: s.Now(),
 		SourceCIDRs: t.SourceCIDRs, SharedMatch: rsconf.Match{Attr: t.SharedMatchAttr, Pattern: t.SharedMatchPattern}}
 	for _, a := range aps {
@@ -149,7 +149,7 @@ func (s *Service) Plan(ctx context.Context, id string) (Plan, error) {
 	if len(p.Missing) > 0 {
 		return p, nil
 	}
-	b, err := s.render(ctx, t)
+	b, err := s.render(ctx, t, keepTemplate(t))
 	if err != nil {
 		if IsInput(err) {
 			p.Error = err.Error()
@@ -260,7 +260,11 @@ func (s *Service) ApplyTemplate(ctx context.Context, a Actor, id string, mode Te
 		return rec, err
 	}
 
-	b, err := s.render(ctx, t)
+	if !agent.KnownTemplate(target.Template) {
+		return fail(db.ResultFailed, invalidCause(CauseTemplateUnavailable, "ひな形の版 %d は、このコードでは作れません", target.Template))
+	}
+	// 設定は、コンテナが動かす形（target）の radsecproxy が読める書き方で描く（§24.15）。前の形に戻すときは前の版の書き方になる。
+	b, err := s.render(ctx, t, target.Template)
 	if err != nil {
 		return fail(db.ResultFailed, err)
 	}
@@ -572,7 +576,10 @@ func (s *Service) reconcile(ctx context.Context) error {
 			if err := s.syncTenant(ctx, cur, st, System); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", t.ID, err))
 			}
-			s.refreshConfigState(ctx, cur)
+			// syncTenant がひな形を記録したかもしれないので、読み直してから設定の書き方を計る。
+			if cur, err = s.DB.Tenant(ctx, t.ID); err == nil {
+				s.refreshConfigState(ctx, cur)
+			}
 		}
 		unlock()
 	}

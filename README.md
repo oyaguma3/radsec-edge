@@ -27,7 +27,7 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 |---|---|
 | `radsec-edge` | テナントと AP の望む状態（SQLite）、設定の生成と反映、整合ループ、CRL の取得、運用者向けの画面（8447。Cloudflare Access の JWT で利用者を確かめる）、管理API（9447、mTLS。管理モードだけ） |
 | `radsec-edge-agent` | Docker を操作する唯一の部品。`radsec-edge` から unix ソケットで決まった操作だけを受け、テナントの radsecproxy のコンテナを固定のひな形から作る |
-| radsecproxy（テナントごと） | `images/radsecproxy` のイメージ（radsecproxy 1.11.4 に PartialChain のパッチを当ててソースからビルドしたもの）。ポート 20000〜21999 の 1 つで AP の RadSec を受ける |
+| radsecproxy（テナントごと） | `images/radsecproxy` のイメージ（radsecproxy 1.11.5 に PartialChain と client ブロックの IdleTimeout のパッチを当ててソースからビルドしたもの）。ポート 20000〜21999 の 1 つで AP の RadSec を受ける |
 
 反映は「設定の生成 → `radsecproxy -p` の構文検査 → 版のディレクトリの付け替え → SIGHUP か再起動 → ヘルスチェック（ヘルスチェック用の証明書で Status-Server を送る）」の順に行い、失敗したら前の版に戻します。
 
@@ -61,7 +61,7 @@ AP ──RadSec（TLS）──> radsecproxy（テナントごと）──RADIUS�
 
 ## 開発
 
-- Go 1.27.4 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.4-pc1 images/radsecproxy`）。
+- Go 1.27.4 と Docker が要ります。`go test ./...` で単体の試験、`EDGE_TEST_DOCKER=1 go test ./...` で本物の Docker と radsecproxy を使う結合の試験も動きます（先に `docker build -t radsec-edge/radsecproxy:1.11.5-pc2 images/radsecproxy`）。
 - `scripts/check-guide.sh` は、管理モードの手順（導入、ピンの入れ替え、宣言から反映、Fluent Bit、監査ログ、バックアップ）を compose で流して確かめます（CI のジョブと同じ）。
 - `scripts/e2e.sh` は、本PoC・radsec-ca・エッジを 1 台に導入して、eapaka_test と AP の役（radsecproxy）で単独モードの通しを確かめます（Docker Desktop では動きません。運用ガイド 8 章）。GitHub Actions では「E2E」のワークフローを手で起動します。
 - 画面の CSS は `sh scripts/build-css.sh` で作ります（Tailwind CSS のスタンドアロン CLI と daisyUI を、版を固定して取得します）。

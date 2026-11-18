@@ -228,7 +228,7 @@ func TestDockerInterruptedApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	tn, _ = e.db.Tenant(ctx, "tenant-a")
-	b, err := e.svc.render(ctx, tn)
+	b, err := e.svc.render(ctx, tn, keepTemplate(tn))
 	if err != nil {
 		t.Fatal(err)
 	}

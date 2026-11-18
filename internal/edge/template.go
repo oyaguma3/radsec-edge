@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"cmp"
 	"context"
 	"errors"
 
@@ -105,10 +106,15 @@ func unusable(err error) bool {
 	return errors.Is(err, agent.ErrImageNotAllowed) || errors.Is(err, agent.ErrUnknownTemplate)
 }
 
-// configKey は設定の書き方が今かの写しの鍵（反映済みのハッシュと望む状態の版が変われば計り直す）。
+// keepTemplate は、普段の反映（記録のひな形を保つ）で設定を描くひな形の版。記録がなければ今の形（最新の版）で描く（§24.15）。
+// 記録がないのは、まだ反映していないテナントか、段階 6 より前のコンテナをまだ記録していない間（次の整合ループで記録する）だけ。
+func keepTemplate(t db.Tenant) int { return cmp.Or(t.Template, agent.LatestTemplate) }
+
+// configKey は設定の書き方が今かの写しの鍵（反映済みのハッシュ・望む状態の版・記録のひな形の版が変われば計り直す）。
 type configKey struct {
 	appliedHash string
 	desired     int64
+	template    int
 }
 
 type configEntry struct {
@@ -117,28 +123,30 @@ type configEntry struct {
 	known   bool
 }
 
-// ConfigCurrent は、未反映の変更がないのに今のコードの書き方で描くと反映済みと違うか（違えば false）を返す。
-// known が false なら分からない（未反映の変更がある、まだ反映していない、まだ計っていない）。計るのは整合ループ（refreshConfigState）。
+// ConfigCurrent は、未反映の変更がないのに今のコードの書き方（記録のひな形の版の書き方）で描くと反映済みと違うか（違えば false）を返す。
+// known が false なら分からない（未反映の変更がある、まだ反映していない、ひな形をまだ記録していない、まだ計っていない）。
+// 計るのは整合ループ（refreshConfigState）。
 func (s *Service) ConfigCurrent(t db.Tenant) (current, known bool) {
-	if t.Pending() || t.AppliedHash == "" {
+	if t.Pending() || t.AppliedHash == "" || t.Template == 0 {
 		return false, false
 	}
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 	e, ok := s.cfgState[t.ID]
-	if !ok || e.key != (configKey{t.AppliedHash, t.DesiredVersion}) {
+	if !ok || e.key != (configKey{t.AppliedHash, t.DesiredVersion, t.Template}) {
 		return false, false
 	}
 	return e.current, e.known
 }
 
 // refreshConfigState は、写しがないか古いテナントについて、今のコードの書き方で描いて反映済みと比べる（§24.14 の U6-2）。
-// 書き方はコードを上げたときにしか変わらないので、反映済みのハッシュか望む状態の版が変わったときだけ計り直す。
+// 描くのは記録のひな形の版の書き方（前の形で動くテナントは前の版の書き方。§24.15）。ひな形がまだ記録されていなければ計らない。
+// 書き方はコードを上げたときにしか変わらないので、反映済みのハッシュ・望む状態の版・記録の版が変わったときだけ計り直す。
 func (s *Service) refreshConfigState(ctx context.Context, t db.Tenant) {
-	if t.Pending() || t.AppliedHash == "" {
+	if t.Pending() || t.AppliedHash == "" || t.Template == 0 {
 		return
 	}
-	key := configKey{t.AppliedHash, t.DesiredVersion}
+	key := configKey{t.AppliedHash, t.DesiredVersion, t.Template}
 	s.cfgMu.Lock()
 	e, ok := s.cfgState[t.ID]
 	s.cfgMu.Unlock()
@@ -146,7 +154,7 @@ func (s *Service) refreshConfigState(ctx context.Context, t db.Tenant) {
 		return
 	}
 	e = configEntry{key: key}
-	if b, err := s.render(ctx, t); err == nil {
+	if b, err := s.render(ctx, t, t.Template); err == nil {
 		e.current, e.known = b.Hash() == t.AppliedHash, true
 	}
 	s.cfgMu.Lock()

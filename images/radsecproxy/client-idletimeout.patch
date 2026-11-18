@@ -1,0 +1,68 @@
+diff -u -r a/radsecproxy.c b/radsecproxy.c
+--- a/radsecproxy.c	2026-11-14 01:06:18.000000000 +0900
++++ b/radsecproxy.c	2026-11-18 20:22:39.280914383 +0900
+@@ -2831,7 +2831,7 @@
+ int confclient_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *val) {
+     struct clsrvconf *conf, *existing;
+     char *conftype = NULL, *rewriteinalias = NULL;
+-    long int dupinterval = LONG_MIN, addttl = LONG_MIN;
++    long int dupinterval = LONG_MIN, addttl = LONG_MIN, idletimeout = LONG_MIN;
+     uint8_t ipv4only = 0, ipv6only = 0;
+     struct list_node *entry;
+ 
+@@ -2857,6 +2857,7 @@
+             "ServerName", CONF_STR, &conf->servername,
+ #endif
+             "DuplicateInterval", CONF_LINT, &dupinterval,
++            "IdleTimeout", CONF_LINT, &idletimeout,
+             "addTTL", CONF_LINT, &addttl,
+             "tcpKeepalive", CONF_BLN, &conf->keepalive,
+             "rewrite", CONF_STR, &rewriteinalias,
+@@ -2911,6 +2912,14 @@
+         conf->addttl = (uint8_t)addttl;
+     }
+ 
++    /* read into a long first: the field is an int, and poll() takes the timeout in milliseconds as an int */
++    if (idletimeout != LONG_MIN) {
++        if (idletimeout < 0 || idletimeout > INT_MAX / 1000)
++            debugx(1, DBG_ERR, "error in block %s, value of option IdleTimeout is %ld, must be 0-%d", block, idletimeout, INT_MAX / 1000);
++        conf->idletimeout = (int)idletimeout;
++    } else
++        conf->idletimeout = CLIENT_IDLE_TIMEOUT_DEFAULT;
++
+     if (!conf->confrewritein)
+         conf->confrewritein = rewriteinalias;
+     else
+diff -u -r a/radsecproxy.h b/radsecproxy.h
+--- a/radsecproxy.h	2026-10-16 22:43:55.000000000 +0900
++++ b/radsecproxy.h	2026-11-18 20:22:39.258920981 +0900
+@@ -32,6 +32,8 @@
+ #define MAX_CERT_DEPTH 5
+ #define STATUS_SERVER_PERIOD 25
+ #define IDLE_TIMEOUT 300
++/* idle timeout of incoming TLS connections without requests, unless IdleTimeout is set in the client block */
++#define CLIENT_IDLE_TIMEOUT_DEFAULT (IDLE_TIMEOUT * 3)
+ #define PSK_MIN_LENGTH 16
+ #define RSP_SECRET_LEN_WARN 10
+ /* Older OpenSSL API had a 256 byte limit; keep this limit to maximize compatibility*/
+@@ -179,6 +181,7 @@
+     uint8_t addttl;
+     uint8_t keepalive;
+     uint8_t loopprevention;
++    int idletimeout; /* seconds, 0 for no timeout; clients only */
+     uint8_t blockingstartup;
+     struct rewrite *rewritein;
+     struct rewrite *rewriteout;
+diff -u -r a/tlscommon.c b/tlscommon.c
+--- a/tlscommon.c	2026-11-18 20:22:24.169923816 +0900
++++ b/tlscommon.c	2026-11-18 20:22:39.284014795 +0900
+@@ -1831,7 +1831,8 @@
+     }
+ 
+     for (;;) {
+-        len = radtlsget(client->ssl, IDLE_TIMEOUT * 3, &client->lock, &buf);
++        /* IdleTimeout of the client block (0: keep the connection without requests, TCPKeepalive detects dead peers) */
++        len = radtlsget(client->ssl, client->conf->idletimeout, &client->lock, &buf);
+         if (!buf || !len) {
+             pthread_mutex_lock(&client->lock);
+             if (SSL_get_shutdown(client->ssl))

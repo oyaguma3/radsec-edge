@@ -65,9 +65,16 @@ type Match struct {
 	Attr, Pattern string
 }
 
+// Templates は、設定の書き方を決めるひな形の版（agent.Templates と同じ番号。§24.14、§24.15）。テナントのコンテナが動かす版の
+// radsecproxy が読める形で描く。版 1 は段階 6-0 の書き方（radsecproxy 1.11.4-pc1 で読める）、版 2 は client ブロックに IdleTimeout 0 を
+// 書く（client-idletimeout.patch のある 1.11.5-pc2 から読める。1.11.4-pc1 は知らないオプションとして断る）。
+var Templates = []int{1, 2}
+
 // Input は設定の生成に使う値。
 type Input struct {
-	Slug string
+	// Template は設定の書き方のひな形の版（Templates のどれか。テナントのコンテナが動かす版）。
+	Template int
+	Slug     string
 	// TenantID は刻印の値（管理モードでは OSS/BSS のテナントの番号、単独モードでは slug。§24.2）。
 	TenantID  string
 	URNPrefix string
@@ -120,6 +127,8 @@ type block struct {
 }
 
 type confData struct {
+	// IdleTimeoutZero は client ブロックに IdleTimeout 0 を書くか（ひな形の版 2 から。§24.15）。
+	IdleTimeoutZero      bool
 	Slug                 string
 	TenantID             string
 	Dir                  string
@@ -190,6 +199,9 @@ func hostsOf(ps []netip.Prefix) []string {
 
 // Render は設定とファイル一式を生成する。値の検証と、`radsecproxy -p` で見つからない誤りの確認を行う。
 func Render(in Input) (Bundle, error) {
+	if !slices.Contains(Templates, in.Template) {
+		return nil, fmt.Errorf("設定の書き方のひな形の版 %d は、このコードでは描けません", in.Template)
+	}
 	if err := names.CheckTenant(in.Slug); err != nil {
 		return nil, fmt.Errorf("テナントの名前: %w", err)
 	}
@@ -286,7 +298,8 @@ func Render(in Input) (Bundle, error) {
 
 	var buf bytes.Buffer
 	err = tmpl.Execute(&buf, confData{
-		Slug: in.Slug, TenantID: in.TenantID, Dir: MountDir, CRLCheck: trust.crlCheck, PartialChain: trust.partialChain,
+		IdleTimeoutZero: in.Template >= 2,
+		Slug:            in.Slug, TenantID: in.TenantID, Dir: MountDir, CRLCheck: trust.crlCheck, PartialChain: trust.partialChain,
 		VendorID: in.Stamp.VendorID, VendorType: in.Stamp.VendorType, Blocks: blocks,
 		AuthHost: hostString(in.Auth.Addr()), AuthPort: in.Auth.Port(),
 		AcctHost: hostString(in.Acct.Addr()), AcctPort: in.Acct.Port(),
