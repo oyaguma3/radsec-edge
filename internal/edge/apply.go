@@ -549,13 +549,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	return err
 }
 
+// unreachableError は、整合が agent（と、その先の Docker）に届かなかったことを表す（起動のときのやり直しの判定に使う）。
+type unreachableError struct{ error }
+
+func (e unreachableError) Unwrap() error { return e.error }
+
 func (s *Service) reconcile(ctx context.Context) error {
 	st, err := s.Agent.Status(ctx)
 	if err != nil {
-		return fmt.Errorf("agent: %w", err)
+		return unreachableError{fmt.Errorf("agent: %w", err)}
 	}
 	if !st.DockerOK {
-		return fmt.Errorf("agent cannot reach Docker: %s", st.DockerError)
+		return unreachableError{fmt.Errorf("agent cannot reach Docker: %s", st.DockerError)}
 	}
 	tenants, err := s.DB.Tenants(ctx)
 	if err != nil {
@@ -636,8 +641,17 @@ func (s *Service) LastReconcile() ReconcileState {
 	return s.lastReconcile
 }
 
+// 起動のときの整合のやり直し（aka-mvpset の R6-4。§24.15）。ホストを再起動すると radsec-edge が agent より先に起き、最初の整合が
+// agent に届かずに失敗することがある。CRL の更新で SIGHUP を受けたテナントのコンテナは Docker では起き上がらない（Docker が「手で止めた」
+// とみなす。aka-mvpset の T5-15）ので、整合ループが起こすまでテナントが使えない。起動の後は、agent に届くまで startupRetryInterval ごとに、
+// startupRetryMax までやり直す（その後は interval ごと）。
+const (
+	startupRetryInterval = 5 * time.Second
+	startupRetryMax      = 2 * time.Minute
+)
+
 // Run は整合ループと AP の最後の接続の読み取り（interval ごと）と CRL の取得（crlInterval ごと）を、ctx が終わるまで動かす。
-// 起動したときにも 1 回ずつ行う。
+// 起動したときにも 1 回ずつ行う。起動の直後に整合が agent に届かなければ、短い間隔でやり直す（startupRetryInterval）。
 func (s *Service) Run(ctx context.Context, interval, crlInterval time.Duration) {
 	go func() {
 		for {
@@ -649,8 +663,29 @@ func (s *Service) Run(ctx context.Context, interval, crlInterval time.Duration) 
 			}
 		}
 	}()
+	started, starting, retries := time.Now(), true, 0
 	for {
-		if err := s.Reconcile(ctx); err != nil && ctx.Err() == nil {
+		err := s.Reconcile(ctx)
+		if starting {
+			_, unreachable := errors.AsType[unreachableError](err)
+			if unreachable && ctx.Err() == nil && time.Since(started) < startupRetryMax {
+				if retries == 0 {
+					s.Log.Warn("reconcile: the agent is not reachable yet; retrying", "interval", startupRetryInterval, "limit", startupRetryMax, "error", err)
+				}
+				retries++
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(startupRetryInterval):
+				}
+				continue
+			}
+			starting = false
+			if retries > 0 && !unreachable {
+				s.Log.Info("reconcile reached the agent", "retries", retries, "elapsed", time.Since(started).Round(time.Second))
+			}
+		}
+		if err != nil && ctx.Err() == nil {
 			s.Log.Warn("reconcile", "error", err)
 		}
 		if err := s.RefreshLastSeen(ctx); err != nil && ctx.Err() == nil {

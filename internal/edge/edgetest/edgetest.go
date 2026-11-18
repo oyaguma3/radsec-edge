@@ -33,6 +33,23 @@ type FakeAgent struct {
 	ImageID   string
 	Images    []string
 	Validated []string
+	// failStatus は Status の誤り（agent のソケットがまだない、など）、statusCalls は Status を呼んだ時刻（SetFailStatus・StatusCalls で使う）。
+	failStatus  error
+	statusCalls []time.Time
+}
+
+// SetFailStatus は Status が返す誤りを決める（nil で届く）。
+func (f *FakeAgent) SetFailStatus(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failStatus = err
+}
+
+// StatusCalls は Status を呼んだ時刻を返す。
+func (f *FakeAgent) StatusCalls() []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.statusCalls)
 }
 
 // テスト用のイメージの ID。
@@ -62,6 +79,10 @@ func (f *FakeAgent) TakeCalls() []string {
 func (f *FakeAgent) Status(context.Context) (agent.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.statusCalls = append(f.statusCalls, time.Now())
+	if f.failStatus != nil {
+		return agent.Status{}, f.failStatus
+	}
 	st := agent.Status{DockerOK: true, ImagePresent: f.ImageID != "", ImageID: f.ImageID, NetworkPresent: true, NetworkSubnets: f.NetworkSubnets,
 		Image: agent.Image, LatestTemplate: agent.LatestTemplate, Templates: agent.Templates}
 	for _, id := range f.images() {
